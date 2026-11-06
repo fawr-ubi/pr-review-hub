@@ -33,10 +33,24 @@ export function computeAuthorInitials({ login = '', name = '' } = {}) {
   return stripped.slice(0, 2).toUpperCase();
 }
 
-export function resolveAuthorDisplayName({ login = '', name = '' } = {}) {
+/**
+ * Format a full person name cleanly (Title Case per word) or fall back to @login
+ * without ever abbreviating to initials.
+ */
+export function formatPersonDisplayName({ login = '', name = '' } = {}) {
   const cleanName = String(name || '').trim();
-  if (cleanName) return cleanName;
-  return String(login || '').trim() || 'Unknown';
+  if (cleanName) {
+    return cleanName
+      .split(/\s+/)
+      .map((word) => (word.length > 0 ? word[0].toUpperCase() + word.slice(1) : ''))
+      .join(' ');
+  }
+  const cleanLogin = String(login || '').trim();
+  return cleanLogin ? `@${cleanLogin.replace(/^@/, '')}` : 'Inconnu';
+}
+
+export function resolveAuthorDisplayName({ login = '', name = '' } = {}) {
+  return formatPersonDisplayName({ login, name });
 }
 
 export function extractJiraKey(pr = {}, customPrefixes = null) {

@@ -42,15 +42,17 @@ const state = {
   fpSections: [],
   rulesFilter: 'all',
   rulesSearch: '',
-  // Collapsible panels state (PR sidebar, Diff/Tree file list, and Full-Screen Focus Diff)
-  prSidebarCollapsed: false,
+  // Full-Page PR Selection Queue, Modified Files Tree, and Full-Screen Focus Diff state
+  prQueueFullPage: !initialUrlPrKey && !isPopoutWindow,
+  prSidebarCollapsed: true,
   fileTreeCollapsed: false,
   focusDiffMode: false,
-  _prevPrSidebar: false,
   _prevFileTree: false,
   activeHunkIndex: -1,
   activeFindingIndex: -1,
   diffZoom: Number(localStorage.getItem('prReviewHub.diffZoom')) || 100,
+  diffBlobCache: {}, // key: `${prKey}::${filePath}` -> string[] (lines of file at HEAD)
+  diffExpandedRanges: {}, // key: `${prKey}::${filePath}` -> Array<{ startRight, endRight, startLeft, endLeft }>
 };
 
 function applyDiffZoomVariables(zoomPct = state.diffZoom) {
@@ -76,6 +78,24 @@ function adjustDiffZoom(stepDelta) {
   applyDiffZoomVariables(state.diffZoom + stepDelta * 10);
 }
 
+const THEME_ORDER = ['light', 'purple', 'dark'];
+const THEME_LABELS = {
+  light: 'Clair',
+  purple: 'Lavande (Purple)',
+  dark: 'Sombre',
+};
+
+function applySavedTheme(themeName) {
+  const validTheme = THEME_ORDER.includes(themeName) ? themeName : 'dark';
+  document.documentElement.setAttribute('data-theme', validTheme);
+  try {
+    localStorage.setItem('prReviewHub.theme', validTheme);
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+applySavedTheme(localStorage.getItem('prReviewHub.theme') || 'dark');
 applyDiffZoomVariables(state.diffZoom);
 
 if (isPopoutWindow) {
@@ -123,11 +143,16 @@ function stripEmojis(str) {
 function formatCleanSummary(raw) {
   if (!raw || raw === '—') return '';
   const replaced = String(raw)
-    .replace(/(\d+)\s*🔴/g, '$1 blk')
-    .replace(/(\d+)\s*🟠/g, '$1 maj')
-    .replace(/(\d+)\s*🟡/g, '$1 min')
-    .replace(/(\d+)\s*🟢/g, '$1 nit')
-    .replace(/(\d+)\s*🔵/g, '$1 qst');
+    .replace(/(\d+)\s*🔴\s*(?:Blocker|Blockers|Blocking)?/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Blockers' : 'Blocker'}`)
+    .replace(/(\d+)\s*🟠\s*(?:Major|Majors|Important)?/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Majors' : 'Major'}`)
+    .replace(/(\d+)\s*🟡\s*(?:Minor|Minors|Suggestion|Suggestions)?/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Minors' : 'Minor'}`)
+    .replace(/(\d+)\s*🟢\s*(?:Nitpick|Nitpicks|Nit|Nits)?/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Nitpicks' : 'Nitpick'}`)
+    .replace(/(\d+)\s*(?:🔵|❓)\s*(?:Question|Questions|Nit|Nitpick)?/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Questions' : 'Question'}`)
+    .replace(/\b(\d+)\s+blk(?:\s+Blocking|\s+Blocker)?\b/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Blockers' : 'Blocker'}`)
+    .replace(/\b(\d+)\s+maj(?:\s+Major)?\b/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Majors' : 'Major'}`)
+    .replace(/\b(\d+)\s+min(?:\s+Minor)?\b/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Minors' : 'Minor'}`)
+    .replace(/\b(\d+)\s+nit(?:\s+Nit|\s+Nitpick)?\b/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Nitpicks' : 'Nitpick'}`)
+    .replace(/\b(\d+)\s+qst(?:\s+Question|\s+Questions)?\b/gi, (_, count) => `${count} ${Number(count) > 1 ? 'Questions' : 'Question'}`);
   return stripEmojis(replaced);
 }
 
@@ -267,6 +292,7 @@ async function loadState(preserveSelection = true) {
       renderTopbar(stillExists);
     }
   }
+  renderCollapsibleLayoutState();
 }
 
 function updateFilterCounts() {
@@ -282,7 +308,7 @@ function renderRepoPills() {
   const container = document.getElementById('repoFilterPills');
   const repos = [...new Set(state.prs.map((p) => p.repo).filter(Boolean))];
   const pillsHtml = [
-    `<button class="repo-pill ${state.activeRepo === 'all' ? 'active' : ''}" data-repo="all">all</button>`,
+    `<button class="repo-pill ${state.activeRepo === 'all' ? 'active' : ''}" data-repo="all">Tous les dépôts</button>`,
     ...repos.map(
       (r) =>
         `<button class="repo-pill ${state.activeRepo === r ? 'active' : ''}" data-repo="${escapeHtml(r)}">${escapeHtml(r)}</button>`
@@ -299,6 +325,22 @@ function renderRepoPills() {
   });
 }
 
+function formatRelativeAgeFr(isoDate) {
+  if (!isoDate) return '';
+  const ts = Date.parse(isoDate);
+  if (Number.isNaN(ts)) return '';
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (diffSec < 60) return "Mis à jour à l'instant";
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `Mis à jour il y a ${diffMin} ${diffMin > 1 ? 'minutes' : 'minute'}`;
+  const diffHours = Math.floor(diffMin / 60);
+  if (diffHours < 24) return `Mis à jour il y a ${diffHours} ${diffHours > 1 ? 'heures' : 'heure'}`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 30) return `Mis à jour il y a ${diffDays} ${diffDays > 1 ? 'jours' : 'jour'}`;
+  const diffMonths = Math.floor(diffDays / 30);
+  return `Mis à jour il y a ${diffMonths} mois`;
+}
+
 function renderAuthorFilterBar() {
   const bar = document.getElementById('activeAuthorFilterBar');
   const label = document.getElementById('activeAuthorFilterLabel');
@@ -308,7 +350,9 @@ function renderAuthorFilterBar() {
     return;
   }
   bar.classList.remove('hidden');
-  label.textContent = `Filtre auteur : @${state.activeAuthor}`;
+  const matchPr = state.prs.find((p) => p.author === state.activeAuthor);
+  const displayName = matchPr?.authorDisplayName || `@${state.activeAuthor}`;
+  label.textContent = `Filtre auteur : ${displayName}`;
 }
 
 function getFilteredPrs() {
@@ -324,7 +368,10 @@ function getFilteredPrs() {
 
     if (state.searchQuery) {
       const q = state.searchQuery.toLowerCase();
-      const hay = `${pr.key} ${pr.title} ${pr.author} ${pr.authorDisplayName || ''} ${pr.authorInitials || ''} ${pr.jiraKey || ''} ${pr.headRefName || ''}`.toLowerCase();
+      const approvers = (pr.approvedBy || []).join(' ');
+      const pending = (pr.pendingReviewers || []).join(' ');
+      const labels = (pr.labels || []).map((l) => l.name).join(' ');
+      const hay = `${pr.key} ${pr.title} ${pr.author} ${pr.authorDisplayName || ''} ${pr.jiraKey || ''} ${pr.headRefName || ''} ${approvers} ${pending} ${labels}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -344,62 +391,127 @@ function renderPrList() {
     .map((pr) => {
       const isSelected = pr.key === state.selectedPrKey;
       const statusClass = getCardStatusClass(pr);
-      const initials = pr.authorInitials || (pr.author || 'PR').slice(0, 2).toUpperCase();
-      const authorTooltip = `${pr.authorDisplayName || pr.author} (@${pr.author})`;
+      const authorFullLabel = pr.authorDisplayName || `@${pr.author || 'inconnu'}`;
       const isAuthorActive = state.activeAuthor === pr.author;
 
+      const modeBadge = `<span class="badge">${escapeHtml(pr.reviewMode === 'Self-Review' ? 'Self-Review' : 'Peer-Review')}</span>`;
       const jiraBadge =
         pr.jiraKey && pr.jiraKey !== '—'
-          ? `<span class="badge">${escapeHtml(pr.jiraKey)}</span>`
+          ? `<span class="badge">Ticket ${escapeHtml(pr.jiraKey)}</span>`
           : '';
       const stackBadge = pr.isStacked
-        ? `<span class="badge badge-severity-major" title="Target: ${escapeHtml(pr.baseRefName)}">STACK</span>`
+        ? `<span class="badge badge-severity-major" title="Branche cible : ${escapeHtml(pr.baseRefName)}">Branche empilée → ${escapeHtml(pr.baseRefName)}</span>`
         : '';
       const ciBadge =
         pr.ciStatus === 'PASS'
-          ? `<span class="badge badge-severity-ok">CI:PASS</span>`
+          ? `<span class="badge badge-severity-ok">CI : Succès</span>`
           : pr.ciStatus === 'FAIL'
-          ? `<span class="badge badge-severity-blocker">CI:FAIL</span>`
+          ? `<span class="badge badge-severity-blocker">CI : Échec</span>`
           : pr.ciStatus === 'PENDING'
-          ? `<span class="badge">CI:WAIT</span>`
+          ? `<span class="badge">CI : En attente</span>`
           : '';
-      const wtBadge = pr.worktreeMounted ? `<span class="badge" title="Worktree monté">WT</span>` : '';
+      const wtBadge = pr.worktreeMounted ? `<span class="badge badge-severity-ok" title="Worktree monté localement">Worktree monté</span>` : '';
 
       const postedInfo =
         pr.findingsCount > 0
-          ? `<span class="badge" title="Commentaires postés">${pr.postedCount}/${pr.findingsCount}</span>`
+          ? `<span class="badge" title="Commentaires publiés sur GitHub">${pr.postedCount}/${pr.findingsCount} commentaires postés</span>`
           : '';
 
       const needsRun = pr.syncStatus === 'NEEDS_REVIEW' || pr.syncStatus === 'NEEDS_UPDATE';
       const quickRunBtn = pr.runningJob
-        ? `<span class="badge"><span class="spinner"></span> Run</span>`
+        ? `<span class="badge"><span class="spinner"></span> Audit IA en cours…</span>`
         : needsRun
-        ? `<button class="btn btn-secondary btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Lancer la review maintenant">Run</button>`
-        : '';
+        ? `<button class="btn btn-secondary btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Lancer l'audit IA maintenant">Lancer l'audit IA</button>`
+        : `<button class="btn btn-secondary btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Relancer l'audit IA">Relancer l'audit</button>`;
 
       const cleanStatus = formatCleanStatus(pr.reviewStatus);
       const cleanSummary = formatCleanSummary(pr.findingsSummary);
+      const shaShort = (pr.headRefOid || pr.lastReviewedSha || '').slice(0, 7);
+      const branchSummary = pr.headRefName
+        ? `<div class="pr-card-branch">${escapeHtml(pr.headRefName)} → ${escapeHtml(pr.baseRefName || 'develop')}${shaShort ? ` · commit ${escapeHtml(shaShort)}` : ''}</div>`
+        : '';
+
+      // Detailed PR metadata & review tags
+      const detailTags = [];
+      if (Array.isArray(pr.approvedBy) && pr.approvedBy.length > 0) {
+        detailTags.push(
+          `<span class="pr-tag pr-tag-approved">Approuvé par : ${escapeHtml(pr.approvedBy.join(', '))}</span>`
+        );
+      }
+      if (Array.isArray(pr.changesRequestedBy) && pr.changesRequestedBy.length > 0) {
+        detailTags.push(
+          `<span class="pr-tag pr-tag-changes">Changements demandés par : ${escapeHtml(pr.changesRequestedBy.join(', '))}</span>`
+        );
+      }
+      if (Array.isArray(pr.commentedBy) && pr.commentedBy.length > 0) {
+        detailTags.push(
+          `<span class="pr-tag">Commenté par : ${escapeHtml(pr.commentedBy.join(', '))}</span>`
+        );
+      }
+      if (Array.isArray(pr.pendingReviewers) && pr.pendingReviewers.length > 0) {
+        detailTags.push(
+          `<span class="pr-tag pr-tag-pending">En attente de : ${escapeHtml(pr.pendingReviewers.join(', '))}</span>`
+        );
+      }
+      if (typeof pr.changedFiles === 'number') {
+        const fileWord = pr.changedFiles > 1 ? 'fichiers' : 'fichier';
+        detailTags.push(
+          `<span class="pr-tag pr-tag-diffstat">${pr.changedFiles} ${fileWord} · <span class="add-stat">+${pr.additions ?? 0}</span> / <span class="del-stat">-${pr.deletions ?? 0}</span></span>`
+        );
+      }
+      if (pr.mergeable === 'CONFLICTING') {
+        detailTags.push(`<span class="pr-tag pr-tag-conflict">Conflit Git</span>`);
+      } else if (pr.mergeable === 'MERGEABLE') {
+        detailTags.push(`<span class="pr-tag pr-tag-mergeable">Fusionnable</span>`);
+      }
+      if (Array.isArray(pr.labels) && pr.labels.length > 0) {
+        for (const lbl of pr.labels) {
+          if (lbl?.name) {
+            detailTags.push(`<span class="pr-tag">Label : ${escapeHtml(lbl.name)}</span>`);
+          }
+        }
+      }
+      const relativeAge = formatRelativeAgeFr(pr.updatedAt);
+      if (relativeAge) {
+        detailTags.push(`<span class="pr-tag">${escapeHtml(relativeAge)}</span>`);
+      }
+
+      const detailTagsRowHtml =
+        detailTags.length > 0
+          ? `<div class="pr-meta-tags-row">${detailTags.join('')}</div>`
+          : '';
 
       return `
         <div class="pr-card ${statusClass} ${isSelected ? 'active' : ''}" data-key="${escapeHtml(pr.key)}">
           <div class="pr-card-top">
-            <div style="display:flex;gap:6px;align-items:center;">
-              <span class="author-badge ${isAuthorActive ? 'active' : ''}" data-author="${escapeHtml(pr.author)}" title="${escapeHtml(authorTooltip)} (Cliquer pour filtrer)">${escapeHtml(initials)}</span>
-              <span class="pr-card-key">${escapeHtml(pr.repo)}#${pr.number}</span>
+            <div class="pr-card-identity">
+              <span class="pr-card-key">${escapeHtml(pr.repo)} #${pr.number}</span>
+              <span class="pr-author-pill author-badge ${isAuthorActive ? 'active' : ''}" data-author="${escapeHtml(pr.author)}" title="Cliquer pour filtrer par auteur (@${escapeHtml(pr.author)})">
+                <span class="author-full-name">${escapeHtml(authorFullLabel)}</span>
+              </span>
+              ${modeBadge}
             </div>
-            <div style="display:flex;gap:4px;align-items:center;">
+            <div class="pr-card-badges">
               ${wtBadge}
               ${stackBadge}
               ${ciBadge}
               ${jiraBadge}
             </div>
           </div>
-          <div class="pr-card-title">${escapeHtml(pr.title || pr.key)}</div>
+          <div class="pr-card-middle">
+            <div class="pr-card-title">${escapeHtml(pr.title || pr.key)}</div>
+            ${branchSummary}
+            ${detailTagsRowHtml}
+          </div>
           <div class="pr-card-bottom">
-            <span>${escapeHtml(cleanStatus)}</span>
-            <div style="display:flex;gap:6px;align-items:center;">
-              <span>${escapeHtml(cleanSummary)}</span>
+            <div class="pr-card-verdict-group">
+              <span class="pr-verdict-text">${escapeHtml(cleanStatus)}</span>
+              ${cleanSummary ? `<span class="pr-summary-pill">${escapeHtml(cleanSummary)}</span>` : ''}
               ${postedInfo}
+            </div>
+            <div class="pr-card-actions">
+              <button class="btn btn-secondary btn-xs card-open-report-btn" data-key="${escapeHtml(pr.key)}" title="Ouvrir le rapport d'audit complet">Lire Audit</button>
+              <button class="btn btn-primary btn-xs card-open-diff-btn" data-key="${escapeHtml(pr.key)}" title="Se lancer dans la review du code avec uniquement la liste des fichiers modifiés à gauche">Ouvrir Diff</button>
               ${quickRunBtn}
             </div>
           </div>
@@ -410,10 +522,29 @@ function renderPrList() {
 
   listEl.querySelectorAll('.pr-card').forEach((card) => {
     card.addEventListener('click', (e) => {
-      if (e.target.closest('.author-badge') || e.target.closest('.card-run-review-btn')) {
+      if (
+        e.target.closest('.author-badge') ||
+        e.target.closest('.card-run-review-btn') ||
+        e.target.closest('.card-open-report-btn') ||
+        e.target.closest('.card-open-diff-btn')
+      ) {
         return;
       }
-      selectPr(card.dataset.key, true);
+      enterPrReviewWorkspace(card.dataset.key, null);
+    });
+  });
+
+  listEl.querySelectorAll('.card-open-report-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      enterPrReviewWorkspace(btn.dataset.key, 'report');
+    });
+  });
+
+  listEl.querySelectorAll('.card-open-diff-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      enterPrReviewWorkspace(btn.dataset.key, 'diff');
     });
   });
 
@@ -439,15 +570,14 @@ function renderTopbar(pr) {
   document.getElementById('emptyMainState').classList.add('hidden');
   document.getElementById('prContentArea').classList.remove('hidden');
 
-  const initialsEl = document.getElementById('prAuthorInitialsBadge');
-  if (initialsEl) {
-    initialsEl.textContent = pr.authorInitials || (pr.author || 'PR').slice(0, 2).toUpperCase();
-    initialsEl.title = `${pr.authorDisplayName || pr.author} (@${pr.author})`;
+  document.getElementById('prRepoBadge').textContent = `${pr.repo} #${pr.number}`;
+  const authorBadgeEl = document.getElementById('prAuthorBadge');
+  if (authorBadgeEl) {
+    authorBadgeEl.textContent = pr.authorDisplayName || (pr.author ? `@${pr.author}` : '');
+    authorBadgeEl.title = pr.author ? `@${pr.author}` : '';
   }
-
-  document.getElementById('prRepoBadge').textContent = `${pr.repo}#${pr.number}`;
   const modeBadge = document.getElementById('prModeBadge');
-  modeBadge.textContent = pr.reviewMode === 'Self-Review' ? 'self-review' : 'peer-review';
+  modeBadge.textContent = pr.reviewMode === 'Self-Review' ? 'Self-Review' : 'Peer-Review';
   modeBadge.className = 'badge';
 
   const verdictEl = document.getElementById('prVerdictBadge');
@@ -466,7 +596,12 @@ function renderTopbar(pr) {
   const ciEl = document.getElementById('prCiBadge');
   if (ciEl) {
     if (pr.ciStatus && pr.ciStatus !== 'NONE') {
-      ciEl.textContent = `CI:${pr.ciStatus}`;
+      ciEl.textContent =
+        pr.ciStatus === 'PASS'
+          ? 'CI : Succès'
+          : pr.ciStatus === 'FAIL'
+          ? 'CI : Échec'
+          : 'CI : En attente';
       ciEl.className = `badge badge-mono ${
         pr.ciStatus === 'PASS'
           ? 'badge-severity-ok'
@@ -483,7 +618,7 @@ function renderTopbar(pr) {
   const stackEl = document.getElementById('prStackBadge');
   if (stackEl) {
     if (pr.isStacked) {
-      stackEl.textContent = `STACK -> ${pr.baseRefName}`;
+      stackEl.textContent = `Branche empilée → ${pr.baseRefName}`;
       stackEl.classList.remove('hidden');
     } else {
       stackEl.classList.add('hidden');
@@ -492,7 +627,7 @@ function renderTopbar(pr) {
 
   const jiraEl = document.getElementById('prJiraLink');
   if (pr.jiraKey && pr.jiraKey !== '—') {
-    jiraEl.textContent = `${pr.jiraKey} ↗`;
+    jiraEl.textContent = `Ticket ${pr.jiraKey} ↗`;
     jiraEl.href = `https://ubitransport.atlassian.net/browse/${pr.jiraKey}`;
     jiraEl.classList.remove('hidden');
   } else {
@@ -500,13 +635,10 @@ function renderTopbar(pr) {
   }
 
   const sha = (pr.headRefOid || pr.lastReviewedSha || '').slice(0, 7);
-  document.getElementById('prShaBadge').textContent = sha ? sha : '';
-  document.getElementById('prAuthorBadge').textContent = pr.author
-    ? `${pr.authorDisplayName || pr.author} (@${pr.author})`
-    : '';
+  document.getElementById('prShaBadge').textContent = sha ? `commit ${sha}` : '';
   document.getElementById('prTitleHeader').textContent = pr.title || pr.key;
   document.getElementById('prBranchRow').textContent = pr.headRefName
-    ? `${pr.headRefName} -> ${pr.baseRefName || 'develop'}`
+    ? `${pr.headRefName} → ${pr.baseRefName || 'develop'}`
     : '';
   document.getElementById('openGithubPrBtn').href =
     pr.url || `https://github.com/ubitransports/${pr.repo}/pull/${pr.number}`;
@@ -516,10 +648,10 @@ function renderTopbar(pr) {
   const reviewLabel = document.getElementById('triggerReviewLabel');
   if (pr.runningJob) {
     reviewSpinner?.classList.remove('hidden');
-    if (reviewLabel) reviewLabel.textContent = 'Running...';
+    if (reviewLabel) reviewLabel.textContent = 'Audit IA en cours…';
   } else {
     reviewSpinner?.classList.add('hidden');
-    if (reviewLabel) reviewLabel.textContent = pr.hasReviewFile ? 'Re-run Review' : 'Run Review';
+    if (reviewLabel) reviewLabel.textContent = pr.hasReviewFile ? "Relancer l'audit" : "Lancer l'audit";
   }
 
   renderWorktreeStatusBar(pr);
@@ -533,16 +665,16 @@ function renderWorktreeStatusBar(pr) {
 
   const isMounted = Boolean(state.worktreeStatus?.mounted || pr?.worktreeMounted);
   if (isMounted) {
-    badge.textContent = 'WT: mounted';
+    badge.textContent = 'Worktree : Monté';
     badge.className = 'badge badge-mono badge-severity-ok';
     badge.title = state.worktreeStatus?.worktreePath || pr?.worktreePath || '';
-    mountBtn.textContent = 'Sync WT';
+    mountBtn.textContent = 'Synchroniser Worktree';
     unmountBtn.classList.remove('hidden');
   } else {
-    badge.textContent = 'WT: zero-disk';
+    badge.textContent = 'Worktree : Git direct';
     badge.className = 'badge badge-mono';
-    badge.title = 'Exploration directe via Git (cliquer sur Mount WT pour créer un dossier worktree isolé)';
-    mountBtn.textContent = 'Mount WT';
+    badge.title = 'Exploration directe via Git (cliquer sur Monter Worktree pour créer un dossier worktree isolé)';
+    mountBtn.textContent = 'Monter Worktree';
     unmountBtn.classList.add('hidden');
   }
 }
@@ -1430,7 +1562,19 @@ function selectDiffFile(filename, highlightLine = null) {
     (f) => f.resolvedPath === filename && !f.dismissed
   );
 
-  const rowsHtml = renderPatchTableRows(fileObj.patch || '', fileFindings, highlightLine);
+  const cacheKey = `${state.selectedPrKey || ''}::${filename}`;
+  const blobLines = state.diffBlobCache[cacheKey] || null;
+  const expandedRanges = state.diffExpandedRanges[cacheKey] || [];
+  const hasFullFileExpanded =
+    blobLines &&
+    expandedRanges.some((r) => r.startRight <= 1 && r.endRight >= blobLines.length);
+
+  const rowsHtml = renderPatchTableRows(
+    fileObj.patch || '',
+    fileFindings,
+    highlightLine,
+    filename
+  );
   const fileIdx = files.findIndex((f) => f.filename === filename);
   const prevFile = fileIdx > 0 ? files[fileIdx - 1] : null;
   const nextFile = fileIdx >= 0 && fileIdx < files.length - 1 ? files[fileIdx + 1] : null;
@@ -1449,6 +1593,10 @@ function selectDiffFile(filename, highlightLine = null) {
   viewerEl.innerHTML = `
     <div class="diff-file-header">
       <div style="display:flex;gap:6px;align-items:center;min-width:0;flex:1;">
+        <button id="diffBackToQueueInlineBtn" class="btn btn-secondary btn-xs" title="Revenir à la sélection des PRs en pleine page (raccourci : q)">&larr; PRs (q)</button>
+        <button id="diffToggleFilesInlineBtn" class="btn ${state.fileTreeCollapsed ? 'btn-primary' : 'btn-secondary'} btn-xs" title="Afficher / Masquer l'arbre des fichiers modifiés (raccourci : b)">
+          ${state.fileTreeCollapsed ? `Fichiers (${files.length}) (b)` : 'Masquer Fichiers (b)'}
+        </button>
         <button id="diffPrevFileBtn" class="btn btn-secondary btn-xs" ${prevFile ? '' : 'disabled'} title="Fichier précédent (Flèche Gauche ←)">&larr;</button>
         <span class="meta-text" style="white-space:nowrap;font-weight:600;">${fileIdx + 1}/${files.length}</span>
         <button id="diffNextFileBtn" class="btn btn-secondary btn-xs" ${nextFile ? '' : 'disabled'} title="Fichier suivant (Flèche Droite →)">&rarr;</button>
@@ -1467,15 +1615,16 @@ function selectDiffFile(filename, highlightLine = null) {
           <button id="diffZoomResetBtn" class="btn btn-xs diff-zoom-label" title="Réinitialiser le zoom à 100% (0)">${state.diffZoom}%</button>
           <button id="diffZoomInBtn" class="btn btn-xs" title="Zoomer (+)">+</button>
         </div>
+        <button id="diffExpandAllContextBtn" class="btn ${expandedRanges.length > 0 ? 'btn-primary' : 'btn-ghost'} btn-xs" title="Afficher ou replier toutes les lignes non modifiées de ce fichier directement dans le diff">
+          ${hasFullFileExpanded ? 'Replier contexte' : '&uarr;&darr; Tout le fichier'}
+        </button>
         <button id="diffPrevHunkBtn" class="btn btn-ghost btn-xs" title="Hunk / Finding précédent dans ce fichier (raccourci : p)">&uarr; Hunk</button>
         <button id="diffNextHunkBtn" class="btn btn-ghost btn-xs" title="Hunk / Finding suivant dans ce fichier (raccourci : n)">&darr; Hunk</button>
-        <button id="diffToggleFilesInlineBtn" class="btn btn-ghost btn-xs" title="Masquer / Afficher la liste des fichiers modifiés (raccourci : ])">
-          ${state.fileTreeCollapsed ? `Fichiers (${files.length})` : 'Masquer Fichiers'}
-        </button>
         <button id="diffOpenFullFileBtn" class="btn btn-ghost btn-xs" title="Ouvrir le fichier complet dans l'arbre de travail (raccourci : t)">Tree</button>
         <button id="diffOpenIdeBtn" class="btn btn-ghost btn-xs" title="Ouvrir ce fichier dans PhpStorm (raccourci : i)">PhpStorm</button>
-        <button id="diffToggleFocusInlineBtn" class="btn ${state.focusDiffMode ? 'btn-primary' : 'btn-secondary'} btn-xs" title="Mode Focus Diff plein écran (raccourci : z, f ou Esc)">
-          ${state.focusDiffMode ? 'Quitter Focus (Esc)' : 'Focus Diff (z)'}
+        <button id="diffOpenChatInlineBtn" class="btn ${state.chatOpen ? 'btn-primary' : 'btn-ghost'} btn-xs" title="Poser une question à l'IA sur ce fichier (raccourci : c)">Agent Q&amp;A (c)</button>
+        <button id="diffToggleFocusInlineBtn" class="btn ${state.focusDiffMode ? 'btn-primary' : 'btn-secondary'} btn-xs" title="Afficher / Masquer l'en-tête de la PR et les onglets (raccourci : z, f ou Esc)">
+          ${state.focusDiffMode ? 'Afficher En-tête (Esc)' : 'Focus Diff (z)'}
         </button>
       </div>
     </div>
@@ -1487,6 +1636,10 @@ function selectDiffFile(filename, highlightLine = null) {
       </div>
     </div>
   `;
+
+  document.getElementById('diffBackToQueueInlineBtn')?.addEventListener('click', () => {
+    showFullPagePrQueue();
+  });
 
   document.getElementById('diffZoomOutBtn')?.addEventListener('click', () => {
     adjustDiffZoom(-1);
@@ -1505,6 +1658,10 @@ function selectDiffFile(filename, highlightLine = null) {
   document.getElementById('diffCopyPathBtn')?.addEventListener('click', async () => {
     await navigator.clipboard.writeText(fileObj.filename);
     showToast(`Chemin copié : ${fileObj.filename}`);
+  });
+
+  document.getElementById('diffExpandAllContextBtn')?.addEventListener('click', () => {
+    toggleExpandAllDiffContext(fileObj.filename);
   });
 
   document.getElementById('diffPrevHunkBtn')?.addEventListener('click', () => {
@@ -1540,6 +1697,14 @@ function selectDiffFile(filename, highlightLine = null) {
     openCurrentPrInIde('phpstorm', fileObj.filename, highlightLine || 1);
   });
 
+  document.getElementById('diffOpenChatInlineBtn')?.addEventListener('click', () => {
+    toggleChatDrawer();
+  });
+
+  if (state.chatOpen) {
+    renderAgentContextBanner();
+  }
+
   viewerEl.querySelectorAll('.diff-copy-finding-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const cid = btn.dataset.cid;
@@ -1556,6 +1721,34 @@ function selectDiffFile(filename, highlightLine = null) {
       const cid = btn.dataset.cid;
       const f = (state.currentReview?.findings || []).find((x) => x.cid === cid);
       if (f) openSingleCommentModal(f, 'inline');
+    });
+  });
+
+  viewerEl.querySelectorAll('.diff-expand-range-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const startRight = Number(btn.dataset.startRight);
+      const endRight = Number(btn.dataset.endRight);
+      const startLeft = Number(btn.dataset.startLeft);
+      const endLeft = Number(btn.dataset.endLeft);
+      if (!startRight || !endRight || endRight < startRight) return;
+      btn.disabled = true;
+      await expandDiffContextRange(fileObj.filename, {
+        startRight,
+        endRight,
+        startLeft,
+        endLeft,
+      });
+    });
+  });
+
+  viewerEl.querySelectorAll('.diff-expand-eof-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const startRight = Number(btn.dataset.startRight);
+      const startLeft = Number(btn.dataset.startLeft);
+      const step = Number(btn.dataset.step) || 0;
+      if (!startRight) return;
+      btn.disabled = true;
+      await expandDiffContextToEof(fileObj.filename, startRight, startLeft, step);
     });
   });
 
@@ -1622,80 +1815,478 @@ function jumpToRelativeHunk(delta) {
   }
 }
 
-function renderPatchTableRows(patch, fileFindings, highlightLine) {
-  if (!patch) {
-    return `<tr><td colspan="3" class="diff-line-code meta-text">Aucun diff textuel disponible pour ce fichier.</td></tr>`;
+async function ensureDiffFileBlobLoaded(filename) {
+  const pr = state.prs.find((p) => p.key === state.selectedPrKey);
+  if (!pr || !filename) return null;
+  const cacheKey = `${pr.key}::${filename}`;
+  if (state.diffBlobCache[cacheKey]) {
+    return state.diffBlobCache[cacheKey];
   }
 
-  const lines = patch.split('\n');
-  let leftLine = 0;
-  let rightLine = 0;
-  const rows = [];
+  try {
+    const res = await fetch(
+      `/api/blob?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&path=${encodeURIComponent(filename)}`
+    );
+    if (!res.ok) throw new Error('Impossible de charger le contenu complet du fichier');
+    const data = await res.json();
+    const rawLines = String(data.content ?? '').split('\n');
+    if (rawLines.length > 1 && rawLines[rawLines.length - 1] === '') {
+      rawLines.pop();
+    }
+    state.diffBlobCache[cacheKey] = rawLines;
+    return rawLines;
+  } catch (err) {
+    showToast(err.message || 'Impossible de charger les lignes non modifiées');
+    return null;
+  }
+}
+
+function addDiffExpandedRange(cacheKey, newRange) {
+  const existing = state.diffExpandedRanges[cacheKey] || [];
+  const list = [...existing, newRange].sort((a, b) => a.startRight - b.startRight);
+  const merged = [];
+  for (const r of list) {
+    if (merged.length === 0) {
+      merged.push({ ...r });
+    } else {
+      const prev = merged[merged.length - 1];
+      if (r.startRight <= prev.endRight + 1) {
+        if (r.endRight > prev.endRight) {
+          prev.endRight = r.endRight;
+          prev.endLeft = r.endLeft;
+        }
+      } else {
+        merged.push({ ...r });
+      }
+    }
+  }
+  state.diffExpandedRanges[cacheKey] = merged;
+}
+
+async function expandDiffContextRange(filename, range) {
+  const scrollArea = document.getElementById('diffScrollArea');
+  const prevScrollTop = scrollArea ? scrollArea.scrollTop : 0;
+
+  const blobLines = await ensureDiffFileBlobLoaded(filename);
+  if (!blobLines) return;
+
+  const cacheKey = `${state.selectedPrKey || ''}::${filename}`;
+  const clampedStartRight = Math.max(1, range.startRight);
+  const clampedEndRight = Math.min(blobLines.length, range.endRight);
+  if (clampedEndRight >= clampedStartRight) {
+    const deltaStart = clampedStartRight - range.startRight;
+    const clampedStartLeft = Math.max(1, (range.startLeft || clampedStartRight) + deltaStart);
+    const clampedEndLeft = clampedStartLeft + (clampedEndRight - clampedStartRight);
+    addDiffExpandedRange(cacheKey, {
+      startRight: clampedStartRight,
+      endRight: clampedEndRight,
+      startLeft: clampedStartLeft,
+      endLeft: clampedEndLeft,
+    });
+  }
+
+  selectDiffFile(filename, state.highlightedLine);
+  const newScrollArea = document.getElementById('diffScrollArea');
+  if (newScrollArea) {
+    newScrollArea.scrollTop = prevScrollTop;
+  }
+}
+
+async function expandDiffContextToEof(filename, startRight, startLeft, step = 0) {
+  const scrollArea = document.getElementById('diffScrollArea');
+  const prevScrollTop = scrollArea ? scrollArea.scrollTop : 0;
+
+  const blobLines = await ensureDiffFileBlobLoaded(filename);
+  if (!blobLines) return;
+
+  const totalRight = blobLines.length;
+  if (startRight > totalRight) {
+    showToast('Fin du fichier déjà atteinte.', 1500);
+    return;
+  }
+
+  const endRight = step > 0 ? Math.min(totalRight, startRight + step - 1) : totalRight;
+  const endLeft = startLeft + (endRight - startRight);
+  const cacheKey = `${state.selectedPrKey || ''}::${filename}`;
+  addDiffExpandedRange(cacheKey, {
+    startRight,
+    endRight,
+    startLeft,
+    endLeft,
+  });
+
+  selectDiffFile(filename, state.highlightedLine);
+  const newScrollArea = document.getElementById('diffScrollArea');
+  if (newScrollArea) {
+    newScrollArea.scrollTop = prevScrollTop;
+  }
+}
+
+async function toggleExpandAllDiffContext(filename) {
+  const scrollArea = document.getElementById('diffScrollArea');
+  const prevScrollTop = scrollArea ? scrollArea.scrollTop : 0;
+
+  const blobLines = await ensureDiffFileBlobLoaded(filename);
+  if (!blobLines) return;
+
+  const cacheKey = `${state.selectedPrKey || ''}::${filename}`;
+  const current = state.diffExpandedRanges[cacheKey] || [];
+  const isFullExpanded = current.some(
+    (r) => r.startRight <= 1 && r.endRight >= blobLines.length
+  );
+
+  if (isFullExpanded) {
+    state.diffExpandedRanges[cacheKey] = [];
+  } else {
+    state.diffExpandedRanges[cacheKey] = [
+      {
+        startRight: 1,
+        endRight: blobLines.length,
+        startLeft: 1,
+        endLeft: blobLines.length,
+      },
+    ];
+  }
+
+  selectDiffFile(filename, state.highlightedLine);
+  const newScrollArea = document.getElementById('diffScrollArea');
+  if (newScrollArea) {
+    newScrollArea.scrollTop = prevScrollTop;
+  }
+}
+
+function parsePatchIntoHunks(patch) {
+  const lines = String(patch || '').split('\n');
+  const hunks = [];
+  let current = null;
 
   for (const rawLine of lines) {
-    const hunkMatch = rawLine.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    const hunkMatch = rawLine.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
     if (hunkMatch) {
-      leftLine = Number(hunkMatch[1]);
-      rightLine = Number(hunkMatch[2]);
+      if (current) hunks.push(current);
+      const startLeft = Number(hunkMatch[1]);
+      const startRight = Number(hunkMatch[3]);
+      current = {
+        header: rawLine,
+        startLeft,
+        startRight,
+        endLeft: startLeft - 1,
+        endRight: startRight - 1,
+        rows: [],
+      };
+      continue;
+    }
+
+    if (!current) continue;
+    if (rawLine.startsWith('\\ No newline at end of file')) continue;
+
+    if (rawLine.startsWith('+')) {
+      current.endRight += 1;
+      current.rows.push({
+        type: 'add',
+        leftNum: '',
+        rightNum: current.endRight,
+        rawLine,
+      });
+    } else if (rawLine.startsWith('-')) {
+      current.endLeft += 1;
+      current.rows.push({
+        type: 'del',
+        leftNum: current.endLeft,
+        rightNum: '',
+        rawLine,
+      });
+    } else {
+      current.endLeft += 1;
+      current.endRight += 1;
+      current.rows.push({
+        type: 'ctx',
+        leftNum: current.endLeft,
+        rightNum: current.endRight,
+        rawLine,
+      });
+    }
+  }
+  if (current) hunks.push(current);
+  return hunks;
+}
+
+function renderDiffLineAndFindingsHtml({
+  rowClass,
+  lNum,
+  rNum,
+  codeText,
+  fileFindings,
+  highlightLine,
+}) {
+  const isHighlighted = highlightLine && rNum && Number(rNum) === Number(highlightLine);
+  const finalClass = `${rowClass}${isHighlighted ? ' diff-row-highlight' : ''}`.trim();
+  const out = [
+    `
+      <tr class="${finalClass}" ${rNum ? `data-right-line="${rNum}"` : ''}>
+        <td class="diff-line-num">${lNum}</td>
+        <td class="diff-line-num">${rNum}</td>
+        <td class="diff-line-code">${escapeHtml(codeText)}</td>
+      </tr>
+    `,
+  ];
+
+  if (rNum) {
+    const matchingFindings = fileFindings.filter((f) => Number(f.resolvedLine) === Number(rNum));
+    for (const mf of matchingFindings) {
+      const sev = getSeverityMeta(mf.severity);
+      out.push(`
+        <tr>
+          <td colspan="3" class="diff-inline-finding">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
+                <strong style="font-size:12.5px;">${escapeHtml(mf.id)} — ${formatInlineCodeHtml(mf.title)}</strong>
+              </div>
+              <div style="display:flex;gap:6px;">
+                <button class="btn btn-secondary btn-sm diff-copy-finding-btn" data-cid="${escapeHtml(mf.cid)}">Copier</button>
+                <button class="btn btn-primary btn-sm diff-post-finding-btn" data-cid="${escapeHtml(mf.cid)}">Poster ici</button>
+              </div>
+            </div>
+            <pre style="margin:0;white-space:pre-wrap;background:var(--bg-app);padding:10px;border-radius:4px;border:1px solid var(--border-color);font-size:11.5px;">${escapeHtml(mf.customComment)}</pre>
+          </td>
+        </tr>
+      `);
+    }
+  }
+
+  return out.join('');
+}
+
+function renderGapWithExpanderHtml({
+  gapStartRight,
+  gapEndRight,
+  gapStartLeft,
+  gapEndLeft,
+  hunkHeaderText,
+  blobLines,
+  expandedRanges,
+  fileFindings,
+  highlightLine,
+  isTopOfFile = false,
+}) {
+  const rows = [];
+  const step = 20;
+
+  if (gapEndRight < gapStartRight) {
+    // Zero hidden lines above this hunk, just render the standard hunk header row if provided
+    if (hunkHeaderText) {
       rows.push(`
         <tr class="diff-row-hunk">
           <td class="diff-line-num">…</td>
           <td class="diff-line-num">…</td>
-          <td class="diff-line-code">${escapeHtml(rawLine)}</td>
+          <td class="diff-line-code">${escapeHtml(hunkHeaderText)}</td>
         </tr>
       `);
-      continue;
     }
+    return rows.join('');
+  }
 
-    let rowClass = '';
-    let lNum = '';
-    let rNum = '';
+  // Partition [gapStartRight .. gapEndRight] into unexpanded vs expanded sub-segments
+  const overlapping = expandedRanges
+    .map((r) => ({
+      startRight: Math.max(gapStartRight, r.startRight),
+      endRight: Math.min(gapEndRight, r.endRight),
+    }))
+    .filter((r) => r.endRight >= r.startRight)
+    .sort((a, b) => a.startRight - b.startRight);
 
-    if (rawLine.startsWith('+')) {
-      rowClass = 'diff-row-add';
-      rNum = rightLine++;
-    } else if (rawLine.startsWith('-')) {
-      rowClass = 'diff-row-del';
-      lNum = leftLine++;
-    } else {
-      lNum = leftLine++;
-      rNum = rightLine++;
+  const segments = [];
+  let cursor = gapStartRight;
+  for (const ov of overlapping) {
+    if (ov.startRight > cursor) {
+      segments.push({ type: 'hidden', startRight: cursor, endRight: ov.startRight - 1 });
     }
+    segments.push({ type: 'expanded', startRight: ov.startRight, endRight: ov.endRight });
+    cursor = ov.endRight + 1;
+  }
+  if (cursor <= gapEndRight) {
+    segments.push({ type: 'hidden', startRight: cursor, endRight: gapEndRight });
+  }
 
-    const isHighlighted = highlightLine && rNum === highlightLine;
-    if (isHighlighted) rowClass += ' diff-row-highlight';
+  segments.forEach((seg, segIdx) => {
+    const segOffset = seg.startRight - gapStartRight;
+    const segStartLeft = gapStartLeft + segOffset;
+    const segCount = seg.endRight - seg.startRight + 1;
+    const segEndLeft = segStartLeft + segCount - 1;
+    const isLastSegment = segIdx === segments.length - 1;
 
-    rows.push(`
-      <tr class="${rowClass}" ${rNum ? `data-right-line="${rNum}"` : ''}>
-        <td class="diff-line-num">${lNum}</td>
-        <td class="diff-line-num">${rNum}</td>
-        <td class="diff-line-code">${escapeHtml(rawLine)}</td>
-      </tr>
-    `);
-
-    if (rNum) {
-      const matchingFindings = fileFindings.filter((f) => Number(f.resolvedLine) === Number(rNum));
-      for (const mf of matchingFindings) {
-        const sev = getSeverityMeta(mf.severity);
+    if (seg.type === 'expanded' && blobLines) {
+      for (let rLine = seg.startRight; rLine <= seg.endRight; rLine++) {
+        const lLine = gapStartLeft + (rLine - gapStartRight);
+        const lineContent = blobLines[rLine - 1] ?? '';
+        rows.push(
+          renderDiffLineAndFindingsHtml({
+            rowClass: 'diff-row-expanded-ctx',
+            lNum: lLine,
+            rNum: rLine,
+            codeText: ` ${lineContent}`,
+            fileFindings,
+            highlightLine,
+          })
+        );
+      }
+      if (isLastSegment && hunkHeaderText) {
         rows.push(`
-          <tr>
-            <td colspan="3" class="diff-inline-finding">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-                  <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
-                  <strong style="font-size:12.5px;">${escapeHtml(mf.id)} — ${formatInlineCodeHtml(mf.title)}</strong>
-                </div>
-                <div style="display:flex;gap:6px;">
-                  <button class="btn btn-secondary btn-sm diff-copy-finding-btn" data-cid="${escapeHtml(mf.cid)}">Copier</button>
-                  <button class="btn btn-primary btn-sm diff-post-finding-btn" data-cid="${escapeHtml(mf.cid)}">Poster ici</button>
-                </div>
-              </div>
-              <pre style="margin:0;white-space:pre-wrap;background:var(--bg-app);padding:10px;border-radius:4px;border:1px solid var(--border-color);font-size:11.5px;">${escapeHtml(mf.customComment)}</pre>
-            </td>
+          <tr class="diff-row-hunk">
+            <td class="diff-line-num">…</td>
+            <td class="diff-line-num">…</td>
+            <td class="diff-line-code">${escapeHtml(hunkHeaderText)}</td>
           </tr>
         `);
       }
+    } else {
+      // Hidden segment -> render interactive expander row with ↑ / ↓ arrow buttons
+      const upStartRight = Math.max(seg.startRight, seg.endRight - step + 1);
+      const upEndRight = seg.endRight;
+      const upStartLeft = segStartLeft + (upStartRight - seg.startRight);
+      const upEndLeft = segEndLeft;
+
+      const downStartRight = seg.startRight;
+      const downEndRight = Math.min(seg.endRight, seg.startRight + step - 1);
+      const downStartLeft = segStartLeft;
+      const downEndLeft = segStartLeft + (downEndRight - downStartRight);
+
+      const headerLabel =
+        isLastSegment && hunkHeaderText
+          ? `${hunkHeaderText}   ·   ${segCount} ${segCount > 1 ? 'lignes non modifiées masquées' : 'ligne non modifiée masquée'} (lignes ${seg.startRight}–${seg.endRight})`
+          : `@@ ${segCount} ${segCount > 1 ? 'lignes non modifiées masquées' : 'ligne non modifiée masquée'} (lignes ${seg.startRight}–${seg.endRight}) @@`;
+
+      const canExpandDown = !isTopOfFile && segCount > step;
+      const expandAllBtnHtml =
+        segCount > step
+          ? `<button type="button" class="diff-expand-btn diff-expand-range-btn" data-start-right="${seg.startRight}" data-end-right="${seg.endRight}" data-start-left="${segStartLeft}" data-end-left="${segEndLeft}" title="Afficher les ${segCount} lignes masquées (lignes ${seg.startRight} à ${seg.endRight})">&uarr;&darr; Tout (${segCount})</button>`
+          : '';
+
+      rows.push(`
+        <tr class="diff-row-hunk">
+          <td colspan="2" class="diff-hunk-expand-cell">
+            <div class="diff-hunk-actions">
+              <button type="button" class="diff-expand-btn diff-expand-range-btn" data-start-right="${upStartRight}" data-end-right="${upEndRight}" data-start-left="${upStartLeft}" data-end-left="${upEndLeft}" title="Déplier vers le haut (lignes ${upStartRight} à ${upEndRight})">&uarr; ${upEndRight - upStartRight + 1}</button>
+              ${
+                canExpandDown
+                  ? `<button type="button" class="diff-expand-btn diff-expand-range-btn" data-start-right="${downStartRight}" data-end-right="${downEndRight}" data-start-left="${downStartLeft}" data-end-left="${downEndLeft}" title="Déplier vers le bas (lignes ${downStartRight} à ${downEndRight})">&darr; ${downEndRight - downStartRight + 1}</button>`
+                  : ''
+              }
+            </div>
+          </td>
+          <td class="diff-line-code">
+            <div class="diff-hunk-header-bar">
+              <span>${escapeHtml(headerLabel)}</span>
+              ${expandAllBtnHtml}
+            </div>
+          </td>
+        </tr>
+      `);
     }
+  });
+
+  return rows.join('');
+}
+
+function renderPatchTableRows(patch, fileFindings, highlightLine, filename = state.selectedDiffFile) {
+  if (!patch) {
+    return `<tr><td colspan="3" class="diff-line-code meta-text">Aucun diff textuel disponible pour ce fichier.</td></tr>`;
+  }
+
+  const cacheKey = `${state.selectedPrKey || ''}::${filename || ''}`;
+  const blobLines = state.diffBlobCache[cacheKey] || null;
+  const expandedRanges = state.diffExpandedRanges[cacheKey] || [];
+  const hunks = parsePatchIntoHunks(patch);
+
+  if (hunks.length === 0) {
+    return `<tr><td colspan="3" class="diff-line-code meta-text">Aucun diff textuel disponible pour ce fichier.</td></tr>`;
+  }
+
+  const rows = [];
+  let prevEndRight = 0;
+  let prevEndLeft = 0;
+
+  hunks.forEach((hunk, idx) => {
+    const gapStartRight = prevEndRight + 1;
+    const gapEndRight = hunk.startRight - 1;
+    const gapStartLeft = prevEndLeft + 1;
+    const gapEndLeft = hunk.startLeft - 1;
+
+    rows.push(
+      renderGapWithExpanderHtml({
+        gapStartRight,
+        gapEndRight,
+        gapStartLeft,
+        gapEndLeft,
+        hunkHeaderText: hunk.header,
+        blobLines,
+        expandedRanges,
+        fileFindings,
+        highlightLine,
+        isTopOfFile: idx === 0,
+      })
+    );
+
+    for (const r of hunk.rows) {
+      const rowClass =
+        r.type === 'add' ? 'diff-row-add' : r.type === 'del' ? 'diff-row-del' : '';
+      rows.push(
+        renderDiffLineAndFindingsHtml({
+          rowClass,
+          lNum: r.leftNum,
+          rNum: r.rightNum,
+          codeText: r.rawLine,
+          fileFindings,
+          highlightLine,
+        })
+      );
+    }
+
+    prevEndRight = Math.max(prevEndRight, hunk.endRight);
+    prevEndLeft = Math.max(prevEndLeft, hunk.endLeft);
+  });
+
+  // Bottom-of-file expander (after the last hunk)
+  const lastRight = prevEndRight;
+  const lastLeft = prevEndLeft;
+  const eofStartRight = lastRight + 1;
+  const eofStartLeft = lastLeft + 1;
+
+  if (blobLines) {
+    if (eofStartRight <= blobLines.length) {
+      rows.push(
+        renderGapWithExpanderHtml({
+          gapStartRight: eofStartRight,
+          gapEndRight: blobLines.length,
+          gapStartLeft: eofStartLeft,
+          gapEndLeft: eofStartLeft + (blobLines.length - eofStartRight),
+          hunkHeaderText: '',
+          blobLines,
+          expandedRanges,
+          fileFindings,
+          highlightLine,
+          isTopOfFile: false,
+        })
+      );
+    }
+  } else {
+    // Blob not loaded yet -> show interactive ↓ +20 / ↓ Fin du fichier bar at bottom
+    rows.push(`
+      <tr class="diff-row-hunk">
+        <td colspan="2" class="diff-hunk-expand-cell">
+          <div class="diff-hunk-actions">
+            <button type="button" class="diff-expand-btn diff-expand-eof-btn" data-start-right="${eofStartRight}" data-start-left="${eofStartLeft}" data-step="20" title="Déplier les 20 lignes suivantes vers le bas (à partir de la ligne ${eofStartRight})">&darr; 20</button>
+          </div>
+        </td>
+        <td class="diff-line-code">
+          <div class="diff-hunk-header-bar">
+            <span>@@ Afficher la suite du fichier après la ligne ${lastRight} @@</span>
+            <button type="button" class="diff-expand-btn diff-expand-eof-btn" data-start-right="${eofStartRight}" data-start-left="${eofStartLeft}" data-step="0" title="Afficher tout le reste du fichier jusqu'à la fin">&darr; Jusqu'à la fin du fichier</button>
+          </div>
+        </td>
+      </tr>
+    `);
   }
 
   return rows.join('');
@@ -2132,6 +2723,11 @@ document.getElementById('openVscodeBtn')?.addEventListener('click', () => {
 // Split-Screen, Pop-out Window & BroadcastChannel Sync
 // =============================================================================
 function switchTab(tabName, options = {}) {
+  if (!options.keepQueueFullPage && state.prQueueFullPage) {
+    state.prQueueFullPage = false;
+    state.prSidebarCollapsed = !state.prSidebarPinned;
+    renderCollapsibleLayoutState();
+  }
   if (!options.keepFocusDiff && state.focusDiffMode && tabName !== 'diff') {
     setFocusDiffMode(false);
   }
@@ -2249,6 +2845,29 @@ document.getElementById('reviewAllPendingBtn')?.addEventListener('click', async 
   }
 });
 
+let chatPollTimer = null;
+
+function renderAgentContextBanner() {
+  const banner = document.getElementById('agentFindingContextBanner');
+  const textEl = document.getElementById('agentFindingContextText');
+  if (!banner || !textEl) return;
+
+  if (state.chatFindingContext) {
+    textEl.textContent = `Cible : ${state.chatFindingContext.id} — ${stripEmojis(state.chatFindingContext.title)}`;
+    banner.classList.remove('hidden');
+    return;
+  }
+
+  const currentFile = state.selectedDiffFile || state.selectedTreeFile;
+  if (currentFile) {
+    const shortPath = formatShortFilePath(currentFile, state.highlightedLine || state.selectedTreeLine);
+    textEl.textContent = `Fichier actif : ${shortPath}`;
+    banner.classList.remove('hidden');
+  } else {
+    banner.classList.add('hidden');
+  }
+}
+
 function toggleChatDrawer(forceState = null) {
   state.chatOpen = typeof forceState === 'boolean' ? forceState : !state.chatOpen;
   const drawer = document.getElementById('agentChatDrawer');
@@ -2256,12 +2875,19 @@ function toggleChatDrawer(forceState = null) {
   if (state.chatOpen) {
     drawer?.classList.remove('hidden');
     btn?.classList.add('btn-primary');
+    renderAgentContextBanner();
     const pr = state.prs.find((p) => p.key === state.selectedPrKey);
     if (pr) loadChatForCurrentPr(pr);
-    document.getElementById('agentChatInput')?.focus();
+    setTimeout(() => {
+      document.getElementById('agentChatInput')?.focus();
+    }, 20);
   } else {
     drawer?.classList.add('hidden');
     btn?.classList.remove('btn-primary');
+    if (chatPollTimer) {
+      clearInterval(chatPollTimer);
+      chatPollTimer = null;
+    }
   }
 }
 
@@ -2270,18 +2896,13 @@ document.getElementById('closeChatDrawerBtn')?.addEventListener('click', () => t
 
 function openChatWithFindingContext(finding) {
   state.chatFindingContext = finding;
-  const banner = document.getElementById('agentFindingContextBanner');
-  const textEl = document.getElementById('agentFindingContextText');
-  if (banner && textEl) {
-    textEl.textContent = `Cible : ${finding.id} — ${stripEmojis(finding.title)}`;
-    banner.classList.remove('hidden');
-  }
+  renderAgentContextBanner();
   toggleChatDrawer(true);
 }
 
 document.getElementById('clearFindingContextBtn')?.addEventListener('click', () => {
   state.chatFindingContext = null;
-  document.getElementById('agentFindingContextBanner')?.classList.add('hidden');
+  renderAgentContextBanner();
 });
 
 async function loadChatForCurrentPr(pr) {
@@ -2291,33 +2912,115 @@ async function loadChatForCurrentPr(pr) {
   if (!res.ok) return;
   const data = await res.json();
   state.chatMessages = data.messages || [];
+  state.chatActiveStream = data.activeStream || null;
   renderChatMessages();
+  if (state.chatActiveStream && !chatPollTimer) {
+    startChatStreamPolling(pr);
+  }
+}
+
+function startChatStreamPolling(pr) {
+  if (chatPollTimer) clearInterval(chatPollTimer);
+  chatPollTimer = setInterval(async () => {
+    try {
+      const res = await fetch(
+        `/api/agent/chat?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}`
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.activeStream) {
+        state.chatActiveStream = data.activeStream;
+        renderChatMessages();
+      } else if (state.chatActiveStream) {
+        state.chatActiveStream = null;
+        state.chatMessages = data.messages || state.chatMessages;
+        clearInterval(chatPollTimer);
+        chatPollTimer = null;
+        renderChatMessages();
+      }
+    } catch {
+      // Ignore transient poll errors
+    }
+  }, 900);
+}
+
+function formatChatMessageBodyHtml(rawText) {
+  const cleaned = stripEmojis(rawText || '');
+  if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
+    return `<div class="chat-markdown-body">${marked.parse(cleaned)}</div>`;
+  }
+  return `<div style="white-space:pre-wrap;">${escapeHtml(cleaned)}</div>`;
 }
 
 function renderChatMessages() {
   const container = document.getElementById('agentChatMessages');
   if (!container) return;
-  if (!state.chatMessages || state.chatMessages.length === 0) {
-    container.innerHTML = `<div class="empty-state meta-text">Pose une question technique sur la PR ou débrieffe un finding avec l'agent.</div>`;
+  const hasMessages = Array.isArray(state.chatMessages) && state.chatMessages.length > 0;
+  const stream = state.chatActiveStream;
+
+  if (!hasMessages && !stream) {
+    container.innerHTML = `<div class="empty-state meta-text">Pose une question technique sur le fichier affiché ou la PR (Entrée pour envoyer).</div>`;
     return;
   }
 
-  container.innerHTML = state.chatMessages
+  const bubblesHtml = (state.chatMessages || [])
     .map((m) => {
       const reviewerLabel = state.config?.githubUser || 'Reviewer';
       const roleLabel = m.role === 'user' ? reviewerLabel : 'Agent my-review';
       const findingTag = m.findingId ? ` · ${m.findingId}` : '';
+      const fileTag = !m.findingId && m.filePath ? ` · ${formatShortFilePath(m.filePath)}` : '';
       return `
         <div class="chat-bubble ${m.role === 'user' ? 'user' : 'assistant'}">
-          <div class="chat-bubble-meta">${escapeHtml(roleLabel + findingTag)}</div>
-          <div>${escapeHtml(stripEmojis(m.text))}</div>
+          <div class="chat-bubble-meta">${escapeHtml(roleLabel + findingTag + fileTag)}</div>
+          ${m.role === 'assistant' ? formatChatMessageBodyHtml(m.text) : `<div style="white-space:pre-wrap;">${escapeHtml(stripEmojis(m.text))}</div>`}
         </div>
       `;
     })
     .join('');
 
+  let streamBubbleHtml = '';
+  if (stream) {
+    const elapsedSec = Math.max(
+      0,
+      Math.floor((Date.now() - Date.parse(stream.startedAt || new Date().toISOString())) / 1000)
+    );
+    const phaseLabel = stream.phase || 'Réflexion en cours…';
+    const fileNote = stream.activeFile ? ` · ${formatShortFilePath(stream.activeFile)}` : '';
+    const partialHtml = stream.partialText
+      ? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border-subtle);">${formatChatMessageBodyHtml(stream.partialText)}</div>`
+      : '';
+    streamBubbleHtml = `
+      <div class="chat-bubble assistant chat-bubble-streaming">
+        <div class="chat-bubble-meta" style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <span>Agent my-review${escapeHtml(fileNote)}</span>
+          <span class="badge badge-mono">${elapsedSec}s</span>
+        </div>
+        <div class="chat-stream-status">
+          <span class="spinner"></span>
+          <span>${escapeHtml(phaseLabel)}</span>
+        </div>
+        ${partialHtml}
+      </div>
+    `;
+  }
+
+  container.innerHTML = bubblesHtml + streamBubbleHtml;
   container.scrollTop = container.scrollHeight;
 }
+
+document.getElementById('agentChatInput')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (!e.shiftKey || e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    const form = document.getElementById('agentChatForm');
+    if (form) {
+      if (typeof form.requestSubmit === 'function') {
+        form.requestSubmit();
+      } else {
+        form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+      }
+    }
+  }
+});
 
 document.getElementById('agentChatForm')?.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -2330,16 +3033,37 @@ document.getElementById('agentChatForm')?.addEventListener('submit', async (e) =
   const message = input.value.trim();
   if (!message) return;
 
+  const currentFilePath = state.selectedDiffFile || state.selectedTreeFile || null;
+  const currentLine = state.highlightedLine || state.selectedTreeLine || null;
+  const currentDiffFileObj = (state.currentDiff?.files || []).find(
+    (f) => f.filename === currentFilePath
+  );
+  const fileContext = currentFilePath
+    ? {
+        filePath: currentFilePath,
+        line: currentLine,
+        patch: currentDiffFileObj?.patch || '',
+      }
+    : null;
+
   input.value = '';
   sendBtn.disabled = true;
-  sendBtn.textContent = '...';
+  sendBtn.textContent = 'En cours…';
 
   state.chatMessages.push({
     role: 'user',
     text: message,
     findingId: state.chatFindingContext?.id || null,
+    filePath: currentFilePath,
   });
+  state.chatActiveStream = {
+    startedAt: new Date().toISOString(),
+    phase: 'Démarrage de Gemini et envoi du diff actif…',
+    partialText: '',
+    activeFile: currentFilePath,
+  };
   renderChatMessages();
+  startChatStreamPolling(pr);
 
   try {
     const res = await fetch('/api/agent/chat', {
@@ -2350,16 +3074,24 @@ document.getElementById('agentChatForm')?.addEventListener('submit', async (e) =
         number: pr.number,
         message,
         findingContext: state.chatFindingContext,
+        fileContext,
         action: debriefChecked ? 'debrief' : 'ask',
       }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Erreur communication agent');
+    state.chatActiveStream = null;
     state.chatMessages = data.messages || [];
     renderChatMessages();
   } catch (err) {
+    state.chatActiveStream = null;
+    renderChatMessages();
     showToast(`Erreur Agent: ${err.message}`, 5000);
   } finally {
+    if (chatPollTimer) {
+      clearInterval(chatPollTimer);
+      chatPollTimer = null;
+    }
     sendBtn.disabled = false;
     sendBtn.textContent = 'Envoyer';
   }
@@ -2744,8 +3476,11 @@ document.querySelectorAll('.view-tab').forEach((tab) => {
 
 document.getElementById('themeToggleBtn')?.addEventListener('click', () => {
   const html = document.documentElement;
-  const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-  html.setAttribute('data-theme', next);
+  const current = html.getAttribute('data-theme') || 'dark';
+  const currentIdx = THEME_ORDER.indexOf(current);
+  const next = THEME_ORDER[(currentIdx + 1) % THEME_ORDER.length];
+  applySavedTheme(next);
+  showToast(`Thème : ${THEME_LABELS[next] || next}`, 1800);
 });
 
 document.getElementById('syncQueueBtn')?.addEventListener('click', async () => {
@@ -3491,48 +4226,70 @@ function renderCollapsibleLayoutState() {
   const appShell = document.getElementById('appShell');
   const diffLayout = document.getElementById('diffLayoutContainer');
   const treeLayout = document.getElementById('treeLayoutContainer');
-  const prBtn = document.getElementById('togglePrSidebarBtn');
   const fileBtn = document.getElementById('toggleFileTreeBtn');
-  const zenBtn = document.getElementById('toggleZenModeBtn');
   const inlineDiffBtn = document.getElementById('diffToggleFilesInlineBtn');
   const inlineFocusBtn = document.getElementById('diffToggleFocusInlineBtn');
+  const returnActiveBtn = document.getElementById('returnToActivePrBtn');
 
-  appShell?.classList.toggle('sidebar-collapsed', state.prSidebarCollapsed || state.focusDiffMode);
-  appShell?.classList.toggle('focus-diff-mode', state.focusDiffMode);
+  appShell?.classList.toggle('pr-queue-fullpage', Boolean(state.prQueueFullPage));
+  appShell?.classList.toggle('sidebar-collapsed', !state.prQueueFullPage);
+  appShell?.classList.toggle('focus-diff-mode', !state.prQueueFullPage && state.focusDiffMode);
   diffLayout?.classList.toggle('file-tree-collapsed', state.fileTreeCollapsed);
   treeLayout?.classList.toggle('file-tree-collapsed', state.fileTreeCollapsed);
 
-  if (prBtn) {
-    prBtn.textContent = state.prSidebarCollapsed ? 'Afficher PRs' : 'Masquer PRs';
-    prBtn.classList.toggle('btn-primary', state.prSidebarCollapsed);
+  if (returnActiveBtn) {
+    returnActiveBtn.classList.toggle('hidden', !state.prQueueFullPage || !state.selectedPrKey);
+    const activePr = state.prs.find((p) => p.key === state.selectedPrKey);
+    if (activePr) {
+      returnActiveBtn.textContent = `Reprendre ${activePr.repo} #${activePr.number} →`;
+    }
   }
+
   if (fileBtn) {
-    fileBtn.textContent = state.fileTreeCollapsed ? 'Afficher Fichiers' : 'Masquer Fichiers';
+    fileBtn.textContent = state.fileTreeCollapsed ? 'Afficher Fichiers (b)' : 'Masquer Fichiers (b)';
     fileBtn.classList.toggle('btn-primary', state.fileTreeCollapsed);
-  }
-  if (zenBtn) {
-    zenBtn.textContent = state.focusDiffMode ? 'Quitter Focus (Esc)' : 'Focus Diff';
-    zenBtn.classList.toggle('btn-primary', state.focusDiffMode);
   }
   if (inlineDiffBtn) {
     const total = (state.currentDiff?.files || []).length;
     inlineDiffBtn.textContent = state.fileTreeCollapsed
-      ? `Fichiers (${total})`
-      : 'Masquer Fichiers';
+      ? `Fichiers (${total}) (b)`
+      : 'Masquer Fichiers (b)';
+    inlineDiffBtn.classList.toggle('btn-primary', state.fileTreeCollapsed);
+    inlineDiffBtn.classList.toggle('btn-secondary', !state.fileTreeCollapsed);
   }
   if (inlineFocusBtn) {
-    inlineFocusBtn.textContent = state.focusDiffMode ? 'Quitter Focus (Esc)' : 'Focus Diff (z)';
+    inlineFocusBtn.textContent = state.focusDiffMode ? 'Afficher En-tête (Esc)' : 'Focus Diff (z)';
     inlineFocusBtn.classList.toggle('btn-primary', state.focusDiffMode);
     inlineFocusBtn.classList.toggle('btn-secondary', !state.focusDiffMode);
   }
 }
 
-function togglePrSidebar() {
-  if (state.focusDiffMode) {
-    setFocusDiffMode(false);
-    return;
+async function enterPrReviewWorkspace(prKey, targetTab = null) {
+  if (!prKey) return;
+  const shouldReloadPr = state.selectedPrKey !== prKey || !state.currentDiff;
+  state.prQueueFullPage = false;
+  state.prSidebarCollapsed = true;
+
+  // Clicking a PR (targetTab === null) or clicking "Ouvrir Diff" lands directly in Focus Diff mode
+  // WITH the modified files tree open on the left (`fileTreeCollapsed = false`)
+  if (!targetTab || targetTab === 'diff') {
+    state.fileTreeCollapsed = false;
+    state.focusDiffMode = true;
+    switchTab('diff', { keepFocusDiff: true });
+  } else {
+    state.focusDiffMode = false;
+    switchTab(targetTab);
   }
-  state.prSidebarCollapsed = !state.prSidebarCollapsed;
+  renderCollapsibleLayoutState();
+
+  if (shouldReloadPr) {
+    await selectPr(prKey, true);
+  }
+}
+
+function showFullPagePrQueue() {
+  state.focusDiffMode = false;
+  state.prQueueFullPage = true;
   renderCollapsibleLayoutState();
 }
 
@@ -3541,16 +4298,15 @@ function toggleFileTree() {
   renderCollapsibleLayoutState();
 }
 
-function setFocusDiffMode(enabled) {
+function setFocusDiffMode(enabled, { keepFileTree = false } = {}) {
   if (enabled) {
-    state._prevPrSidebar = state.prSidebarCollapsed;
     state._prevFileTree = state.fileTreeCollapsed;
     if (state.splitMode) {
       toggleSplitMode();
     }
     state.focusDiffMode = true;
-    state.prSidebarCollapsed = true;
-    state.fileTreeCollapsed = true;
+    state.prQueueFullPage = false;
+    state.fileTreeCollapsed = keepFileTree ? false : state.fileTreeCollapsed;
     switchTab('diff', { keepFocusDiff: true });
     renderCollapsibleLayoutState();
     setTimeout(() => {
@@ -3558,8 +4314,6 @@ function setFocusDiffMode(enabled) {
     }, 0);
   } else {
     state.focusDiffMode = false;
-    state.prSidebarCollapsed = Boolean(state._prevPrSidebar);
-    state.fileTreeCollapsed = Boolean(state._prevFileTree);
     renderCollapsibleLayoutState();
   }
 }
@@ -3613,22 +4367,25 @@ function openKeyboardShortcutsModal() {
   confirmBtn.textContent = 'Fermer';
 
   const shortcuts = [
+    ['Entrée (dans la liste PRs)', 'Ouvrir la PR directement en Focus Diff + Arbre Fichiers'],
+    ['b (ou ])', 'Afficher / Masquer l’arbre des fichiers modifiés à gauche'],
+    ['q', 'Revenir à la sélection de PRs pleine page (Toutes les PRs)'],
     ['← / → (ou h / l)', 'Fichier modifié précédent / suivant (Diff)'],
     ['↑ / ↓ / PageUp / PageDown', 'Défiler dans le diff ou le rapport actif'],
     ['- / + (ou =) / 0', 'Dézoomer / Zoomer dans le diff / Reset 100%'],
     ['n / p', 'Hunk ou Finding suivant / précédent'],
-    ['z ou f', 'Mode Focus Diff plein écran (100% diff)'],
+    ['z ou f', 'Mode Focus Diff plein écran (masquer/afficher l’en-tête PR)'],
     ['Esc', 'Quitter Focus Diff / Fermer modale ou drawer'],
     ['g', 'Sélecteur rapide de fichier (Diff / Tree)'],
     ['j / k', 'PR suivante / PR précédente dans la queue'],
     ['1 — 5', 'Changer d’onglet (Audit, Commentaires, Diff, Tree, Règles)'],
-    ['[ / ]', 'Masquer/Afficher liste PRs / liste Fichiers'],
+    ['[', 'Masquer/Afficher colonne PRs'],
     ['t', 'Basculer le fichier entre Diff Git et Arbre de Travail'],
     ['i', 'Ouvrir le fichier courant dans PhpStorm'],
     ['s', 'Mode Split côte-à-côte (Rapport + Code)'],
     ['o', 'Ouvrir le Diff dans une fenêtre Pop-out'],
-    ['c', 'Ouvrir / Fermer le drawer Agent Q&A'],
-    ['r', 'Relancer l’audit IA (Run Review) sur la PR'],
+    ['c (puis Entrée)', 'Ouvrir Agent Q&A (Entrée ou Cmd+Entrée pour envoyer)'],
+    ['r', 'Relancer l’audit IA sur la PR'],
     ['m', 'Ouvrir la modale Publier Review sur GitHub'],
     ['/', 'Rechercher / Filtrer une PR'],
     ['?', 'Afficher cette aide des raccourcis clavier'],
@@ -3655,11 +4412,15 @@ function openKeyboardShortcutsModal() {
   };
 }
 
-document.getElementById('togglePrSidebarBtn')?.addEventListener('click', togglePrSidebar);
 document.getElementById('toggleFileTreeBtn')?.addEventListener('click', toggleFileTree);
-document.getElementById('toggleZenModeBtn')?.addEventListener('click', toggleZenMode);
 document.getElementById('openShortcutsBtn')?.addEventListener('click', openKeyboardShortcutsModal);
 document.getElementById('topbarShortcutsBtn')?.addEventListener('click', openKeyboardShortcutsModal);
+document.getElementById('backToPrQueueBtn')?.addEventListener('click', showFullPagePrQueue);
+document.getElementById('returnToActivePrBtn')?.addEventListener('click', () => {
+  if (state.selectedPrKey) {
+    enterPrReviewWorkspace(state.selectedPrKey, null);
+  }
+});
 
 // =============================================================================
 // Keyboard Shortcuts (100% Keyboard-Driven Interface)
@@ -3672,6 +4433,9 @@ document.addEventListener('keydown', (e) => {
     const tag = (e.target?.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target?.isContentEditable) {
       e.target.blur();
+      if (e.target?.id === 'agentChatInput' && state.chatOpen) {
+        toggleChatDrawer(false);
+      }
       return;
     }
     if (isModalOpen) {
@@ -3696,6 +4460,24 @@ document.addEventListener('keydown', (e) => {
   }
   if (isModalOpen) return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+  if (e.key === 'Enter' && state.prQueueFullPage) {
+    e.preventDefault();
+    if (state.selectedPrKey) {
+      enterPrReviewWorkspace(state.selectedPrKey, null);
+    }
+    return;
+  }
+
+  if (e.key === 'q') {
+    e.preventDefault();
+    if (state.prQueueFullPage && state.selectedPrKey) {
+      enterPrReviewWorkspace(state.selectedPrKey, null);
+    } else {
+      showFullPagePrQueue();
+    }
+    return;
+  }
 
   if (e.key === 'ArrowLeft' || e.key === 'h') {
     if (state.focusDiffMode || state.activeTab === 'diff' || state.activeTab === 'tree' || state.splitMode) {
@@ -3765,8 +4547,8 @@ document.addEventListener('keydown', (e) => {
     switchTab('rules');
   } else if (e.key === '[') {
     e.preventDefault();
-    togglePrSidebar();
-  } else if (e.key === ']') {
+    showFullPagePrQueue();
+  } else if (e.key === 'b' || e.key === ']') {
     e.preventDefault();
     toggleFileTree();
   } else if (e.key === 'z' || e.key === 'f') {
@@ -3788,8 +4570,7 @@ document.addEventListener('keydown', (e) => {
     openBatchReviewModal('APPROVE');
   } else if (e.key === '/') {
     e.preventDefault();
-    if (state.focusDiffMode) setFocusDiffMode(false);
-    if (state.prSidebarCollapsed) togglePrSidebar();
+    showFullPagePrQueue();
     document.getElementById('searchInput')?.focus();
   } else if (e.key === '-' || e.key === '_') {
     e.preventDefault();

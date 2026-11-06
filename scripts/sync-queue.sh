@@ -211,15 +211,32 @@ for f in "${REVIEWS_DIR}"/review-*.md; do
   fi
 done
 
-# 2. Check existing OPEN PRs in .state.json to see if any were MERGED or CLOSED
-OPEN_KEYS=$(jq -r '.prs | to_entries[] | select(.value.state == "OPEN") | .key' "${STATE_FILE}")
-for key in ${OPEN_KEYS}; do
+# 2. Check existing OPEN PRs (or PRs missing rich metadata) in .state.json to see if any were MERGED or CLOSED
+CHECK_KEYS=$(jq -r '.prs | to_entries[] | select(.value.state == "OPEN" or (.value.changedFiles == null)) | .key' "${STATE_FILE}")
+for key in ${CHECK_KEYS}; do
   repo="${key%#*}"
   num="${key#*#}"
   pr_info=$(gh api graphql -f query="{
     repository(owner: \"${ORG}\", name: \"${repo}\") {
       pullRequest(number: ${num}) {
-        state headRefOid updatedAt
+        state headRefOid updatedAt createdAt additions deletions changedFiles mergeable reviewDecision
+        author { login ... on User { name } }
+        labels(first: 10) { nodes { name color } }
+        latestOpinionatedReviews(first: 20) {
+          nodes {
+            state
+            submittedAt
+            author { login ... on User { name } }
+          }
+        }
+        reviewRequests(first: 15) {
+          nodes {
+            requestedReviewer {
+              ... on User { login name }
+              ... on Team { name slug }
+            }
+          }
+        }
       }
     }
   }" --jq '.data.repository.pullRequest' 2>/dev/null || echo "null")
@@ -228,7 +245,26 @@ for key in ${OPEN_KEYS}; do
     jq --arg k "$key" --argjson pr "$pr_info" '
       .prs[$k].state = $pr.state |
       .prs[$k].headRefOid = $pr.headRefOid |
-      .prs[$k].updatedAt = $pr.updatedAt
+      .prs[$k].updatedAt = $pr.updatedAt |
+      .prs[$k].createdAt = ($pr.createdAt // .prs[$k].createdAt // null) |
+      .prs[$k].authorName = ($pr.author.name // .prs[$k].authorName // null) |
+      .prs[$k].additions = ($pr.additions // .prs[$k].additions // null) |
+      .prs[$k].deletions = ($pr.deletions // .prs[$k].deletions // null) |
+      .prs[$k].changedFiles = ($pr.changedFiles // .prs[$k].changedFiles // null) |
+      .prs[$k].mergeable = ($pr.mergeable // .prs[$k].mergeable // null) |
+      .prs[$k].reviewDecision = ($pr.reviewDecision // .prs[$k].reviewDecision // null) |
+      .prs[$k].labels = ([$pr.labels.nodes[]? | { name: .name, color: .color }]) |
+      .prs[$k].latestReviews = ([$pr.latestOpinionatedReviews.nodes[]? | select(.author.login != null) | {
+        login: .author.login,
+        name: (.author.name // null),
+        state: .state,
+        submittedAt: .submittedAt
+      }]) |
+      .prs[$k].pendingReviewers = ([$pr.reviewRequests.nodes[]?.requestedReviewer | select(. != null) | {
+        login: (.login // .slug // null),
+        name: (.name // .login // .slug // null),
+        isTeam: (has("slug"))
+      }])
     ' "${STATE_FILE}" > "${TMP_STATE}" && mv "${TMP_STATE}" "${STATE_FILE}"
   fi
 done
@@ -261,14 +297,25 @@ PR_FRAGMENT='
   title
   state
   isDraft
+  createdAt
   updatedAt
+  additions
+  deletions
+  changedFiles
   headRefOid
   baseRefName
   headRefName
   mergeable
+  reviewDecision
   url
   author { login ... on User { name } }
   repository { name }
+  labels(first: 10) {
+    nodes {
+      name
+      color
+    }
+  }
   commits(last: 1) {
     nodes {
       commit {
@@ -278,9 +325,24 @@ PR_FRAGMENT='
       }
     }
   }
+  latestOpinionatedReviews(first: 20) {
+    nodes {
+      author { login ... on User { name } }
+      state
+      submittedAt
+    }
+  }
+  reviewRequests(first: 15) {
+    nodes {
+      requestedReviewer {
+        ... on User { login name }
+        ... on Team { name slug }
+      }
+    }
+  }
   reviews(last: 20) {
     nodes {
-      author { login }
+      author { login ... on User { name } }
       state
       commit { oid }
       submittedAt
@@ -358,7 +420,24 @@ SCAN_RESULT=$(jq -n \
         baseRefName: $pr.baseRefName,
         headRefName: $pr.headRefName,
         headRefOid: $pr.headRefOid,
+        createdAt: ($pr.createdAt // $st.createdAt // null),
+        additions: ($pr.additions // $st.additions // null),
+        deletions: ($pr.deletions // $st.deletions // null),
+        changedFiles: ($pr.changedFiles // $st.changedFiles // null),
         mergeable: ($pr.mergeable // $st.mergeable // null),
+        reviewDecision: ($pr.reviewDecision // $st.reviewDecision // null),
+        labels: ([$pr.labels.nodes[]? | { name: .name, color: .color }]),
+        latestReviews: ([$pr.latestOpinionatedReviews.nodes[]? | select(.author.login != null) | {
+          login: .author.login,
+          name: (.author.name // null),
+          state: .state,
+          submittedAt: .submittedAt
+        }]),
+        pendingReviewers: ([$pr.reviewRequests.nodes[]?.requestedReviewer | select(. != null) | {
+          login: (.login // .slug // null),
+          name: (.name // .login // .slug // null),
+          isTeam: (has("slug"))
+        }]),
         ciState: ($pr.commits.nodes[0].commit.statusCheckRollup.state // $st.ciState // null),
         previousReviewedSha: ($localSha // $ghSha),
         lastReviewedSha: $localSha,

@@ -17,6 +17,7 @@ import {
 import {
   computeAuthorInitials,
   resolveAuthorDisplayName,
+  formatPersonDisplayName,
   extractJiraKey,
   detectStackedPr,
   normalizeCiState,
@@ -37,6 +38,7 @@ import {
 import {
   getAgentJobs,
   getPrChatHistory,
+  getPrChatStatus,
   triggerPrReview,
   sendPrChatMessage,
   dismissFindingAsFalsePositive,
@@ -86,16 +88,21 @@ async function fetchPrDiffFiles(repo, number, sha = 'latest') {
   const safeSha = (sha || 'latest').slice(0, 12);
   const cacheFile = path.join(cacheDir, `diff-${repo}-${number}-${safeSha}.json`);
   if (fs.existsSync(cacheFile)) {
-    return readJsonSafe(cacheFile, []);
+    const cached = readJsonSafe(cacheFile, []);
+    // If legacy non-paginated cache hit the exact 100-file boundary, re-fetch with pagination
+    if (Array.isArray(cached) && cached.length !== 100) {
+      return cached;
+    }
   }
 
   const { stdout } = await execFileAsync(
     'gh',
-    ['api', `repos/${cfg.githubOrg}/${repo}/pulls/${number}/files?per_page=100`],
-    { maxBuffer: 25 * 1024 * 1024 }
+    ['api', '--paginate', '--slurp', `repos/${cfg.githubOrg}/${repo}/pulls/${number}/files?per_page=100`],
+    { maxBuffer: 50 * 1024 * 1024 }
   );
 
-  const files = JSON.parse(stdout);
+  const parsed = JSON.parse(stdout);
+  const files = Array.isArray(parsed) && Array.isArray(parsed[0]) ? parsed.flat() : parsed;
   writeJsonSafe(cacheFile, files);
   return files;
 }
@@ -141,12 +148,44 @@ export function buildStateResponse() {
 
     const authorInitials = computeAuthorInitials({ login: pr.author, name: pr.authorName });
     const authorDisplayName = resolveAuthorDisplayName({ login: pr.author, name: pr.authorName });
-    const resolvedJira = extractJiraKey(pr, cfg);
+    const resolvedJira = extractJiraKey(pr, cfg.jiraPrefixes);
     const stackInfo = detectStackedPr(pr);
     const ciStatus = normalizeCiState(pr.ciState);
     const wtPath = getWorktreePath(projectsDir, pr.repo, pr.number);
     const worktreeMounted = fs.existsSync(wtPath);
     const runningJob = jobs.find((j) => j.prKey === key && j.status === 'running') || null;
+
+    // Resolve full names for approvals, changes requested, comments, and pending reviewers
+    const latestReviews = Array.isArray(pr.latestReviews) ? pr.latestReviews : [];
+    const approvedBy = [];
+    const changesRequestedBy = [];
+    const commentedBy = [];
+    for (const rev of latestReviews) {
+      if (!rev || !rev.login) continue;
+      // Skip bots
+      if (/^(ci-cd-matawan|dependabot|renovate|github-actions)/i.test(rev.login)) continue;
+      const personLabel = formatPersonDisplayName({ login: rev.login, name: rev.name });
+      if (rev.state === 'APPROVED' && !approvedBy.includes(personLabel)) {
+        approvedBy.push(personLabel);
+      } else if (rev.state === 'CHANGES_REQUESTED' && !changesRequestedBy.includes(personLabel)) {
+        changesRequestedBy.push(personLabel);
+      } else if (rev.state === 'COMMENTED' && !commentedBy.includes(personLabel)) {
+        commentedBy.push(personLabel);
+      }
+    }
+
+    const pendingReviewers = (Array.isArray(pr.pendingReviewers) ? pr.pendingReviewers : [])
+      .map((req) => {
+        if (!req) return null;
+        if (req.isTeam) {
+          return req.name || req.login;
+        }
+        return formatPersonDisplayName({
+          login: req.login,
+          name: req.name && req.name !== req.login ? req.name : '',
+        });
+      })
+      .filter(Boolean);
 
     return {
       ...pr,
@@ -154,6 +193,10 @@ export function buildStateResponse() {
       jiraKey: resolvedJira || pr.jiraKey || '—',
       authorInitials,
       authorDisplayName,
+      approvedBy,
+      changesRequestedBy,
+      commentedBy,
+      pendingReviewers,
       isStacked: stackInfo.isStacked,
       ciStatus,
       worktreeMounted,
@@ -360,10 +403,41 @@ export function createHubServer() {
           return sendJson(res, 400, { error: 'Missing repo, number, or path' });
         }
 
+        const cleanPath = String(filePath).replace(/^\/+/, '');
+        if (cleanPath.includes('..')) {
+          return sendJson(res, 400, { error: 'Invalid file path' });
+        }
+
         const repoPath = getLocalRepoPath(projectsDir, repo);
-        const commitRef = await ensurePrCommitFetched(repoPath, number, sha);
-        const blob = await readBlobAtCommit(repoPath, commitRef, filePath);
-        return sendJson(res, 200, { ...blob, commitRef });
+        try {
+          const commitRef = await ensurePrCommitFetched(repoPath, number, sha);
+          const blob = await readBlobAtCommit(repoPath, commitRef, cleanPath);
+          return sendJson(res, 200, { ...blob, commitRef });
+        } catch (localErr) {
+          // Fallback to GitHub REST API if local repository or commit is not available locally
+          try {
+            const refQuery = sha && sha !== 'latest' ? `?ref=${encodeURIComponent(sha)}` : '';
+            const encodedPath = cleanPath.split('/').map(encodeURIComponent).join('/');
+            const { stdout } = await execFileAsync(
+              'gh',
+              [
+                'api',
+                '-H',
+                'Accept: application/vnd.github.raw+json',
+                `repos/${cfg.githubOrg}/${repo}/contents/${encodedPath}${refQuery}`,
+              ],
+              { maxBuffer: 15 * 1024 * 1024 }
+            );
+            return sendJson(res, 200, {
+              filePath: cleanPath,
+              content: stdout,
+              lineCount: stdout.split('\n').length,
+              commitRef: sha || 'HEAD',
+            });
+          } catch {
+            throw localErr;
+          }
+        }
       }
 
       if (req.method === 'GET' && pathname === '/api/grep') {
@@ -479,12 +553,20 @@ export function createHubServer() {
           return sendJson(res, 400, { error: 'Missing repo or number' });
         }
         const messages = getPrChatHistory(reviewsDir, repo, number);
-        return sendJson(res, 200, { messages });
+        const activeStream = getPrChatStatus(`${repo}#${number}`);
+        return sendJson(res, 200, { messages, activeStream });
       }
 
       if (req.method === 'POST' && pathname === '/api/agent/chat') {
         const body = await readRequestBody(req);
-        const { repo, number, message, findingContext = null, action = 'ask' } = body;
+        const {
+          repo,
+          number,
+          message,
+          findingContext = null,
+          fileContext = null,
+          action = 'ask',
+        } = body;
         if (!repo || !number || !message) {
           return sendJson(res, 400, { error: 'Missing repo, number, or message' });
         }
@@ -495,10 +577,11 @@ export function createHubServer() {
           pr,
           message,
           findingContext,
+          fileContext,
           action,
         });
         const messages = getPrChatHistory(reviewsDir, repo, number);
-        return sendJson(res, 200, { ok: true, ...result, messages });
+        return sendJson(res, 200, { ok: true, ...result, messages, activeStream: null });
       }
 
       if (req.method === 'POST' && pathname === '/api/agent/dismiss') {

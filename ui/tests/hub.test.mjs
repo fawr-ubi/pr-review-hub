@@ -15,6 +15,7 @@ import {
 import { loadConfig, saveConfig } from '../lib/config.mjs';
 import {
   computeAuthorInitials,
+  resolveAuthorDisplayName,
   extractJiraKey,
   detectStackedPr,
   normalizeCiState,
@@ -534,12 +535,15 @@ describe('Metadata, Working Tree Explorer, Worktrees & Agent Q&A', () => {
     }
   });
 
-  test('computeAuthorInitials resolves full names, known logins, and -ubi suffixes', () => {
+  test('computeAuthorInitials and resolveAuthorDisplayName format full names and @handles cleanly', () => {
     assert.equal(computeAuthorInitials({ login: 'fawr-ubi', name: 'Antoine Fawer' }), 'AF');
     assert.equal(computeAuthorInitials({ login: 'fawr-ubi' }), 'AF');
     assert.equal(computeAuthorInitials({ login: 'p-pichet' }), 'PP');
     assert.equal(computeAuthorInitials({ login: 'sontungpham', name: 'Son Tung PHAM' }), 'SP');
     assert.equal(computeAuthorInitials({ login: 'jdoe-ubi' }), 'JD');
+
+    assert.equal(resolveAuthorDisplayName({ login: 'fawr-ubi', name: 'Antoine fawer' }), 'Antoine Fawer');
+    assert.equal(resolveAuthorDisplayName({ login: 'sontungpham', name: '' }), '@sontungpham');
   });
 
   test('extractJiraKey, detectStackedPr, and normalizeCiState work accurately', () => {
@@ -844,6 +848,84 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     delete process.env.REVIEW_HUB_DNA_FILE;
     delete process.env.REVIEW_HUB_CANDIDATES_FILE;
     delete process.env.REVIEW_HUB_CHANGELOG_FILE;
+  });
+
+  test('Full-Page PR Selection Queue, zero abbreviations (full words), rich PR tags, 3-theme cycle (light/purple/dark), and >100 files pagination', async () => {
+    const [htmlRes, jsRes, cssRes] = await Promise.all([
+      fetch(`${baseUrl}/`),
+      fetch(`${baseUrl}/app.js`),
+      fetch(`${baseUrl}/styles.css`),
+    ]);
+    assert.equal(htmlRes.status, 200);
+    assert.equal(jsRes.status, 200);
+    assert.equal(cssRes.status, 200);
+
+    const html = await htmlRes.text();
+    const js = await jsRes.text();
+    const css = await cssRes.text();
+
+    // Full-page PR selection queue layout & controls (exclusively full-page, no narrow left PR column)
+    assert.ok(html.includes('pr-queue-fullpage'));
+    assert.ok(html.includes('id="backToPrQueueBtn"'));
+    assert.ok(html.includes('id="returnToActivePrBtn"'));
+    assert.ok(!html.includes('id="togglePinSidebarBtn"'));
+    assert.ok(!html.includes('id="togglePrSidebarBtn"'));
+    assert.ok(css.includes('.app-shell.pr-queue-fullpage'));
+    assert.ok(js.includes('enterPrReviewWorkspace'));
+    assert.ok(js.includes('showFullPagePrQueue'));
+
+    // Removed redundant buttons (.zip and topbar Focus Diff) and removed 2-letter initials badges
+    assert.ok(!html.includes('/api/export-zip'));
+    assert.ok(!html.includes('id="toggleZenModeBtn"'));
+    assert.ok(!html.includes('id="prAuthorInitialsBadge"'));
+    assert.ok(!js.includes('author-initials-circle'));
+
+    // Zero abbreviations ("en toutes lettres") & rich PR detail tags in HTML and JS
+    assert.ok(html.includes('Configuration'));
+    assert.ok(html.includes('Tout auditer'));
+    assert.ok(html.includes('Synchroniser GitHub'));
+    assert.ok(html.includes('Peer-Review'));
+    assert.ok(html.includes('Self-Review'));
+    assert.ok(html.includes('Monter Worktree'));
+    assert.ok(js.includes('Tous les dépôts'));
+    assert.ok(js.includes('CI : Succès'));
+    assert.ok(js.includes('CI : Échec'));
+    assert.ok(js.includes('Branche empilée →'));
+    assert.ok(js.includes('Worktree : Git direct'));
+    assert.ok(js.includes('Ouvrir Diff'));
+    assert.ok(js.includes('Lire Audit'));
+    assert.ok(js.includes('Approuvé par :'));
+    assert.ok(js.includes('Changements demandés par :'));
+    assert.ok(js.includes('En attente de :'));
+    assert.ok(js.includes('Conflit Git'));
+    assert.ok(js.includes('Fusionnable'));
+    assert.ok(!js.includes('$1 blk'));
+    assert.ok(!js.includes('$1 maj'));
+
+    // 3-Theme cycle with 'purple' between 'light' and 'dark'
+    assert.ok(css.includes('[data-theme="purple"]'));
+    assert.ok(css.includes('#231f33'));
+    assert.ok(js.includes("const THEME_ORDER = ['light', 'purple', 'dark']"));
+
+    // Dedicated 'b' shortcut for modified file tree & Enter/Cmd+Enter chat submission
+    assert.ok(js.includes("e.key === 'b'"));
+    assert.ok(js.includes('Masquer Fichiers (b)'));
+    assert.ok(js.includes("document.getElementById('agentChatInput')?.addEventListener('keydown'"));
+    assert.ok(js.includes('form.requestSubmit()'));
+
+    // On-demand context expansion (↑ / ↓ arrows & full-file toggle) for unchanged lines in Diff
+    assert.ok(js.includes('parsePatchIntoHunks'));
+    assert.ok(js.includes('renderGapWithExpanderHtml'));
+    assert.ok(js.includes('diff-expand-range-btn'));
+    assert.ok(js.includes('diff-expand-eof-btn'));
+    assert.ok(js.includes('diffExpandAllContextBtn'));
+    assert.ok(css.includes('.diff-expand-btn'));
+    assert.ok(css.includes('.diff-row-expanded-ctx'));
+
+    // Server pagination for >100 changed files
+    const serverSrc = fs.readFileSync(new URL('../server.mjs', import.meta.url), 'utf8');
+    assert.ok(serverSrc.includes("'--paginate'"));
+    assert.ok(serverSrc.includes("'--slurp'"));
   });
 });
 

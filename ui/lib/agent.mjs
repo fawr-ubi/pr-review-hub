@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { SKILL_ROOT } from './config.mjs';
 import { parseFindingsFromMarkdown } from './parser.mjs';
@@ -11,10 +11,15 @@ import { getReferencePaths, syncCombinedReferenceFiles } from './rules.mjs';
 const execFileAsync = promisify(execFile);
 
 const activeJobs = new Map();
+const activeChatStreams = new Map();
 let customAgentRunner = null;
 
 export function setCustomAgentRunnerForTests(fn) {
   customAgentRunner = fn;
+}
+
+export function getPrChatStatus(prKey) {
+  return activeChatStreams.get(prKey) || null;
 }
 
 export function getAgentJobs() {
@@ -91,17 +96,121 @@ function inferVerdictFromFindings(findings = [], rawMarkdown = '') {
   return '🟢 Ready to Approve';
 }
 
-async function runCliPrompt({ prompt, cwd, approvalMode = 'yolo', timeoutMs = 240000 }) {
+async function runCliPrompt({
+  prompt,
+  cwd,
+  approvalMode = 'yolo',
+  timeoutMs = 240000,
+  fastChatMode = false,
+  onStreamUpdate = null,
+}) {
   if (customAgentRunner) {
+    if (onStreamUpdate) {
+      onStreamUpdate({ phase: 'Exécution de l’agent…', partialText: '' });
+    }
     return customAgentRunner({ prompt, cwd, approvalMode });
   }
   const bin = resolveGeminiBinary();
-  const { stdout } = await execFileAsync(bin, ['-p', prompt, '--approval-mode', approvalMode], {
-    cwd: fs.existsSync(cwd) ? cwd : process.cwd(),
-    maxBuffer: 25 * 1024 * 1024,
-    timeout: timeoutMs,
+  const workingDir = fs.existsSync(cwd) ? cwd : process.cwd();
+
+  if (!fastChatMode) {
+    const { stdout } = await execFileAsync(bin, ['-p', prompt, '--approval-mode', approvalMode], {
+      cwd: workingDir,
+      maxBuffer: 25 * 1024 * 1024,
+      timeout: timeoutMs,
+    });
+    return stdout.trim();
+  }
+
+  // Fast streaming mode for interactive Q&A: skip external MCP servers & extensions, stream JSON events
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-p',
+      prompt,
+      '--approval-mode',
+      approvalMode,
+      '-o',
+      'stream-json',
+      '--allowed-mcp-server-names',
+      'none',
+      '-e',
+      'none',
+    ];
+    const child = spawn(bin, args, {
+      cwd: workingDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let partialText = '';
+    let rawStdout = '';
+    let lineBuffer = '';
+
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`Délai dépassé (${Math.round(timeoutMs / 1000)}s)`));
+    }, timeoutMs);
+
+    const processJsonLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('{')) return;
+      try {
+        const evt = JSON.parse(trimmed);
+        if (evt.type === 'init') {
+          onStreamUpdate?.({
+            phase: 'Modèle initialisé — analyse du code et du diff…',
+            partialText,
+          });
+        } else if (evt.type === 'tool_use' || evt.tool_name) {
+          const toolLabel = evt.tool_name || evt.name || 'outil';
+          onStreamUpdate?.({
+            phase: `Inspection en cours (${toolLabel})…`,
+            partialText,
+            toolName: toolLabel,
+          });
+        } else if (evt.type === 'message' && evt.role === 'assistant' && typeof evt.content === 'string') {
+          if (evt.delta) {
+            partialText += evt.content;
+          } else {
+            partialText = evt.content;
+          }
+          onStreamUpdate?.({
+            phase: 'Rédaction de la réponse en direct…',
+            partialText,
+          });
+        }
+      } catch {
+        // Ignore non-JSON warning lines
+      }
+    };
+
+    child.stdout.on('data', (chunk) => {
+      const str = chunk.toString('utf8');
+      rawStdout += str;
+      lineBuffer += str;
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop() || '';
+      for (const l of lines) {
+        processJsonLine(l);
+      }
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (lineBuffer) processJsonLine(lineBuffer);
+      if (partialText.trim()) {
+        resolve(partialText.trim());
+      } else if (code === 0 && rawStdout.trim()) {
+        resolve(rawStdout.trim());
+      } else {
+        reject(new Error(`Le processus Gemini s'est terminé avec le code ${code}`));
+      }
+    });
   });
-  return stdout.trim();
 }
 
 export function triggerPrReview({ cfg, pr }) {
@@ -212,6 +321,7 @@ export async function sendPrChatMessage({
   pr,
   message,
   findingContext = null,
+  fileContext = null,
   action = 'ask',
 }) {
   const cleanMessage = String(message || '').trim();
@@ -219,82 +329,115 @@ export async function sendPrChatMessage({
     throw new Error('Empty message');
   }
 
+  const prKey = `${pr.repo}#${pr.number}`;
   const userMsg = appendPrChatMessage(cfg.reviewsDir, pr.repo, pr.number, {
     role: 'user',
     text: cleanMessage,
     findingId: findingContext?.id || null,
+    filePath: fileContext?.filePath || findingContext?.filePath || null,
     action,
   });
 
-  const projectsDir = getProjectsDir(cfg);
-  const repoPath = getLocalRepoPath(projectsDir, pr.repo);
-  const reviewFile = pr.reviewFile || `review-${pr.repo}-${pr.number}.md`;
-  let reviewMd = '';
-  const activeReviewPath = path.join(cfg.reviewsDir, reviewFile);
-  if (fs.existsSync(activeReviewPath)) {
-    reviewMd = fs.readFileSync(activeReviewPath, 'utf8');
+  const streamState = {
+    prKey,
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    phase: 'Démarrage de Gemini (sans serveurs MCP externes)…',
+    partialText: '',
+    activeFile: fileContext?.filePath || findingContext?.filePath || null,
+    toolCalls: [],
+  };
+  activeChatStreams.set(prKey, streamState);
+
+  try {
+    const projectsDir = getProjectsDir(cfg);
+    const repoPath = getLocalRepoPath(projectsDir, pr.repo);
+    const reviewFile = pr.reviewFile || `review-${pr.repo}-${pr.number}.md`;
+    let reviewMd = '';
+    const activeReviewPath = path.join(cfg.reviewsDir, reviewFile);
+    if (fs.existsSync(activeReviewPath)) {
+      reviewMd = fs.readFileSync(activeReviewPath, 'utf8');
+    }
+
+    syncCombinedReferenceFiles();
+    const refPaths = getReferencePaths();
+    const dnaPath = refPaths.combinedDnaPath;
+    const fpPath = refPaths.fpPath;
+    const dnaText = fs.existsSync(dnaPath) ? fs.readFileSync(dnaPath, 'utf8') : '';
+    const fpText = fs.existsSync(fpPath) ? fs.readFileSync(fpPath, 'utf8') : '';
+    const reviewerName = cfg.githubUser || 'Reviewer';
+
+    const history = getPrChatHistory(cfg.reviewsDir, pr.repo, pr.number).slice(-8);
+    const historyTranscript = history
+      .map((m) => `${m.role === 'user' ? reviewerName : 'Agent'}: ${m.text}`)
+      .join('\n\n');
+
+    const promptParts = [
+      `Tu es l'agent personnel de code review de ${reviewerName} dans le PR Review Hub.`,
+      `Réponds de façon concise, directe, technique et SANS emoji décoratif en français (code et identifiants en anglais).`,
+      `Privilégie une réponse immédiate à partir du diff et du rapport fournis ci-dessous sans lancer de commandes shell inutiles, sauf si l'utilisateur demande explicitement de modifier un fichier.`,
+      `Contexte PR : ${pr.repo}#${pr.number} — "${pr.title || ''}" (auteur: ${pr.author || ''}, branche: ${pr.headRefName || ''} -> ${pr.baseRefName || 'develop'}, SHA: ${pr.headRefOid || ''}).`,
+    ];
+
+    if (fileContext?.filePath) {
+      promptParts.push(
+        `--- Fichier Actuellement Affiché à l'Écran ("ici") ---\nFichier : ${fileContext.filePath}${fileContext.line ? ` (ligne ${fileContext.line})` : ''}\n${fileContext.patch ? `Diff du fichier :\n\`\`\`diff\n${String(fileContext.patch).slice(0, 10000)}\n\`\`\`` : ''}`
+      );
+    }
+
+    if (findingContext) {
+      promptParts.push(
+        `Finding ciblé : ${findingContext.id} (${findingContext.title || ''}) sur ${findingContext.filePath || 'la PR'}:${findingContext.startLine || ''}.\nCommentaire proposé :\n${findingContext.customComment || findingContext.comment || ''}`
+      );
+    }
+
+    if (action === 'debrief') {
+      promptParts.push(
+        `Mode 2 Debrief actif : si ${reviewerName} rejette un finding ou t'enseigne une règle projet, mets à jour ${fpPath} ou ${refPaths.dnaPath} et adapte ${activeReviewPath} si pertinent.`
+      );
+    }
+
+    if (reviewMd) {
+      promptParts.push(`--- Rapport d'Audit Actuel ---\n${reviewMd.slice(0, 12000)}`);
+    }
+
+    if (fpText) {
+      promptParts.push(`--- Exceptions & Faux Positifs Connus ---\n${fpText.slice(0, 3500)}`);
+    }
+
+    if (dnaText) {
+      promptParts.push(`--- ADN de Review (${reviewerName}) ---\n${dnaText.slice(0, 3500)}`);
+    }
+
+    promptParts.push(`--- Historique de discussion ---\n${historyTranscript}`);
+    promptParts.push(`Réponds maintenant à la dernière demande de ${reviewerName} :`);
+
+    const replyText = await runCliPrompt({
+      prompt: promptParts.join('\n\n'),
+      cwd: repoPath,
+      approvalMode: action === 'debrief' ? 'auto_edit' : 'plan',
+      timeoutMs: 120000,
+      fastChatMode: true,
+      onStreamUpdate: ({ phase, partialText, toolName }) => {
+        if (phase) streamState.phase = phase;
+        if (typeof partialText === 'string') streamState.partialText = partialText;
+        if (toolName && !streamState.toolCalls.includes(toolName)) {
+          streamState.toolCalls.push(toolName);
+        }
+      },
+    });
+
+    const assistantMsg = appendPrChatMessage(cfg.reviewsDir, pr.repo, pr.number, {
+      role: 'assistant',
+      text: replyText || 'Réponse enregistrée.',
+      findingId: findingContext?.id || null,
+      filePath: fileContext?.filePath || null,
+    });
+
+    return { userMsg, assistantMsg };
+  } finally {
+    activeChatStreams.delete(prKey);
   }
-
-  syncCombinedReferenceFiles();
-  const refPaths = getReferencePaths();
-  const dnaPath = refPaths.combinedDnaPath;
-  const fpPath = refPaths.fpPath;
-  const dnaText = fs.existsSync(dnaPath) ? fs.readFileSync(dnaPath, 'utf8') : '';
-  const fpText = fs.existsSync(fpPath) ? fs.readFileSync(fpPath, 'utf8') : '';
-  const reviewerName = cfg.githubUser || 'Reviewer';
-
-  const history = getPrChatHistory(cfg.reviewsDir, pr.repo, pr.number).slice(-10);
-  const historyTranscript = history
-    .map((m) => `${m.role === 'user' ? reviewerName : 'Agent'}: ${m.text}`)
-    .join('\n\n');
-
-  const promptParts = [
-    `Tu es l'agent personnel de code review de ${reviewerName} dans le PR Review Hub.`,
-    `Réponds de façon concise, directe, technique et SANS emoji décoratif en français (code et identifiants en anglais).`,
-    `Contexte PR : ${pr.repo}#${pr.number} — "${pr.title || ''}" (auteur: ${pr.author || ''}, branche: ${pr.headRefName || ''} -> ${pr.baseRefName || 'develop'}, SHA: ${pr.headRefOid || ''}).`,
-  ];
-
-  if (findingContext) {
-    promptParts.push(
-      `Finding ciblé : ${findingContext.id} (${findingContext.title || ''}) sur ${findingContext.filePath || 'la PR'}:${findingContext.startLine || ''}.\nCommentaire proposé :\n${findingContext.customComment || findingContext.comment || ''}`
-    );
-  }
-
-  if (action === 'debrief') {
-    promptParts.push(
-      `Mode 2 Debrief actif : si ${reviewerName} rejette un finding ou t'enseigne une règle projet, mets à jour ${fpPath} ou ${refPaths.dnaPath} et adapte ${activeReviewPath} si pertinent.`
-    );
-  }
-
-  if (reviewMd) {
-    promptParts.push(`--- Rapport d'Audit Actuel ---\n${reviewMd.slice(0, 14000)}`);
-  }
-
-  if (fpText) {
-    promptParts.push(`--- Exceptions & Faux Positifs Connus ---\n${fpText.slice(0, 4000)}`);
-  }
-
-  if (dnaText) {
-    promptParts.push(`--- ADN de Review (${reviewerName}) ---\n${dnaText.slice(0, 4000)}`);
-  }
-
-  promptParts.push(`--- Historique de discussion ---\n${historyTranscript}`);
-  promptParts.push(`Réponds maintenant à la dernière demande de ${reviewerName} :`);
-
-  const replyText = await runCliPrompt({
-    prompt: promptParts.join('\n\n'),
-    cwd: repoPath,
-    approvalMode: 'auto_edit',
-    timeoutMs: 120000,
-  });
-
-  const assistantMsg = appendPrChatMessage(cfg.reviewsDir, pr.repo, pr.number, {
-    role: 'assistant',
-    text: replyText || 'Réponse enregistrée.',
-    findingId: findingContext?.id || null,
-  });
-
-  return { userMsg, assistantMsg };
 }
 
 export function dismissFindingAsFalsePositive({

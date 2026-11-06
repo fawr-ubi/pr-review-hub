@@ -4,68 +4,80 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PR Review Hub</title>
-  <link rel="stylesheet" href="/styles.css?v=20261106-2" />
+  <link rel="stylesheet" href="/styles.css?v=20261106-7" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
 </head>
 <body>
-  <div id="appShell" class="app-shell">
-    <!-- Left Sidebar -->
+  <div id="appShell" class="app-shell pr-queue-fullpage">
+    <!-- Left Sidebar / Full-Page PR Selection Queue -->
     <aside id="sidebarPanel" class="sidebar">
-      <div class="sidebar-header">
-        <div class="sidebar-header-top">
-          <h1>PR Review Hub</h1>
-          <p id="brandSubtitle" class="subtitle" title="fawr-ubi · popcorn">fawr-ubi &middot; popcorn</p>
+      <div class="sidebar-inner">
+        <div class="sidebar-header">
+          <div class="sidebar-header-top">
+            <div style="display:flex;align-items:baseline;gap:12px;min-width:0;flex-wrap:wrap;">
+              <h1>PR Review Hub</h1>
+              <p id="brandSubtitle" class="subtitle" title="Compte & équipes GitHub">Chargement…</p>
+            </div>
+            <div class="header-actions">
+              <button id="returnToActivePrBtn" class="btn btn-primary btn-xs hidden" title="Retourner à la Pull Request en cours de revue (Entrée)">
+                Reprendre la PR active &rarr;
+              </button>
+              <button id="settingsBtn" class="btn btn-ghost btn-xs" title="Configuration GitHub, Jira et dossiers locaux">Configuration</button>
+              <button id="themeToggleBtn" class="btn btn-ghost btn-xs" title="Changer de thème (Dark / Purple / Light)">Thème</button>
+              <button id="reviewAllPendingBtn" class="btn btn-secondary btn-xs" title="Lancer l'audit IA sur toutes les PRs en attente">
+                Tout auditer
+              </button>
+              <button id="syncQueueBtn" class="btn btn-secondary btn-xs" title="Synchroniser la file de PRs avec GitHub (sync-queue.sh scan)">
+                <span id="syncSpinner" class="spinner hidden"></span>
+                <span>Synchroniser GitHub</span>
+              </button>
+            </div>
+          </div>
         </div>
-        <div class="header-actions">
-          <a href="/api/export-zip" class="btn btn-ghost btn-xs" title="Télécharger l'archive .zip partageable">.zip</a>
-          <button id="settingsBtn" class="btn btn-ghost btn-xs" title="Configuration">Config</button>
-          <button id="themeToggleBtn" class="btn btn-ghost btn-xs" title="Basculer thème sombre / papier">Thème</button>
-          <button id="reviewAllPendingBtn" class="btn btn-secondary btn-xs" title="Lancer l'audit IA sur toutes les PRs en attente">
-            Run All
-          </button>
-          <button id="syncQueueBtn" class="btn btn-secondary btn-xs" title="Synchroniser la queue GitHub (sync-queue.sh scan)">
-            <span id="syncSpinner" class="spinner hidden"></span>
-            <span>Sync</span>
-          </button>
-        </div>
-      </div>
 
-      <div class="sidebar-filters">
-        <input
-          type="search"
-          id="searchInput"
-          class="search-input"
-          placeholder="Filtrer par PR #, Jira, titre, auteur... (j/k nav)"
-        />
-        <div class="filter-tabs" id="modeFilterTabs">
-          <button class="filter-tab active" data-filter="open">Ouvertes <span id="count-open" class="count-pill">0</span></button>
-          <button class="filter-tab" data-filter="actionable">À traiter <span id="count-actionable" class="count-pill">0</span></button>
-          <button class="filter-tab" data-filter="peer">Peer <span id="count-peer" class="count-pill">0</span></button>
-          <button class="filter-tab" data-filter="self">Self <span id="count-self" class="count-pill">0</span></button>
-          <button class="filter-tab" data-filter="archived">Archives <span id="count-archived" class="count-pill">0</span></button>
+        <div class="sidebar-filters">
+          <div class="sidebar-filters-row">
+            <input
+              type="search"
+              id="searchInput"
+              class="search-input"
+              placeholder="Rechercher par numéro de PR, ticket Jira, titre, branche ou nom d'auteur… (raccourci : / · navigation : j/k + Entrée)"
+            />
+          </div>
+          <div class="sidebar-filters-subrow">
+            <div class="filter-tabs" id="modeFilterTabs">
+              <button class="filter-tab active" data-filter="open">Toutes ouvertes <span id="count-open" class="count-pill">0</span></button>
+              <button class="filter-tab" data-filter="actionable">À traiter <span id="count-actionable" class="count-pill">0</span></button>
+              <button class="filter-tab" data-filter="peer">Peer-Review <span id="count-peer" class="count-pill">0</span></button>
+              <button class="filter-tab" data-filter="self">Self-Review <span id="count-self" class="count-pill">0</span></button>
+              <button class="filter-tab" data-filter="archived">Archivées <span id="count-archived" class="count-pill">0</span></button>
+            </div>
+            <div class="repo-pills" id="repoFilterPills"></div>
+          </div>
+          <div id="activeAuthorFilterBar" class="author-filter-bar hidden">
+            <span id="activeAuthorFilterLabel" class="meta-text"></span>
+            <button id="clearAuthorFilterBtn" class="btn btn-ghost btn-xs">Effacer le filtre auteur</button>
+          </div>
         </div>
-        <div class="repo-pills" id="repoFilterPills"></div>
-        <div id="activeAuthorFilterBar" class="author-filter-bar hidden">
-          <span id="activeAuthorFilterLabel" class="meta-text"></span>
-          <button id="clearAuthorFilterBtn" class="btn btn-ghost btn-xs">Effacer</button>
+
+        <div class="pr-list" id="prList">
+          <div class="empty-state">Chargement des Pull Requests…</div>
         </div>
-      </div>
 
-      <div class="pr-list" id="prList">
-        <div class="empty-state">Chargement...</div>
-      </div>
-
-      <div class="sidebar-footer">
-        <span><kbd>j</kbd>/<kbd>k</kbd> PR</span>
-        <span><kbd>&larr;</kbd>/<kbd>&rarr;</kbd> Fichier</span>
-        <span><kbd>n</kbd>/<kbd>p</kbd> Hunk</span>
-        <span><kbd>1</kbd>-<kbd>5</kbd> Vues</span>
-        <span><kbd>z</kbd>/<kbd>f</kbd> Focus</span>
-        <span><kbd>[</kbd>/<kbd>]</kbd> Panneaux</span>
-        <button id="openShortcutsBtn" class="btn btn-ghost btn-xs" style="margin-left:auto;padding:1px 6px;" title="Tous les raccourcis clavier (?)">? Clavier</button>
+        <div class="sidebar-footer">
+          <span><kbd>j</kbd>/<kbd>k</kbd> Naviguer PR</span>
+          <span><kbd>Entrée</kbd> Ouvrir PR (Focus Diff)</span>
+          <span><kbd>q</kbd> File des PRs</span>
+          <span><kbd>&larr;</kbd>/<kbd>&rarr;</kbd> Fichier</span>
+          <span><kbd>b</kbd> Arbre Fichiers</span>
+          <span><kbd>n</kbd>/<kbd>p</kbd> Hunk</span>
+          <span><kbd>1</kbd>-<kbd>5</kbd> Onglets</span>
+          <span><kbd>z</kbd>/<kbd>f</kbd> Focus Diff</span>
+          <button id="openShortcutsBtn" class="btn btn-ghost btn-xs" style="margin-left:auto;padding:1px 6px;" title="Tous les raccourcis clavier (?)">? Raccourcis clavier</button>
+        </div>
       </div>
     </aside>
 
@@ -74,7 +86,7 @@
       <div id="emptyMainState" class="main-empty">
         <div class="empty-card">
           <h2>Aucune Pull Request sélectionnée</h2>
-          <p>Sélectionne une PR dans la colonne de gauche pour lire le rapport d'audit, inspecter le diff, explorer l'arbre de travail ou gérer les règles de l'agent.</p>
+          <p>Sélectionne une Pull Request pour lire le rapport d'audit, inspecter le diff, explorer l'arbre de travail ou gérer les règles de l'agent.</p>
         </div>
       </div>
 
@@ -83,23 +95,25 @@
         <header class="pr-topbar">
           <div class="pr-topbar-info">
             <div class="pr-meta-row">
-              <span id="prAuthorInitialsBadge" class="author-badge" title="Auteur de la PR"></span>
+              <button id="backToPrQueueBtn" class="btn btn-secondary btn-xs" title="Revenir à la sélection des PRs en pleine page (raccourci : q)">
+                &larr; Toutes les PRs
+              </button>
               <span id="prRepoBadge" class="badge badge-mono"></span>
+              <span id="prAuthorBadge" class="badge"></span>
               <span id="prModeBadge" class="badge"></span>
               <span id="prVerdictBadge" class="badge"></span>
               <span id="prCiBadge" class="badge badge-mono hidden"></span>
-              <span id="prStackBadge" class="badge badge-severity-major hidden" title="Cette PR cible une autre branche de feature (Stacked PR)">STACK</span>
+              <span id="prStackBadge" class="badge badge-severity-major hidden" title="Cette PR cible une autre branche de feature (Stacked PR)">Branche empilée</span>
               <a id="prJiraLink" href="#" target="_blank" rel="noopener" class="btn btn-ghost btn-xs hidden"></a>
               <span id="prShaBadge" class="badge badge-mono" title="Commit HEAD"></span>
-              <span id="prAuthorBadge" class="meta-text"></span>
             </div>
             <h2 id="prTitleHeader" class="pr-title-header"></h2>
             <div class="pr-subbar-row">
               <div id="prBranchRow" class="pr-branch-row"></div>
               <div class="worktree-bar">
-                <span id="worktreeStatusBadge" class="badge badge-mono">WT: zero-disk</span>
-                <button id="mountWorktreeBtn" class="btn btn-ghost btn-xs" title="Monter un git worktree isolé avec copie APFS des vendor/">Mount WT</button>
-                <button id="unmountWorktreeBtn" class="btn btn-ghost btn-xs hidden" title="Supprimer le worktree isolé">Unmount</button>
+                <span id="worktreeStatusBadge" class="badge badge-mono">Worktree : Git direct</span>
+                <button id="mountWorktreeBtn" class="btn btn-ghost btn-xs" title="Monter un git worktree isolé avec copie APFS des vendor/">Monter Worktree</button>
+                <button id="unmountWorktreeBtn" class="btn btn-ghost btn-xs hidden" title="Supprimer le worktree isolé">Démonter Worktree</button>
                 <button id="openPhpstormBtn" class="btn btn-ghost btn-xs" title="Monter le worktree et l'ouvrir dans PhpStorm">PhpStorm</button>
                 <button id="openVscodeBtn" class="btn btn-ghost btn-xs" title="Monter le worktree et l'ouvrir dans VS Code">VS Code</button>
               </div>
@@ -149,14 +163,8 @@
             </button>
           </div>
           <div class="view-tabs-actions">
-            <button id="togglePrSidebarBtn" class="btn btn-ghost btn-xs" title="Masquer / Afficher la colonne des PRs (raccourci : [)">
-              Masquer PRs
-            </button>
-            <button id="toggleFileTreeBtn" class="btn btn-ghost btn-xs" title="Masquer / Afficher la liste des fichiers modifiés (raccourci : ])">
-              Masquer Fichiers
-            </button>
-            <button id="toggleZenModeBtn" class="btn btn-secondary btn-xs" title="Mode Focus Diff plein écran : uniquement le fichier courant et le diff (raccourci : z ou f)">
-              Focus Diff
+            <button id="toggleFileTreeBtn" class="btn btn-ghost btn-xs" title="Masquer / Afficher l'arbre des fichiers modifiés (raccourci : b)">
+              Masquer Fichiers (b)
             </button>
             <button id="topbarShortcutsBtn" class="btn btn-ghost btn-xs" title="Afficher tous les raccourcis clavier (?)">
               ?
@@ -289,13 +297,13 @@
               <textarea
                 id="agentChatInput"
                 class="agent-chat-input"
-                placeholder="Ex: Pourquoi cette méthode n'est pas transactionnelle ? / Le finding #1 est faux car..."
+                placeholder="Ex: Pourquoi cette méthode n'est pas transactionnelle ? / Le finding #1 est faux car... (Entrée ou Cmd+Entrée pour envoyer · Shift+Entrée pour retour à la ligne)"
                 rows="3"
               ></textarea>
               <div class="agent-chat-actions">
                 <label class="checkbox-label" title="Autoriser l'agent à mettre à jour reviewer-dna.md, false-positives.md et le rapport">
-                  <input type="checkbox" id="agentDebriefModeCheckbox" checked />
-                  <span>Mode 2 Debrief actif</span>
+                  <input type="checkbox" id="agentDebriefModeCheckbox" />
+                  <span>Mode 2 Debrief (modifier règles/rapport)</span>
                 </label>
                 <button type="submit" id="agentSendBtn" class="btn btn-primary btn-sm">Envoyer</button>
               </div>
@@ -324,6 +332,6 @@
   <!-- Toast notification -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script type="module" src="/app.js?v=20261106-2"></script>
+  <script type="module" src="/app.js?v=20261106-7"></script>
 </body>
 </html>
