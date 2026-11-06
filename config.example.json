@@ -1,0 +1,18 @@
+{
+  "githubOrg": "ubitransports",
+  "githubUser": "your-github-login",
+  "githubTeams": [
+    "your-github-team-slug"
+  ],
+  "projectsDir": "~/Ubitransport/projects",
+  "reviewsDir": "~/Ubitransport/projects/artifacts/reviews",
+  "jiraBaseUrl": "https://ubitransport.atlassian.net/browse",
+  "jiraPrefixes": [
+    "PRD",
+    "HYB",
+    "WAN",
+    "SUP",
+    "DEV"
+  ],
+  "port": 4242
+}

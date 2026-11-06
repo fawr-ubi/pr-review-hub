@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PR Review Hub</title>
+  <link rel="stylesheet" href="/styles.css?v=20261106-2" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+</head>
+<body>
+  <div id="appShell" class="app-shell">
+    <!-- Left Sidebar -->
+    <aside id="sidebarPanel" class="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-header-top">
+          <h1>PR Review Hub</h1>
+          <p id="brandSubtitle" class="subtitle" title="fawr-ubi · popcorn">fawr-ubi &middot; popcorn</p>
+        </div>
+        <div class="header-actions">
+          <a href="/api/export-zip" class="btn btn-ghost btn-xs" title="Télécharger l'archive .zip partageable">.zip</a>
+          <button id="settingsBtn" class="btn btn-ghost btn-xs" title="Configuration">Config</button>
+          <button id="themeToggleBtn" class="btn btn-ghost btn-xs" title="Basculer thème sombre / papier">Thème</button>
+          <button id="reviewAllPendingBtn" class="btn btn-secondary btn-xs" title="Lancer l'audit IA sur toutes les PRs en attente">
+            Run All
+          </button>
+          <button id="syncQueueBtn" class="btn btn-secondary btn-xs" title="Synchroniser la queue GitHub (sync-queue.sh scan)">
+            <span id="syncSpinner" class="spinner hidden"></span>
+            <span>Sync</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="sidebar-filters">
+        <input
+          type="search"
+          id="searchInput"
+          class="search-input"
+          placeholder="Filtrer par PR #, Jira, titre, auteur... (j/k nav)"
+        />
+        <div class="filter-tabs" id="modeFilterTabs">
+          <button class="filter-tab active" data-filter="open">Ouvertes <span id="count-open" class="count-pill">0</span></button>
+          <button class="filter-tab" data-filter="actionable">À traiter <span id="count-actionable" class="count-pill">0</span></button>
+          <button class="filter-tab" data-filter="peer">Peer <span id="count-peer" class="count-pill">0</span></button>
+          <button class="filter-tab" data-filter="self">Self <span id="count-self" class="count-pill">0</span></button>
+          <button class="filter-tab" data-filter="archived">Archives <span id="count-archived" class="count-pill">0</span></button>
+        </div>
+        <div class="repo-pills" id="repoFilterPills"></div>
+        <div id="activeAuthorFilterBar" class="author-filter-bar hidden">
+          <span id="activeAuthorFilterLabel" class="meta-text"></span>
+          <button id="clearAuthorFilterBtn" class="btn btn-ghost btn-xs">Effacer</button>
+        </div>
+      </div>
+
+      <div class="pr-list" id="prList">
+        <div class="empty-state">Chargement...</div>
+      </div>
+
+      <div class="sidebar-footer">
+        <span><kbd>j</kbd>/<kbd>k</kbd> PR</span>
+        <span><kbd>&larr;</kbd>/<kbd>&rarr;</kbd> Fichier</span>
+        <span><kbd>n</kbd>/<kbd>p</kbd> Hunk</span>
+        <span><kbd>1</kbd>-<kbd>5</kbd> Vues</span>
+        <span><kbd>z</kbd>/<kbd>f</kbd> Focus</span>
+        <span><kbd>[</kbd>/<kbd>]</kbd> Panneaux</span>
+        <button id="openShortcutsBtn" class="btn btn-ghost btn-xs" style="margin-left:auto;padding:1px 6px;" title="Tous les raccourcis clavier (?)">? Clavier</button>
+      </div>
+    </aside>
+
+    <!-- Right Main Area -->
+    <main class="main-area">
+      <div id="emptyMainState" class="main-empty">
+        <div class="empty-card">
+          <h2>Aucune Pull Request sélectionnée</h2>
+          <p>Sélectionne une PR dans la colonne de gauche pour lire le rapport d'audit, inspecter le diff, explorer l'arbre de travail ou gérer les règles de l'agent.</p>
+        </div>
+      </div>
+
+      <div id="prContentArea" class="pr-content hidden">
+        <!-- PR Topbar -->
+        <header class="pr-topbar">
+          <div class="pr-topbar-info">
+            <div class="pr-meta-row">
+              <span id="prAuthorInitialsBadge" class="author-badge" title="Auteur de la PR"></span>
+              <span id="prRepoBadge" class="badge badge-mono"></span>
+              <span id="prModeBadge" class="badge"></span>
+              <span id="prVerdictBadge" class="badge"></span>
+              <span id="prCiBadge" class="badge badge-mono hidden"></span>
+              <span id="prStackBadge" class="badge badge-severity-major hidden" title="Cette PR cible une autre branche de feature (Stacked PR)">STACK</span>
+              <a id="prJiraLink" href="#" target="_blank" rel="noopener" class="btn btn-ghost btn-xs hidden"></a>
+              <span id="prShaBadge" class="badge badge-mono" title="Commit HEAD"></span>
+              <span id="prAuthorBadge" class="meta-text"></span>
+            </div>
+            <h2 id="prTitleHeader" class="pr-title-header"></h2>
+            <div class="pr-subbar-row">
+              <div id="prBranchRow" class="pr-branch-row"></div>
+              <div class="worktree-bar">
+                <span id="worktreeStatusBadge" class="badge badge-mono">WT: zero-disk</span>
+                <button id="mountWorktreeBtn" class="btn btn-ghost btn-xs" title="Monter un git worktree isolé avec copie APFS des vendor/">Mount WT</button>
+                <button id="unmountWorktreeBtn" class="btn btn-ghost btn-xs hidden" title="Supprimer le worktree isolé">Unmount</button>
+                <button id="openPhpstormBtn" class="btn btn-ghost btn-xs" title="Monter le worktree et l'ouvrir dans PhpStorm">PhpStorm</button>
+                <button id="openVscodeBtn" class="btn btn-ghost btn-xs" title="Monter le worktree et l'ouvrir dans VS Code">VS Code</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="pr-topbar-actions">
+            <button id="triggerReviewBtn" class="btn btn-secondary btn-sm" title="Lancer ou relancer l'audit IA maintenant (r)">
+              <span id="reviewJobSpinner" class="spinner hidden"></span>
+              <span id="triggerReviewLabel">Run Review</span>
+            </button>
+            <button id="toggleSplitViewBtn" class="btn btn-secondary btn-sm" title="Mode côte-à-côte Rapport + Code (s)">
+              Split
+            </button>
+            <button id="popoutWorkspaceBtn" class="btn btn-secondary btn-sm" title="Ouvrir le Diff et le Working Tree dans une autre fenêtre synchronisée (o)">
+              Pop-out &#8599;
+            </button>
+            <button id="toggleChatDrawerBtn" class="btn btn-secondary btn-sm" title="Poser une question ou débriefer l'agent de review (c)">
+              Agent Q&amp;A
+            </button>
+            <a id="openGithubPrBtn" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">
+              GitHub &#8599;
+            </a>
+            <button id="openBatchReviewModalBtn" class="btn btn-primary btn-sm">
+              Publier Review
+            </button>
+          </div>
+        </header>
+
+        <!-- Navigation Tabs -->
+        <nav class="view-tabs">
+          <div class="view-tabs-left">
+            <button class="view-tab active" data-tab="report">
+              <span>1. Rapport d'Audit</span>
+            </button>
+            <button class="view-tab" data-tab="comments">
+              <span>2. Commentaires</span> <span id="tabFindingsCount" class="count-pill">0</span>
+            </button>
+            <button class="view-tab" data-tab="diff">
+              <span>3. Diff Git</span> <span id="tabFilesCount" class="count-pill">…</span>
+            </button>
+            <button class="view-tab" data-tab="tree">
+              <span>4. Arbre de Travail</span>
+            </button>
+            <button class="view-tab" data-tab="rules">
+              <span>5. Règles Agent</span> <span id="tabRulesCount" class="count-pill">…</span>
+            </button>
+          </div>
+          <div class="view-tabs-actions">
+            <button id="togglePrSidebarBtn" class="btn btn-ghost btn-xs" title="Masquer / Afficher la colonne des PRs (raccourci : [)">
+              Masquer PRs
+            </button>
+            <button id="toggleFileTreeBtn" class="btn btn-ghost btn-xs" title="Masquer / Afficher la liste des fichiers modifiés (raccourci : ])">
+              Masquer Fichiers
+            </button>
+            <button id="toggleZenModeBtn" class="btn btn-secondary btn-xs" title="Mode Focus Diff plein écran : uniquement le fichier courant et le diff (raccourci : z ou f)">
+              Focus Diff
+            </button>
+            <button id="topbarShortcutsBtn" class="btn btn-ghost btn-xs" title="Afficher tous les raccourcis clavier (?)">
+              ?
+            </button>
+          </div>
+        </nav>
+
+        <!-- Workspace Body (supports single tab, split-screen, and agent chat drawer) -->
+        <div id="workspaceBody" class="workspace-body">
+          <div id="panelsContainer" class="panels-container">
+            <!-- Tab 1: Full Markdown Report -->
+            <section id="tab-report" class="tab-panel active">
+              <div id="reportExecutiveHeader" class="report-executive-header hidden"></div>
+              <div id="reportFindingsQuickBar" class="report-findings-quickbar hidden"></div>
+              <article id="markdownContainer" class="markdown-body"></article>
+            </section>
+
+            <!-- Tab 2: Interactive Ready-to-Paste Comments -->
+            <section id="tab-comments" class="tab-panel">
+              <div class="comments-toolbar">
+                <div class="comments-toolbar-left">
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="selectAllCommentsCheckbox" checked />
+                    <span>Tout sélectionner</span>
+                  </label>
+                  <span id="commentsSummaryStats" class="meta-text"></span>
+                </div>
+                <div class="comments-toolbar-right">
+                  <button id="copyAllSelectedBtn" class="btn btn-secondary btn-sm">
+                    Copier la sélection
+                  </button>
+                  <button id="createPendingReviewBtn" class="btn btn-primary btn-sm">
+                    Créer Pending Review
+                  </button>
+                </div>
+              </div>
+              <div id="findingsList" class="findings-list"></div>
+            </section>
+
+            <!-- Tab 3: Integrated Diff Viewer -->
+            <section id="tab-diff" class="tab-panel diff-panel">
+              <div id="diffLayoutContainer" class="diff-layout">
+                <aside class="diff-file-tree" id="diffFileTree">
+                  <div class="empty-state">Chargement du diff...</div>
+                </aside>
+                <div class="diff-viewer-container" id="diffViewerContainer">
+                  <div class="empty-state">Sélectionne un fichier pour inspecter son diff.</div>
+                </div>
+              </div>
+            </section>
+
+            <!-- Tab 4: Full Working Tree Explorer (Zero-Disk + Worktree) -->
+            <section id="tab-tree" class="tab-panel tree-panel">
+              <div id="treeLayoutContainer" class="tree-layout">
+                <aside id="treeSidebar" class="tree-sidebar">
+                  <div class="tree-search-box">
+                    <input
+                      type="search"
+                      id="treeFileFilterInput"
+                      class="search-input"
+                      placeholder="Aller au fichier (ex: Handler.php)..."
+                    />
+                    <form id="treeGrepForm" class="tree-grep-form">
+                      <input
+                        type="search"
+                        id="treeGrepInput"
+                        class="search-input"
+                        placeholder="Chercher dans le code (git grep)..."
+                      />
+                      <button type="submit" class="btn btn-secondary btn-xs">Grep</button>
+                    </form>
+                  </div>
+                  <div id="treeBreadcrumbs" class="tree-breadcrumbs"></div>
+                  <div id="treeEntriesList" class="tree-entries-list">
+                    <div class="empty-state meta-text">Chargement de l'arbre...</div>
+                  </div>
+                </aside>
+                <div class="tree-viewer-container" id="treeViewerContainer">
+                  <div class="empty-state meta-text">Sélectionne un fichier dans l'arbre de travail ou effectue une recherche grep.</div>
+                </div>
+              </div>
+            </section>
+
+            <!-- Tab 5: Agent Rules & False Positives Manager -->
+            <section id="tab-rules" class="tab-panel">
+              <div class="comments-toolbar">
+                <div class="comments-toolbar-left">
+                  <div class="filter-tabs" id="rulesTargetFilterTabs">
+                    <button class="filter-tab active" data-rule-target="all">Toutes</button>
+                    <button class="filter-tab" data-rule-target="candidate">À valider <span id="rulesCandidateCount" class="count-pill">0</span></button>
+                    <button class="filter-tab" data-rule-target="common">Socle Commun <span id="rulesCommonCount" class="count-pill">0</span></button>
+                    <button class="filter-tab" data-rule-target="dna">ADN Local <span id="rulesDnaCount" class="count-pill">0</span></button>
+                    <button class="filter-tab" data-rule-target="false-positive">False Positives <span id="rulesFpCount" class="count-pill">0</span></button>
+                  </div>
+                  <input
+                    type="search"
+                    id="rulesSearchInput"
+                    class="search-input"
+                    style="width:220px;"
+                    placeholder="Rechercher une règle..."
+                  />
+                </div>
+                <div class="comments-toolbar-right">
+                  <button id="bootstrapTeamRulesBtn" class="btn btn-secondary btn-sm" title="Analyser 1 an de commentaires de review de l'équipe sur GitHub et proposer des règles candidates à valider">Analyser PRs Équipe (1 an)</button>
+                  <button id="addDnaRuleBtn" class="btn btn-primary btn-sm">+ Ajouter Règle DNA</button>
+                  <button id="addFpRuleBtn" class="btn btn-secondary btn-sm">+ Ajouter False Positive</button>
+                </div>
+              </div>
+              <div id="rulesListContainer" class="findings-list"></div>
+            </section>
+          </div>
+
+          <!-- Collapsible Agent Chat & Mode 2 Debrief Drawer -->
+          <aside id="agentChatDrawer" class="agent-drawer hidden">
+            <div class="agent-drawer-header">
+              <div>
+                <h3>Agent Review &amp; Debrief</h3>
+                <p id="agentDrawerSubtitle" class="meta-text">Questions sur le code ou apprentissage Mode 2</p>
+              </div>
+              <button id="closeChatDrawerBtn" class="btn btn-ghost btn-xs">&#10005;</button>
+            </div>
+            <div id="agentFindingContextBanner" class="agent-context-banner hidden">
+              <span id="agentFindingContextText"></span>
+              <button id="clearFindingContextBtn" class="btn btn-ghost btn-xs">&#10005;</button>
+            </div>
+            <div id="agentChatMessages" class="agent-chat-messages">
+              <div class="empty-state meta-text">Pose une question sur la PR ou clique sur "Ask Agent" sur un finding.</div>
+            </div>
+            <form id="agentChatForm" class="agent-chat-form">
+              <textarea
+                id="agentChatInput"
+                class="agent-chat-input"
+                placeholder="Ex: Pourquoi cette méthode n'est pas transactionnelle ? / Le finding #1 est faux car..."
+                rows="3"
+              ></textarea>
+              <div class="agent-chat-actions">
+                <label class="checkbox-label" title="Autoriser l'agent à mettre à jour reviewer-dna.md, false-positives.md et le rapport">
+                  <input type="checkbox" id="agentDebriefModeCheckbox" checked />
+                  <span>Mode 2 Debrief actif</span>
+                </label>
+                <button type="submit" id="agentSendBtn" class="btn btn-primary btn-sm">Envoyer</button>
+              </div>
+            </form>
+          </aside>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Confirmation / Batch Review / Rule Editor Modal -->
+  <div id="githubModal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modalTitle">Publier sur GitHub</h3>
+        <button id="closeModalBtn" class="btn btn-ghost btn-xs">&#10005;</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-footer">
+        <button id="cancelModalBtn" class="btn btn-secondary">Annuler</button>
+        <button id="confirmModalBtn" class="btn btn-primary">Confirmer</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notification -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script type="module" src="/app.js?v=20261106-2"></script>
+</body>
+</html>
