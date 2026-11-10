@@ -13,6 +13,7 @@ import {
   loadConfig,
   saveConfig,
   discoverGithubIdentityAndTeams,
+  ensureConfigBootstrapped,
 } from './lib/config.mjs';
 import {
   computeAuthorInitials,
@@ -55,13 +56,30 @@ import {
   deleteRule,
   decideCandidateRule,
   approveAllCandidateRules,
+  syncCombinedReferenceFiles,
 } from './lib/rules.mjs';
 import { bootstrapTeamCandidateRules } from './lib/onboarding.mjs';
+import {
+  runDoctor,
+  listRexFeedback,
+  addRexFeedback,
+  deleteRexFeedback,
+  formatRexMarkdownReport,
+} from './lib/doctor.mjs';
 
 const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const SKILL_ROOT_DIR = path.resolve(__dirname, '..');
+
+function getAppVersion() {
+  try {
+    return fs.readFileSync(path.join(SKILL_ROOT_DIR, 'VERSION'), 'utf8').trim() || '1.1.0';
+  } catch {
+    return '1.1.0';
+  }
+}
 
 const prOverviewCache = new Map();
 let customOverviewHandlerForTests = null;
@@ -625,6 +643,8 @@ export function buildStateResponse() {
     const wtPath = getWorktreePath(projectsDir, pr.repo, pr.number);
     const worktreeMounted = fs.existsSync(wtPath);
     const runningJob = jobs.find((j) => j.prKey === key && j.status === 'running') || null;
+    const lastFailedJob =
+      jobs.find((j) => j.prKey === key && j.status === 'failed') || null;
 
     // Resolve full names for approvals, changes requested, comments, and pending reviewers
     const latestReviews = Array.isArray(pr.latestReviews) ? pr.latestReviews : [];
@@ -685,6 +705,7 @@ export function buildStateResponse() {
       worktreeMounted,
       worktreePath: worktreeMounted ? wtPath : null,
       runningJob,
+      lastFailedJob,
       isArchived: Boolean(pr.state !== 'OPEN' || isArchivedFile),
       hasReviewFile: Boolean(hasActiveFile || isArchivedFile),
       findingsCount,
@@ -698,7 +719,14 @@ export function buildStateResponse() {
     return String(b.createdAt || b.updatedAt || '').localeCompare(String(a.createdAt || a.updatedAt || ''));
   });
 
-  return { prs, uiState, config: cfg, jobs };
+  return {
+    prs,
+    uiState,
+    config: cfg,
+    jobs,
+    version: getAppVersion(),
+    neverSynced: !fs.existsSync(stateFile),
+  };
 }
 
 function readRequestBody(req) {
@@ -727,6 +755,17 @@ function sendJson(res, status, payload) {
 }
 
 export function createHubServer() {
+  try {
+    ensureConfigBootstrapped();
+  } catch {
+    // ignore bootstrap error
+  }
+  try {
+    const initialCfg = loadConfig();
+    syncCombinedReferenceFiles(initialCfg.teamProfile);
+  } catch {
+    // ignore startup sync error
+  }
   return http.createServer(async (req, res) => {
     try {
       const urlObj = new URL(req.url, 'http://localhost');
@@ -741,13 +780,105 @@ export function createHubServer() {
       }
 
       if (req.method === 'GET' && pathname === '/api/config') {
-        return sendJson(res, 200, { config: cfg });
+        return sendJson(res, 200, { config: cfg, version: getAppVersion() });
       }
 
       if (req.method === 'POST' && pathname === '/api/config') {
         const body = await readRequestBody(req);
         const updated = saveConfig(body);
+        try {
+          syncCombinedReferenceFiles(updated.teamProfile);
+        } catch {
+          // ignore
+        }
         return sendJson(res, 200, { ok: true, config: updated });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/doctor') {
+        const report = await runDoctor(cfg);
+        return sendJson(res, 200, { version: getAppVersion(), ...report });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/rex') {
+        const version = getAppVersion();
+        const items = listRexFeedback(cfg);
+        const markdown = formatRexMarkdownReport({ items, cfg, version });
+        return sendJson(res, 200, { items, markdown, version });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/rex') {
+        const body = await readRequestBody(req);
+        const version = getAppVersion();
+        const item = addRexFeedback(cfg, body, version);
+        const items = listRexFeedback(cfg);
+        const markdown = formatRexMarkdownReport({ items, cfg, version });
+        return sendJson(res, 200, { ok: true, item, items, markdown, version });
+      }
+
+      if (req.method === 'DELETE' && pathname === '/api/rex') {
+        const body = await readRequestBody(req);
+        const id = body.id || urlObj.searchParams.get('id') || '';
+        if (!id) {
+          return sendJson(res, 400, { error: 'Missing feedback item id' });
+        }
+        const version = getAppVersion();
+        const resDel = deleteRexFeedback(cfg, id);
+        const items = listRexFeedback(cfg);
+        const markdown = formatRexMarkdownReport({ items, cfg, version });
+        return sendJson(res, 200, { ok: true, ...resDel, items, markdown, version });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/app-update') {
+        const version = getAppVersion();
+        let behindCount = 0;
+        let latestCommitSubject = '';
+        try {
+          if (fs.existsSync(path.join(SKILL_ROOT_DIR, '.git'))) {
+            await execFileAsync('git', ['-C', SKILL_ROOT_DIR, 'fetch', 'origin', 'main', '--quiet'], {
+              timeout: 7000,
+            });
+            const { stdout: countOut } = await execFileAsync(
+              'git',
+              ['-C', SKILL_ROOT_DIR, 'rev-list', 'HEAD..origin/main', '--count'],
+              { timeout: 4000 }
+            );
+            behindCount = parseInt(String(countOut || '0').trim(), 10) || 0;
+            if (behindCount > 0) {
+              const { stdout: subjOut } = await execFileAsync(
+                'git',
+                ['-C', SKILL_ROOT_DIR, 'log', '-1', '--format=%s', 'origin/main'],
+                { timeout: 4000 }
+              );
+              latestCommitSubject = String(subjOut || '').trim();
+            }
+          }
+        } catch {
+          // ignore network / git errors
+        }
+        return sendJson(res, 200, {
+          version,
+          updateAvailable: behindCount > 0,
+          behindCount,
+          latestCommitSubject,
+        });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/app-update') {
+        const { stdout } = await execFileAsync(
+          'git',
+          ['-C', SKILL_ROOT_DIR, 'pull', '--rebase', '--autostash', 'origin', 'main'],
+          { timeout: 25000 }
+        );
+        try {
+          syncCombinedReferenceFiles(cfg.teamProfile);
+        } catch {
+          // ignore
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          version: getAppVersion(),
+          output: String(stdout || '').trim(),
+        });
       }
 
       if (req.method === 'GET' && pathname === '/api/github/teams') {

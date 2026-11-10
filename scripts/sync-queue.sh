@@ -391,6 +391,9 @@ RAW_SEARCH=$(gh api graphql -f query="{
   authoredByMe: search(query: \"org:${ORG} is:pr is:open updated:>=${CUTOFF_DATE} author:${USER_LOGIN}\", type: ISSUE, first: 30) {
     nodes { ... on PullRequest { ${PR_FRAGMENT} } }
   }
+  myDrafts: search(query: \"org:${ORG} is:pr is:open is:draft updated:>=${CUTOFF_DATE} author:${USER_LOGIN}\", type: ISSUE, first: 20) {
+    nodes { ... on PullRequest { ${PR_FRAGMENT} } }
+  }
   draftsInMainRepos: search(query: \"repo:${ORG}/2cloud-services is:pr is:open is:draft updated:>=${CUTOFF_DATE}\", type: ISSUE, first: 20) {
     nodes { ... on PullRequest { ${PR_FRAGMENT} } }
   }
@@ -475,7 +478,7 @@ SCAN_RESULT=$(jq -n \
         syncStatus: $syncStatus,
         reviewStatus: (
           if $syncStatus == "UP_TO_DATE" then ($st.reviewStatus // "✅ Reviewed")
-          elif $syncStatus == "DRAFT" then "📝 Draft (audit manuel)"
+          elif $syncStatus == "DRAFT" then "📝 Draft (Manual Audit)"
           elif $syncStatus == "REVIEWED_ON_GITHUB" then "✅ Reviewed on GH (\($lastGhReview.state))"
           elif $syncStatus == "NEEDS_UPDATE" then "🔄 Update Needed (new commits)"
           else "⏳ Pending Review"

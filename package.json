@@ -1,6 +1,6 @@
 {
   "name": "pr-review-hub",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Multi-team local web cockpit and continuously learning AI code review agent (my-review) for GitHub Pull Requests.",
   "type": "module",
   "private": true,
@@ -11,6 +11,8 @@
     "start": "node ui/server.mjs",
     "test": "node --test ui/tests/hub.test.mjs",
     "sync": "./scripts/sync-queue.sh scan",
+    "doctor": "node --input-type=module -e \"import { loadConfig } from './ui/lib/config.mjs'; import { runDoctor } from './ui/lib/doctor.mjs'; const r = await runDoctor(loadConfig()); for (const c of r.checks) console.log((c.ok ? '🟢' : '🔴'), c.label, '—', c.detail);\"",
+    "package": "./scripts/package-shareable-zip.sh",
     "setup": "./install.sh"
   }
 }

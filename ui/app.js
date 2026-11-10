@@ -534,6 +534,7 @@ function isActionablePr(pr) {
 }
 
 let jobPollTimer = null;
+const notifiedJobIds = new Set();
 
 function scheduleJobPollingIfNeeded() {
   const hasRunning = (state.jobs || []).some((j) => j.status === 'running');
@@ -541,15 +542,27 @@ function scheduleJobPollingIfNeeded() {
     jobPollTimer = setInterval(async () => {
       await loadState(true);
       const stillRunning = (state.jobs || []).some((j) => j.status === 'running');
+      for (const j of state.jobs || []) {
+        if (j.status !== 'running' && j.id && !notifiedJobIds.has(j.id)) {
+          notifiedJobIds.add(j.id);
+          if (j.status === 'failed') {
+            showToast(
+              `AI review failed for ${j.prKey}: ${j.error || 'Unknown error'} (check Doctor for CLI status)`,
+              7000
+            );
+          } else if (j.status === 'completed') {
+            showToast(`AI review completed for ${j.prKey}.`, 3500);
+          }
+        }
+      }
       if (!stillRunning) {
         clearInterval(jobPollTimer);
         jobPollTimer = null;
         if (state.selectedPrKey) {
           selectPr(state.selectedPrKey, false);
         }
-        showToast('AI review completed.');
       }
-    }, 3000);
+    }, 2500);
   }
 }
 
@@ -560,6 +573,12 @@ async function loadState(preserveSelection = true) {
   state.uiState = data.uiState || {};
   state.config = data.config || {};
   state.jobs = data.jobs || [];
+  state.appVersion = data.version || '1.1.0';
+
+  const versionBadgeEl = document.getElementById('appVersionBadge');
+  if (versionBadgeEl) {
+    versionBadgeEl.textContent = `v${state.appVersion}`;
+  }
 
   const subtitleEl = document.getElementById('brandSubtitle');
   if (subtitleEl && state.config.githubUser) {
@@ -576,6 +595,12 @@ async function loadState(preserveSelection = true) {
   renderPrList();
   scheduleJobPollingIfNeeded();
 
+  if (data.neverSynced && state.prs.length === 0 && !state._autoSyncedFirstRun) {
+    state._autoSyncedFirstRun = true;
+    runQueueSync();
+    return;
+  }
+
   if (!preserveSelection || !state.selectedPrKey) {
     const targetPr =
       (initialUrlPrKey && state.prs.find((p) => p.key === initialUrlPrKey)) ||
@@ -591,6 +616,9 @@ async function loadState(preserveSelection = true) {
     const stillExists = state.prs.find((p) => p.key === state.selectedPrKey);
     if (stillExists) {
       renderTopbar(stillExists);
+      if (!stillExists.hasReviewFile && state.activeTab === 'report') {
+        selectPr(stillExists.key, false);
+      }
     }
   }
   renderCollapsibleLayoutState();
@@ -1142,7 +1170,9 @@ function renderTopbar(pr) {
   const rLbl = formatKeybindLabel(getKeybind('rerunReview'));
   if (pr.runningJob) {
     reviewSpinner?.classList.remove('hidden');
-    if (reviewLabel) reviewLabel.textContent = 'AI Review running…';
+    if (reviewLabel) {
+      reviewLabel.textContent = pr.runningJob.phase || 'AI Review running…';
+    }
   } else {
     reviewSpinner?.classList.add('hidden');
     if (reviewLabel) {
@@ -1258,16 +1288,45 @@ async function selectPr(prKey, broadcast = true) {
   } else {
     document.getElementById('reportExecutiveHeader')?.classList.add('hidden');
     document.getElementById('reportFindingsQuickBar')?.classList.add('hidden');
-    document.getElementById('markdownContainer').innerHTML = `
-      <div class="empty-card" style="margin:40px auto;">
-        <h3>No local review file</h3>
-        <p class="meta-text" style="margin-bottom:14px;">Status: ${escapeHtml(formatCleanStatus(pr.reviewStatus || pr.syncStatus || 'Pending'))}</p>
-        <div style="display:flex;gap:8px;justify-content:center;">
-          <button id="emptyCardRunReviewBtn" class="btn btn-primary btn-sm">Run AI Review Now</button>
-          <a href="${escapeHtml(pr.url)}" target="_blank" class="btn btn-secondary btn-sm">Open on GitHub ↗</a>
+    if (pr.runningJob) {
+      document.getElementById('markdownContainer').innerHTML = `
+        <div class="empty-card" style="margin:40px auto;">
+          <div style="display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:10px;">
+            <span class="spinner"></span>
+            <h3 style="margin:0;">AI Review in progress (${escapeHtml((pr.runningJob.cli || 'gemini').toUpperCase())})</h3>
+          </div>
+          <p class="meta-text" style="margin-bottom:6px;">${escapeHtml(pr.runningJob.phase || 'Analyzing Pull Request diff against 4-layer engineering rules…')}</p>
+          <p class="meta-text" style="margin:0;font-size:11.5px;">This page will refresh automatically as soon as the review report is saved.</p>
         </div>
-      </div>
-    `;
+      `;
+    } else if (pr.lastFailedJob) {
+      document.getElementById('markdownContainer').innerHTML = `
+        <div class="empty-card" style="margin:40px auto;max-width:680px;border-color:var(--sev-blocker-border);background:var(--sev-blocker-bg);">
+          <h3 style="color:var(--sev-blocker);margin-top:0;">Last AI Review Attempt Failed</h3>
+          <p class="meta-text" style="margin-bottom:10px;color:var(--text-primary);white-space:pre-wrap;text-align:left;font-family:var(--font-mono);font-size:12px;padding:10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);">${escapeHtml(pr.lastFailedJob.error || 'Unknown error while running AI agent CLI.')}</p>
+          <p class="meta-text" style="margin-bottom:14px;">Click <strong>Doctor</strong> in the top bar to verify your <code>gemini</code> / <code>claude</code> CLI installation and authentication.</p>
+          <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+            <button id="emptyCardRunReviewBtn" class="btn btn-primary btn-sm">Retry AI Review</button>
+            <button id="emptyCardOpenDoctorBtn" class="btn btn-secondary btn-sm">Open Doctor &amp; Setup Check</button>
+            <a href="${escapeHtml(pr.url)}" target="_blank" class="btn btn-secondary btn-sm">Open on GitHub ↗</a>
+          </div>
+        </div>
+      `;
+      document.getElementById('emptyCardOpenDoctorBtn')?.addEventListener('click', () => {
+        openDoctorModal();
+      });
+    } else {
+      document.getElementById('markdownContainer').innerHTML = `
+        <div class="empty-card" style="margin:40px auto;">
+          <h3>No local review file</h3>
+          <p class="meta-text" style="margin-bottom:14px;">Status: ${escapeHtml(formatCleanStatus(pr.reviewStatus || pr.syncStatus || 'Pending'))}</p>
+          <div style="display:flex;gap:8px;justify-content:center;">
+            <button id="emptyCardRunReviewBtn" class="btn btn-primary btn-sm">Run AI Review Now</button>
+            <a href="${escapeHtml(pr.url)}" target="_blank" class="btn btn-secondary btn-sm">Open on GitHub ↗</a>
+          </div>
+        </div>
+      `;
+    }
     document.getElementById('emptyCardRunReviewBtn')?.addEventListener('click', () => {
       triggerManualReviewForKey(pr.key);
     });
@@ -5261,11 +5320,11 @@ document.getElementById('themeToggleBtn')?.addEventListener('click', () => {
   showToast(`Theme: ${THEME_LABELS[next] || next}`, 1800);
 });
 
-document.getElementById('syncQueueBtn')?.addEventListener('click', async () => {
+async function runQueueSync() {
   const btn = document.getElementById('syncQueueBtn');
   const spinner = document.getElementById('syncSpinner');
-  btn.disabled = true;
-  spinner.classList.remove('hidden');
+  if (btn) btn.disabled = true;
+  if (spinner) spinner.classList.remove('hidden');
   showToast('Syncing with GitHub...');
 
   try {
@@ -5278,8 +5337,53 @@ document.getElementById('syncQueueBtn')?.addEventListener('click', async () => {
   } catch (err) {
     showToast(`Error: ${err.message}`, 4500);
   } finally {
+    if (btn) btn.disabled = false;
+    if (spinner) spinner.classList.add('hidden');
+  }
+}
+
+document.getElementById('syncQueueBtn')?.addEventListener('click', runQueueSync);
+
+async function checkAppUpdateAvailability() {
+  const btn = document.getElementById('appUpdateBtn');
+  if (!btn) return;
+  try {
+    const res = await fetch('/api/app-update');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.version) {
+      const badge = document.getElementById('appVersionBadge');
+      if (badge) badge.textContent = `v${data.version}`;
+    }
+    if (data.updateAvailable && data.behindCount > 0) {
+      btn.textContent = `⬆ Update (${data.behindCount})`;
+      btn.title = data.latestCommitSubject
+        ? `Pull ${data.behindCount} new commit(s): ${data.latestCommitSubject}`
+        : `Pull ${data.behindCount} new commit(s) from GitHub`;
+      btn.classList.remove('hidden');
+    } else {
+      btn.classList.add('hidden');
+    }
+  } catch {
+    // ignore offline/network errors
+  }
+}
+
+document.getElementById('appUpdateBtn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('appUpdateBtn');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = 'Updating…';
+  try {
+    const res = await fetch('/api/app-update', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Error pulling update');
+    showToast('Updated to latest version! Reloading…', 2000);
+    setTimeout(() => window.location.reload(), 900);
+  } catch (err) {
+    showToast(`Update error: ${err.message}`, 4500);
     btn.disabled = false;
-    spinner.classList.add('hidden');
+    btn.textContent = '⬆ Update Available';
   }
 });
 
@@ -5323,7 +5427,7 @@ async function openSettingsModal() {
   }
   const profiles = state.teamProfiles || [];
   const activeProfileId = cfg.teamProfile || state.activeTeamProfile?.id || 'popcorn-back';
-  const activeAgentCli = cfg.agentCli || 'gemini';
+  const activeAgentCli = cfg.agentCli || 'agy';
 
   const modal = document.getElementById('githubModal');
   const titleEl = document.getElementById('modalTitle');
@@ -5360,6 +5464,7 @@ async function openSettingsModal() {
         <div>
           <label style="display:block;font-weight:500;margin-bottom:4px;">AI Agent CLI Runner:</label>
           <select id="cfgAgentCli" class="search-input">
+            <option value="agy" ${activeAgentCli === 'agy' ? 'selected' : ''}>Antigravity CLI (agy)</option>
             <option value="gemini" ${activeAgentCli === 'gemini' ? 'selected' : ''}>Gemini CLI (gemini)</option>
             <option value="claude" ${activeAgentCli === 'claude' ? 'selected' : ''}>Claude Code CLI (claude)</option>
           </select>
@@ -5393,10 +5498,51 @@ async function openSettingsModal() {
           <input type="text" id="cfgJiraPrefixes" class="search-input" value="${escapeHtml((cfg.jiraPrefixes || ['PRD', 'HYB', 'WAN', 'POP', 'OPS', 'SEC']).join(', '))}" />
         </div>
       </div>
+      <div style="border-top:1px solid var(--border-color);padding-top:10px;margin-top:4px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
+          <strong style="font-size:0.84rem;">System Health Check (Environment Doctor)</strong>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <a href="/api/export-zip" class="btn btn-secondary btn-xs" title="Download a clean shareable .zip without personal local config">Download Shareable .zip</a>
+            <button type="button" id="cfgRefreshDoctorBtn" class="btn btn-ghost btn-xs">Re-check</button>
+          </div>
+        </div>
+        <div id="cfgDoctorStatusBox" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:0.78rem;">
+          <span class="meta-text">Running diagnostic checks…</span>
+        </div>
+      </div>
     </div>
   `;
 
   modal.classList.remove('hidden');
+
+  const loadDoctorStatus = async () => {
+    const docBox = document.getElementById('cfgDoctorStatusBox');
+    if (!docBox) return;
+    docBox.innerHTML = `<span class="meta-text">Running diagnostic checks…</span>`;
+    try {
+      const res = await fetch('/api/doctor');
+      if (!res.ok) throw new Error('Doctor check failed');
+      const report = await res.json();
+      docBox.innerHTML = (report.checks || [])
+        .map(
+          (chk) => `
+          <div style="background:var(--bg-elevated);padding:6px 8px;border-radius:6px;border:1px solid var(--border-color);display:flex;flex-direction:column;gap:2px;">
+            <div style="display:flex;align-items:center;gap:6px;font-weight:600;">
+              <span>${chk.ok ? '🟢' : '🔴'}</span>
+              <span>${escapeHtml(chk.label)}</span>
+            </div>
+            <div class="meta-text" style="font-size:0.72rem;word-break:break-word;">${escapeHtml(chk.detail || '')}</div>
+            ${!chk.ok && chk.fixHint ? `<div style="font-size:0.71rem;color:var(--accent-warning,#f59e0b);">Fix: <code>${escapeHtml(chk.fixHint)}</code></div>` : ''}
+          </div>
+        `
+        )
+        .join('');
+    } catch (err) {
+      docBox.innerHTML = `<span class="meta-text">Could not run diagnostics: ${escapeHtml(err.message)}</span>`;
+    }
+  };
+  document.getElementById('cfgRefreshDoctorBtn')?.addEventListener('click', loadDoctorStatus);
+  loadDoctorStatus();
 
   const renderDiscoveredTeamPills = async () => {
     const box = document.getElementById('cfgDiscoveredTeamsBox');
@@ -5452,7 +5598,7 @@ async function openSettingsModal() {
     const githubUser = document.getElementById('cfgGithubUser').value.trim();
     const githubOrg = document.getElementById('cfgGithubOrg').value.trim();
     const teamProfile = document.getElementById('cfgTeamProfile')?.value || 'popcorn-back';
-    const agentCli = document.getElementById('cfgAgentCli')?.value || 'gemini';
+    const agentCli = document.getElementById('cfgAgentCli')?.value || 'agy';
     const githubTeams = document
       .getElementById('cfgGithubTeams')
       .value.split(',')
@@ -5501,6 +5647,187 @@ async function openSettingsModal() {
 }
 
 document.getElementById('settingsBtn')?.addEventListener('click', openSettingsModal);
+
+async function openRexFeedbackModal() {
+  const modal = document.getElementById('githubModal');
+  const titleEl = document.getElementById('modalTitle');
+  const bodyEl = document.getElementById('modalBody');
+  const confirmBtn = document.getElementById('confirmModalBtn');
+  if (!modal || !titleEl || !bodyEl || !confirmBtn) return;
+
+  titleEl.textContent = 'Colleague Feedback & REX (Return on Experience)';
+  confirmBtn.textContent = 'Add Feedback Note';
+
+  let currentItems = [];
+  let currentMarkdown = '';
+
+  const renderRexModalBody = () => {
+    const activePr = state.selectedPrKey || '';
+    const activeTab = state.prQueueFullPage ? 'queue' : state.activeTab || 'report';
+    bodyEl.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        <div class="meta-text">
+          Log any bug, UX friction, AI false positive, or team rule idea while testing PR Review Hub. Export your REX in 1 click to share on Slack/Teams or GitHub.
+        </div>
+        <div style="display:grid;grid-template-columns:1.3fr 0.7fr 1fr;gap:10px;">
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px;">Category:</label>
+            <select id="rexCategory" class="search-input">
+              <option value="ux">✨ UX / Shortcuts / Ergonomics</option>
+              <option value="bug">🐛 Bug / Issue</option>
+              <option value="agent-quality">🤖 AI Agent Quality / False Positive</option>
+              <option value="team-rule">📏 Team DNA Rule Idea</option>
+              <option value="feature-request">🚀 Feature Request</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px;">Experience (1–5):</label>
+            <select id="rexRating" class="search-input">
+              <option value="5">★★★★★ (5/5)</option>
+              <option value="4">★★★★☆ (4/5)</option>
+              <option value="3">★★★☆☆ (3/5)</option>
+              <option value="2">★★☆☆☆ (2/5)</option>
+              <option value="1">★☆☆☆☆ (1/5)</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px;">PR Context (optional):</label>
+            <input type="text" id="rexPrKey" class="search-input" value="${escapeHtml(activePr)}" placeholder="E.g.: 2cloud-services#5677" />
+          </div>
+        </div>
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Summary / Title:</label>
+          <input type="text" id="rexTitle" class="search-input" placeholder="E.g.: Diff file tree could auto-scroll to active file..." />
+        </div>
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Details / Steps / Suggestion:</label>
+          <textarea id="rexDescription" class="finding-textarea" rows="3" placeholder="Describe what happened or what would make your daily code reviews faster..."></textarea>
+        </div>
+        <div style="border-top:1px solid var(--border-color);padding-top:10px;display:flex;flex-direction:column;gap:8px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong style="font-size:0.84rem;">Saved REX Notes (${currentItems.length})</strong>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              <button type="button" id="copyRexMarkdownBtn" class="btn btn-secondary btn-xs">📋 Copy REX Markdown for Slack</button>
+              <button type="button" id="openRexGithubIssueBtn" class="btn btn-ghost btn-xs">🐙 Open GitHub Issue &#8599;</button>
+            </div>
+          </div>
+          <div style="max-height:170px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;">
+            ${
+              currentItems.length === 0
+                ? `<div class="meta-text">No REX notes saved yet. Add your first note above!</div>`
+                : currentItems
+                    .map(
+                      (item) => `
+                  <div style="background:var(--bg-elevated);padding:8px 10px;border-radius:6px;border:1px solid var(--border-color);display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">
+                    <div style="min-width:0;flex:1;">
+                      <div style="font-weight:600;font-size:0.8rem;">
+                        <span class="badge badge-mono">${escapeHtml(item.category || 'ux')}</span>
+                        ${item.prKey ? `<span class="badge badge-mono">${escapeHtml(item.prKey)}</span>` : ''}
+                        <span>${escapeHtml(item.title)}</span>
+                      </div>
+                      ${item.description ? `<div class="meta-text" style="font-size:0.75rem;margin-top:3px;white-space:pre-wrap;">${escapeHtml(item.description)}</div>` : ''}
+                    </div>
+                    <button type="button" class="btn btn-ghost btn-xs rex-delete-btn" data-rex-id="${escapeHtml(item.id)}" title="Delete note">&#10005;</button>
+                  </div>
+                `
+                    )
+                    .join('')
+            }
+          </div>
+        </div>
+      </div>
+    `;
+
+    bodyEl.querySelector('#copyRexMarkdownBtn')?.addEventListener('click', async () => {
+      await navigator.clipboard.writeText(currentMarkdown || '# No REX notes yet');
+      showToast('REX Markdown report copied to clipboard! Ready to paste in Slack/Teams.');
+    });
+
+    bodyEl.querySelector('#openRexGithubIssueBtn')?.addEventListener('click', () => {
+      const issueTitle = encodeURIComponent(
+        `[REX] Feedback from @${state.config?.githubUser || 'colleague'} (${state.config?.teamProfile || 'popcorn-back'})`
+      );
+      const issueBody = encodeURIComponent(currentMarkdown || '');
+      window.open(
+        `https://github.com/fawr-ubi/pr-review-hub/issues/new?title=${issueTitle}&body=${issueBody}`,
+        '_blank',
+        'noopener'
+      );
+    });
+
+    bodyEl.querySelectorAll('.rex-delete-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.rexId;
+        if (!id) return;
+        const res = await fetch('/api/rex', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          currentItems = data.items || [];
+          currentMarkdown = data.markdown || '';
+          renderRexModalBody();
+        }
+      });
+    });
+
+    confirmBtn.onclick = async () => {
+      const category = document.getElementById('rexCategory')?.value || 'ux';
+      const rating = Number(document.getElementById('rexRating')?.value || 5);
+      const prKey = document.getElementById('rexPrKey')?.value.trim() || '';
+      const title = document.getElementById('rexTitle')?.value.trim() || '';
+      const description = document.getElementById('rexDescription')?.value.trim() || '';
+      if (!title && !description) {
+        showToast('Please enter a summary or details for your feedback note.');
+        return;
+      }
+      confirmBtn.disabled = true;
+      try {
+        const res = await fetch('/api/rex', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            category,
+            rating,
+            prKey,
+            activeTab,
+            title,
+            description,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Error saving feedback');
+        currentItems = data.items || [];
+        currentMarkdown = data.markdown || '';
+        renderRexModalBody();
+        showToast('REX note saved!');
+      } catch (err) {
+        showToast(`Error: ${err.message}`, 4000);
+      } finally {
+        confirmBtn.disabled = false;
+      }
+    };
+  };
+
+  try {
+    const res = await fetch('/api/rex');
+    if (res.ok) {
+      const data = await res.json();
+      currentItems = data.items || [];
+      currentMarkdown = data.markdown || '';
+    }
+  } catch {
+    // ignore
+  }
+
+  renderRexModalBody();
+  modal.classList.remove('hidden');
+}
+
+document.getElementById('rexFeedbackBtn')?.addEventListener('click', openRexFeedbackModal);
+document.getElementById('prTopbarRexBtn')?.addEventListener('click', openRexFeedbackModal);
 
 document.getElementById('closeModalBtn')?.addEventListener('click', () => {
   document.getElementById('githubModal').classList.add('hidden');
@@ -6662,3 +6989,4 @@ document.addEventListener('keydown', (e) => {
 // Initial load
 loadState(false);
 loadRules();
+checkAppUpdateAvailability();

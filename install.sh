@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "============================================================"
-echo "PR Review Hub & Agent Skill (my-review) — Installer v1.1.0"
+echo "PR Review Hub & Agent Skill (my-review) — Installer v1.2.0"
 echo "============================================================"
 
 if ! command -v node >/dev/null 2>&1; then
@@ -76,11 +76,15 @@ case "${TEAM_PROFILE}" in
   4) TEAM_PROFILE="qa-automation" ;;
 esac
 
-DEFAULT_AGENT_CLI="gemini"
-if ! command -v gemini >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
-  DEFAULT_AGENT_CLI="claude"
+DEFAULT_AGENT_CLI="agy"
+if ! command -v agy >/dev/null 2>&1 && [[ ! -x "${HOME}/.local/bin/agy" ]]; then
+  if command -v gemini >/dev/null 2>&1; then
+    DEFAULT_AGENT_CLI="gemini"
+  elif command -v claude >/dev/null 2>&1; then
+    DEFAULT_AGENT_CLI="claude"
+  fi
 fi
-read -r -p "AI Agent CLI runner (gemini / claude) [${DEFAULT_AGENT_CLI}]: " INPUT_AGENT_CLI
+read -r -p "AI Agent CLI runner (agy / gemini / claude) [${DEFAULT_AGENT_CLI}]: " INPUT_AGENT_CLI
 AGENT_CLI="${INPUT_AGENT_CLI:-$DEFAULT_AGENT_CLI}"
 
 read -r -p "Local repositories workspace (projectsDir) [${DEFAULT_PROJECTS_DIR}]: " INPUT_PROJECTS_DIR
@@ -121,7 +125,7 @@ const cfg = {
   githubOrg: process.argv[2],
   githubTeams: teams,
   teamProfile: process.argv[9] || "popcorn-back",
-  agentCli: process.argv[10] || "gemini",
+  agentCli: process.argv[10] || "agy",
   projectsDir: process.argv[4],
   reviewsDir: process.argv[5],
   jiraBaseUrl: process.argv[6].replace(/\/+$/, ""),
@@ -131,6 +135,20 @@ const cfg = {
 };
 fs.writeFileSync(path.join(process.argv[8], "config.json"), JSON.stringify(cfg, null, 2) + "\n");
 ' "${GITHUB_USER}" "${GITHUB_ORG}" "${RAW_TEAMS}" "${PROJECTS_DIR}" "${REVIEWS_DIR}" "${JIRA_BASE_URL}" "${RAW_PREFIXES}" "${TARGET_SKILL_DIR}" "${TEAM_PROFILE}" "${AGENT_CLI}"
+
+# Synchronize 3-layer combined rule files (Common DNA + Team DNA + Local DNA)
+node --input-type=module -e "
+  import { syncCombinedReferenceFiles } from '${TARGET_SKILL_DIR}/ui/lib/rules.mjs';
+  syncCombinedReferenceFiles('${TEAM_PROFILE}');
+" || true
+
+# Also symlink for Claude Code if ~/.claude exists or agentCli is claude
+if [[ -d "${HOME}/.claude" || "${AGENT_CLI}" == "claude" ]]; then
+  mkdir -p "${HOME}/.claude/skills"
+  if [[ ! -e "${HOME}/.claude/skills/my-review" ]]; then
+    ln -s "${TARGET_SKILL_DIR}" "${HOME}/.claude/skills/my-review" || true
+  fi
+fi
 
 read -r -p "Analyze last 1 year (365 days) of team PR review comments to propose candidate rules now? [Y/n]: " RUN_BOOTSTRAP
 RUN_BOOTSTRAP="${RUN_BOOTSTRAP:-Y}"
@@ -144,6 +162,14 @@ if [[ "${RUN_BOOTSTRAP}" =~ ^[Yy]$ ]]; then
     console.log(\`Synthesized \${res.addedCandidatesCount} candidate rule(s) from \${res.analyzedCommentsCount} comments across \${res.analyzedPrsCount} PRs.\`);
     console.log('Open Tab 5 (5. Agent Rules -> Candidates) in PR Review Hub to approve or reject them.');
   " || true
+fi
+
+read -r -p "Run initial GitHub PR queue sync right now? [Y/n]: " RUN_INITIAL_SYNC
+RUN_INITIAL_SYNC="${RUN_INITIAL_SYNC:-Y}"
+if [[ "${RUN_INITIAL_SYNC}" =~ ^[Yy]$ ]]; then
+  echo "Syncing open Pull Requests from GitHub..."
+  "${TARGET_SKILL_DIR}/scripts/sync-queue.sh" scan >/dev/null || true
+  echo "Initial PR queue synced!"
 fi
 
 LAUNCHER="${REVIEWS_DIR}/Open Review Hub.command"

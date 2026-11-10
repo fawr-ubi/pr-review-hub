@@ -1425,5 +1425,41 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
       delete process.env.REVIEW_HUB_TEAMS_DIR;
     }
   });
+
+  test('GET /api/doctor and POST /api/rex provide colleague diagnostics and structured REX export', async () => {
+    const docRes = await fetch(`${baseUrl}/api/doctor`);
+    assert.equal(docRes.status, 200);
+    const docData = await docRes.json();
+    assert.ok(Array.isArray(docData.checks));
+    assert.ok(docData.checks.some((c) => c.id === 'node' && c.ok === true));
+
+    const addRexRes = await fetch(`${baseUrl}/api/rex`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        category: 'ux',
+        rating: 5,
+        prKey: '2cloud-services#5677',
+        activeTab: 'diff',
+        title: 'Love the instant diff switching',
+        description: 'Pre-fetching makes switching PRs super smooth.',
+      }),
+    });
+    assert.equal(addRexRes.status, 200);
+    const rexData = await addRexRes.json();
+    assert.equal(rexData.ok, true);
+    assert.equal(rexData.items.length, 1);
+    assert.ok(rexData.markdown.includes('Love the instant diff switching'));
+
+    const delRexRes = await fetch(`${baseUrl}/api/rex`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: rexData.item.id }),
+    });
+    assert.equal(delRexRes.status, 200);
+    const afterDel = await delRexRes.json();
+    assert.equal(afterDel.items.length, 0);
+  });
 });
+
 

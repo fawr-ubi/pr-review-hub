@@ -5,7 +5,7 @@
     "your-github-team-slug"
   ],
   "teamProfile": "popcorn-back",
-  "agentCli": "gemini",
+  "agentCli": "agy",
   "projectsDir": "~/Ubitransport/projects",
   "reviewsDir": "~/Ubitransport/projects/artifacts/reviews",
   "jiraBaseUrl": "https://ubitransport.atlassian.net/browse",

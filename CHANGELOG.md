@@ -2,6 +2,20 @@
 
 All notable changes to **PR Review Hub (`my-review`)** are documented in this file.
 
+## [1.2.0] - 2026-11-10
+
+### Added & Fixed
+- **Antigravity CLI (`agy`) Support & Auto-Fallback (`agy` → `gemini` → `claude`)**:
+  - Added first-class headless support for **Antigravity CLI (`agy`)** (`--dangerously-skip-permissions --disable-slash-commands --output-format stream-json --add-dir ... -p ...`) alongside `gemini` and `claude`, with automatic detection and fallback across all three CLIs.
+- **Zero-Config Auto-Bootstrap (`ensureConfigBootstrapped`)**:
+  - Running `npm start` immediately after `git clone` now auto-creates `config.json`, detects the user's GitHub identity/teams via `gh api`, locates local project workspaces (`~/Ubitransport/projects`, `~/projects`, etc.), finds installed AI CLIs (`agy`, `gemini`, or `claude`), and auto-syncs the PR queue on first browser load.
+- **Standalone & Headless AI Review Engine (`ui/lib/agent.mjs`)**:
+  - Added versioned [`references/review-checklist.md`](references/review-checklist.md) to the repository.
+  - Pre-fetches PR metadata, file stats, and unified diff directly from GitHub (`gh pr view` / `gh pr diff`) in Node.js and embeds the 4-layer engineering rules + checklist + template directly into the prompt so AI reviews work reliably even if the repository is not cloned locally.
+  - Added `--skip-trust --approval-mode yolo -o stream-json --allowed-mcp-server-names none -e none` and `--include-directories` to headless `gemini` invocations so reviews never hang on workspace trust prompts, sandbox directory restrictions, or slow MCP server startups.
+- **Colleague Environment Doctor, In-App REX Collector & 1-Click Updater (`ui/lib/doctor.mjs`)**:
+  - Added `Doctor` check (`GET /api/doctor` and `npm run doctor`), in-app `Feedback / REX` collector (`GET/POST/DELETE /api/rex` with Slack Markdown copy), and 1-click Git update check (`GET/POST /api/app-update`).
+
 ## [1.1.0] - 2026-11-09
 
 ### Added

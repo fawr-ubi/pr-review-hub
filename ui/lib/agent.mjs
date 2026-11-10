@@ -1,8 +1,9 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { SKILL_ROOT } from './config.mjs';
+import { SKILL_ROOT, findCliBinaryPath } from './config.mjs';
 import { parseFindingsFromMarkdown } from './parser.mjs';
 import { extractJiraKey } from './metadata.mjs';
 import { getLocalRepoPath, getProjectsDir } from './worktree.mjs';
@@ -63,15 +64,19 @@ export function appendPrChatMessage(reviewsDir, repo, number, msg) {
   return entry;
 }
 
-function resolveAgentBinary(agentCli = 'gemini') {
-  if (agentCli === 'claude') {
-    if (fs.existsSync('/opt/homebrew/bin/claude')) return '/opt/homebrew/bin/claude';
-    if (fs.existsSync('/usr/local/bin/claude')) return '/usr/local/bin/claude';
-    return 'claude';
+export function resolveAgentBinary(preferredCli = 'agy') {
+  const normalized = ['agy', 'gemini', 'claude'].includes(preferredCli) ? preferredCli : 'agy';
+  const order = [normalized, ...['agy', 'gemini', 'claude'].filter((c) => c !== normalized)];
+
+  for (const candidate of order) {
+    const binPath = findCliBinaryPath(candidate);
+    if (binPath) {
+      return { cli: candidate, bin: binPath };
+    }
   }
-  if (fs.existsSync('/opt/homebrew/bin/gemini')) return '/opt/homebrew/bin/gemini';
-  if (fs.existsSync('/usr/local/bin/gemini')) return '/usr/local/bin/gemini';
-  return 'gemini';
+  throw new Error(
+    `No AI Agent CLI ('agy', 'gemini', or 'claude') was found in PATH. Install Antigravity CLI ('agy'), Gemini CLI ('npm install -g @google/gemini-cli'), or Claude Code CLI ('claude'), then retry.`
+  );
 }
 
 function summarizeFindings(findings = []) {
@@ -101,13 +106,37 @@ function inferVerdictFromFindings(findings = [], rawMarkdown = '') {
   return '🟢 Ready to Approve';
 }
 
+function cleanReviewMarkdownOutput(rawText = '') {
+  let text = String(rawText || '').trim();
+  if (!text) return '';
+
+  // Strip outer ```markdown ... ``` fence if the LLM wrapped the whole document
+  const fencedMatch = text.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/i);
+  if (fencedMatch) {
+    text = fencedMatch[1].trim();
+  }
+
+  // Strip any Gemini CLI startup banner lines before the first Markdown heading
+  const firstHeadingIdx = text.search(/^#{1,2}\s+(?:Code Review|\d+\.\s+Task Summary)/m);
+  if (firstHeadingIdx > 0) {
+    text = text.slice(firstHeadingIdx).trim();
+  } else {
+    const anyHeadingIdx = text.search(/^#{1,3}\s+/m);
+    if (anyHeadingIdx > 0) {
+      text = text.slice(anyHeadingIdx).trim();
+    }
+  }
+  return text;
+}
+
 async function runCliPrompt({
   prompt,
   cwd,
-  agentCli = 'gemini',
+  agentCli = 'agy',
   approvalMode = 'yolo',
   timeoutMs = 240000,
   fastChatMode = false,
+  includeDirs = [],
   onStreamUpdate = null,
 }) {
   if (customAgentRunner) {
@@ -116,36 +145,213 @@ async function runCliPrompt({
     }
     return customAgentRunner({ prompt, cwd, approvalMode, agentCli });
   }
-  const bin = resolveAgentBinary(agentCli);
-  const workingDir = fs.existsSync(cwd) ? cwd : process.cwd();
 
-  if (agentCli === 'claude') {
-    const args = ['-p', prompt];
-    if (approvalMode === 'yolo' || approvalMode === 'auto_edit') {
-      args.push('--dangerously-skip-permissions');
-    }
-    const { stdout } = await execFileAsync(bin, args, {
-      cwd: workingDir,
-      maxBuffer: 25 * 1024 * 1024,
-      timeout: timeoutMs,
+  const { cli, bin } = resolveAgentBinary(agentCli);
+  const workingDir = cwd && fs.existsSync(cwd) ? cwd : process.cwd();
+  const validIncludeDirs = includeDirs.filter((d) => d && fs.existsSync(d));
+
+  // Antigravity CLI (`agy`) — first-class default agent runner
+  if (cli === 'agy') {
+    return new Promise((resolve, reject) => {
+      let tempPromptFile = null;
+      let effectivePrompt = prompt;
+      const dirsToAdd = [...validIncludeDirs];
+
+      if (prompt.length > 32000) {
+        tempPromptFile = path.join(
+          os.tmpdir(),
+          `prh-agy-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.md`
+        );
+        fs.writeFileSync(tempPromptFile, prompt, 'utf8');
+        if (!dirsToAdd.includes(os.tmpdir())) {
+          dirsToAdd.push(os.tmpdir());
+        }
+        effectivePrompt = `Read the complete review instructions and diff in the file "${tempPromptFile}" and output ONLY the requested Markdown response.`;
+      }
+
+      const args = [
+        '--dangerously-skip-permissions',
+        '--disable-slash-commands',
+        '--output-format',
+        'stream-json',
+      ];
+      for (const dir of dirsToAdd) {
+        args.push('--add-dir', dir);
+      }
+      args.push('-p', effectivePrompt);
+
+      const child = spawn(bin, args, {
+        cwd: workingDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let partialText = '';
+      let finalResponse = '';
+      let rawStdout = '';
+      let rawStderr = '';
+      let lineBuffer = '';
+
+      const cleanupTemp = () => {
+        if (tempPromptFile && fs.existsSync(tempPromptFile)) {
+          try {
+            fs.unlinkSync(tempPromptFile);
+          } catch {
+            // ignore
+          }
+        }
+      };
+
+      const timer = setTimeout(() => {
+        child.kill('SIGTERM');
+        cleanupTemp();
+        reject(new Error(`Antigravity CLI (agy) timeout exceeded (${Math.round(timeoutMs / 1000)}s)`));
+      }, timeoutMs);
+
+      const processAgyJsonLine = (line) => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('{')) return;
+        try {
+          const evt = JSON.parse(trimmed);
+          if (evt.event === 'init') {
+            onStreamUpdate?.({
+              phase: 'Antigravity (agy) initialized — analyzing code and diff…',
+              partialText,
+            });
+          } else if (evt.event === 'step_update' && evt.step_update) {
+            const su = evt.step_update;
+            if (su.step_type === 'tool_call' || su.tool_name) {
+              const toolLabel = su.tool_name || 'tool';
+              onStreamUpdate?.({
+                phase: `Inspecting (${toolLabel})…`,
+                partialText,
+                toolName: toolLabel,
+              });
+            } else if (su.step_type === 'agent_response' && typeof su.text_delta === 'string') {
+              partialText += su.text_delta;
+              onStreamUpdate?.({
+                phase: fastChatMode ? 'Streaming response…' : 'Generating review report…',
+                partialText,
+              });
+            }
+          } else if (evt.event === 'result' && evt.result) {
+            if (typeof evt.result.response === 'string' && evt.result.response.trim()) {
+              finalResponse = evt.result.response.trim();
+            }
+          }
+        } catch {
+          // ignore non-JSON lines
+        }
+      };
+
+      child.stdout.on('data', (chunk) => {
+        const str = chunk.toString('utf8');
+        rawStdout += str;
+        lineBuffer += str;
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() || '';
+        for (const l of lines) {
+          processAgyJsonLine(l);
+        }
+      });
+
+      child.stderr.on('data', (chunk) => {
+        rawStderr += chunk.toString('utf8');
+      });
+
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        cleanupTemp();
+        reject(err);
+      });
+
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        cleanupTemp();
+        if (lineBuffer) processAgyJsonLine(lineBuffer);
+        const out = finalResponse || partialText.trim();
+        if (out) {
+          resolve(out);
+        } else if (code === 0 && rawStdout.trim()) {
+          resolve(rawStdout.trim());
+        } else {
+          const errSnippet = rawStderr.trim().slice(-400) || rawStdout.trim().slice(-400);
+          reject(
+            new Error(
+              `Antigravity CLI (agy) exited with code ${code}${errSnippet ? `: ${errSnippet}` : ''}`
+            )
+          );
+        }
+      });
     });
-    return stdout.trim();
   }
 
-  if (!fastChatMode) {
-    const { stdout } = await execFileAsync(bin, ['-p', prompt, '--approval-mode', approvalMode], {
-      cwd: workingDir,
-      maxBuffer: 25 * 1024 * 1024,
-      timeout: timeoutMs,
+  if (cli === 'claude') {
+    return new Promise((resolve, reject) => {
+      const useStdin = prompt.length > 4000;
+      const args = [
+        '-p',
+        useStdin
+          ? 'Follow the instructions provided on stdin and output the requested response.'
+          : prompt,
+      ];
+      if (approvalMode === 'yolo' || approvalMode === 'auto_edit') {
+        args.push('--dangerously-skip-permissions');
+      }
+      for (const dir of validIncludeDirs) {
+        args.push('--add-dir', dir);
+      }
+
+      const child = spawn(bin, args, {
+        cwd: workingDir,
+        stdio: [useStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+      const timer = setTimeout(() => {
+        child.kill('SIGTERM');
+        reject(new Error(`Claude CLI timeout exceeded (${Math.round(timeoutMs / 1000)}s)`));
+      }, timeoutMs);
+
+      if (useStdin && child.stdin) {
+        child.stdin.write(prompt);
+        child.stdin.end();
+      }
+
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk.toString('utf8');
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString('utf8');
+      });
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0 && stdout.trim()) {
+          resolve(stdout.trim());
+        } else {
+          reject(
+            new Error(
+              `Claude CLI exited with code ${code}${stderr.trim() ? `: ${stderr.trim().slice(0, 300)}` : ''}`
+            )
+          );
+        }
+      });
     });
-    return stdout.trim();
   }
 
-  // Fast streaming mode for interactive Q&A: skip external MCP servers & extensions, stream JSON events
+  // Gemini CLI (both review and interactive Q&A use stream-json + --skip-trust + no slow MCP servers)
   return new Promise((resolve, reject) => {
+    const useStdin = prompt.length > 4000;
     const args = [
       '-p',
-      prompt,
+      useStdin
+        ? 'Execute the instructions provided on stdin and output the full response.'
+        : prompt,
+      '--skip-trust',
       '--approval-mode',
       approvalMode,
       '-o',
@@ -155,18 +361,28 @@ async function runCliPrompt({
       '-e',
       'none',
     ];
+    for (const dir of validIncludeDirs) {
+      args.push('--include-directories', dir);
+    }
+
     const child = spawn(bin, args, {
       cwd: workingDir,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [useStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
+
+    if (useStdin && child.stdin) {
+      child.stdin.write(prompt);
+      child.stdin.end();
+    }
 
     let partialText = '';
     let rawStdout = '';
+    let rawStderr = '';
     let lineBuffer = '';
 
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
-      reject(new Error(`Timeout exceeded (${Math.round(timeoutMs / 1000)}s)`));
+      reject(new Error(`Gemini CLI timeout exceeded (${Math.round(timeoutMs / 1000)}s)`));
     }, timeoutMs);
 
     const processJsonLine = (line) => {
@@ -186,14 +402,18 @@ async function runCliPrompt({
             partialText,
             toolName: toolLabel,
           });
-        } else if (evt.type === 'message' && evt.role === 'assistant' && typeof evt.content === 'string') {
+        } else if (
+          evt.type === 'message' &&
+          evt.role === 'assistant' &&
+          typeof evt.content === 'string'
+        ) {
           if (evt.delta) {
             partialText += evt.content;
           } else {
             partialText = evt.content;
           }
           onStreamUpdate?.({
-            phase: 'Streaming response…',
+            phase: fastChatMode ? 'Streaming response…' : 'Generating review report…',
             partialText,
           });
         }
@@ -213,6 +433,10 @@ async function runCliPrompt({
       }
     });
 
+    child.stderr.on('data', (chunk) => {
+      rawStderr += chunk.toString('utf8');
+    });
+
     child.on('error', (err) => {
       clearTimeout(timer);
       reject(err);
@@ -226,10 +450,67 @@ async function runCliPrompt({
       } else if (code === 0 && rawStdout.trim()) {
         resolve(rawStdout.trim());
       } else {
-        reject(new Error(`Gemini process exited with code ${code}`));
+        const errSnippet = rawStderr.trim().slice(-400) || rawStdout.trim().slice(-400);
+        reject(
+          new Error(
+            `Gemini CLI exited with code ${code}${errSnippet ? `: ${errSnippet}` : ''}`
+          )
+        );
       }
     });
   });
+}
+
+async function fetchPrContextFromGithub(cfg, pr) {
+  if (customAgentRunner) {
+    return {
+      headSha: pr.headRefOid || pr.lastReviewedSha || 'HEAD',
+      prBody: '',
+      diffText: '',
+      changedFilesList: [],
+    };
+  }
+  const repoSlug = `${cfg.githubOrg}/${pr.repo}`;
+  const [viewRes, diffRes] = await Promise.all([
+    execFileAsync(
+      'gh',
+      [
+        'pr',
+        'view',
+        String(pr.number),
+        '--repo',
+        repoSlug,
+        '--json',
+        'title,body,baseRefName,headRefName,headRefOid,author,files',
+      ],
+      { maxBuffer: 15 * 1024 * 1024, timeout: 20000 }
+    ).catch(() => ({ stdout: '{}' })),
+    execFileAsync('gh', ['pr', 'diff', String(pr.number), '--repo', repoSlug], {
+      maxBuffer: 25 * 1024 * 1024,
+      timeout: 30000,
+    }).catch(() => ({ stdout: '' })),
+  ]);
+
+  let parsed = {};
+  try {
+    parsed = JSON.parse(viewRes.stdout || '{}');
+  } catch {
+    parsed = {};
+  }
+
+  const headSha = parsed.headRefOid || pr.headRefOid || pr.lastReviewedSha || 'HEAD';
+  const prBody = String(parsed.body || '').trim();
+  const changedFilesList = Array.isArray(parsed.files)
+    ? parsed.files.map((f) => `${f.path} (+${f.additions || 0}/-${f.deletions || 0})`)
+    : [];
+  const diffText = String(diffRes.stdout || '').trim();
+
+  return {
+    headSha,
+    prBody,
+    diffText,
+    changedFilesList,
+  };
 }
 
 export function triggerPrReview({ cfg, pr }) {
@@ -247,6 +528,7 @@ export function triggerPrReview({ cfg, pr }) {
     number: Number(pr.number),
     type: 'review',
     status: 'running',
+    phase: 'Fetching PR diff and metadata from GitHub…',
     startedAt: new Date().toISOString(),
     finishedAt: null,
     error: null,
@@ -257,85 +539,124 @@ export function triggerPrReview({ cfg, pr }) {
     try {
       const projectsDir = getProjectsDir(cfg);
       const repoPath = getLocalRepoPath(projectsDir, pr.repo);
+      fs.mkdirSync(cfg.reviewsDir, { recursive: true });
       const reviewFileName = `review-${pr.repo}-${pr.number}.md`;
       const reviewFilePath = path.join(cfg.reviewsDir, reviewFileName);
       const jiraKey = extractJiraKey(pr) || '—';
 
-      let headSha = pr.headRefOid || pr.lastReviewedSha || '';
-      if (!headSha) {
-        try {
-          const { stdout } = await execFileAsync('gh', [
-            'pr',
-            'view',
-            String(pr.number),
-            '--repo',
-            `${cfg.githubOrg}/${pr.repo}`,
-            '--json',
-            'headRefOid',
-            '--jq',
-            '.headRefOid',
-          ]);
-          headSha = stdout.trim();
-        } catch {
-          headSha = 'HEAD';
-        }
-      }
-
-      const { commonDnaPath, teamDnaPath, activeTeam, dnaPath, fpPath } = getReferencePaths(
-        cfg.teamProfile
+      const { headSha, prBody, diffText, changedFilesList } = await fetchPrContextFromGithub(
+        cfg,
+        pr
       );
+
       syncCombinedReferenceFiles(cfg.teamProfile);
+      const { commonDnaPath, teamDnaPath, activeTeam, dnaPath, fpPath, combinedDnaPath } =
+        getReferencePaths(cfg.teamProfile);
+
+      const readSafe = (p) => (p && fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim() : '');
+      const combinedRulesText =
+        readSafe(combinedDnaPath) ||
+        [readSafe(commonDnaPath), readSafe(teamDnaPath), readSafe(dnaPath)]
+          .filter(Boolean)
+          .join('\n\n');
+      const fpRulesText = readSafe(fpPath);
+      const checklistText = readSafe(path.join(SKILL_ROOT, 'references/review-checklist.md'));
+      const templateText = readSafe(path.join(SKILL_ROOT, 'assets/review-artifact-template.md'));
 
       const teamContextLine = activeTeam
         ? `Active Team Profile: "${activeTeam.name}" (${activeTeam.id}). Tech Stack: ${(activeTeam.techStack || []).join(', ') || 'General'}.${activeTeam.agentInstructions ? ` Team Agent Focus: ${activeTeam.agentInstructions}` : ''}`
         : '';
 
+      const maxDiffChars = 110000;
+      const truncatedDiff =
+        diffText.length > maxDiffChars
+          ? `${diffText.slice(0, maxDiffChars)}\n\n[... Diff truncated at ${maxDiffChars} characters ...]`
+          : diffText;
+
       const prompt = [
         `Execute a Mode 1 code review using the skill at ${path.join(SKILL_ROOT, 'SKILL.md')} for PR ${cfg.githubOrg}/${pr.repo}#${pr.number} ("${pr.title || ''}", author: ${pr.author || 'unknown'}, head SHA: ${headSha}).`,
         teamContextLine,
         `Read ${commonDnaPath}, ${teamDnaPath}, ${dnaPath}, ${path.join(SKILL_ROOT, 'references/review-checklist.md')}, and ${fpPath}.`,
-        `Write the full Markdown review report in 100% English to ${reviewFilePath}, starting with "## 1. Task Summary & Functional Problem Solved" (Business & Functional Problem Solved, Technical & Feature Solution, Jira & Scope Compliance), and providing a single English "Ready-to-paste GitHub comment:" block per finding.`,
+        `Write the full Markdown review report in 100% English to ${reviewFilePath} (or output the complete Markdown report directly as your response), starting with "# Code Review: ${pr.repo}#${pr.number} — ${pr.title || ''}" and "## 1. Task Summary & Functional Problem Solved" (Business & Functional Problem Solved, Technical & Feature Solution, Jira & Scope Compliance), and providing a single English "Ready-to-paste GitHub comment:" block per finding.`,
         `Never publish any comment to GitHub.`,
+        templateText ? `\n--- Output Markdown Template ---\n${templateText}` : '',
+        combinedRulesText
+          ? `\n--- Active Reviewer & Team DNA Rules ---\n${combinedRulesText.slice(0, 18000)}`
+          : '',
+        fpRulesText
+          ? `\n--- Known False Positives (DO NOT FLAG THESE) ---\n${fpRulesText.slice(0, 8000)}`
+          : '',
+        checklistText ? `\n--- Review Checklist ---\n${checklistText}` : '',
+        prBody ? `\n--- PR Description ---\n${prBody.slice(0, 6000)}` : '',
+        changedFilesList.length > 0
+          ? `\n--- Modified Files (${changedFilesList.length}) ---\n${changedFilesList.join('\n')}`
+          : '',
+        truncatedDiff ? `\n--- Full Unified Git Diff ---\n\`\`\`diff\n${truncatedDiff}\n\`\`\`` : '',
       ]
         .filter(Boolean)
         .join('\n');
 
+      const resolvedCliLabel = (() => {
+        try {
+          return resolveAgentBinary(cfg.agentCli || 'agy').cli;
+        } catch {
+          return cfg.agentCli || 'agy';
+        }
+      })();
+      job.cli = resolvedCliLabel;
+      job.phase = `Running AI audit (${resolvedCliLabel})…`;
+
       const out = await runCliPrompt({
         prompt,
         cwd: repoPath,
-        agentCli: cfg.agentCli || 'gemini',
+        agentCli: cfg.agentCli || 'agy',
         approvalMode: 'yolo',
         timeoutMs: 300000,
+        includeDirs: [SKILL_ROOT, cfg.reviewsDir, repoPath],
+        onStreamUpdate: ({ phase }) => {
+          if (phase) job.phase = phase;
+        },
       });
 
-      // Fallback if the CLI returned markdown on stdout instead of writing the file directly
-      if (!fs.existsSync(reviewFilePath) && out && out.includes('#')) {
-        fs.writeFileSync(reviewFilePath, out, 'utf8');
-      }
-
-      if (fs.existsSync(reviewFilePath)) {
-        const md = fs.readFileSync(reviewFilePath, 'utf8');
-        const findings = parseFindingsFromMarkdown(md, pr.repo);
-        const summary = summarizeFindings(findings);
-        const verdict = inferVerdictFromFindings(findings, md);
-
-        if (cfg.syncScript && fs.existsSync(cfg.syncScript)) {
-          await execFileAsync(cfg.syncScript, [
-            'record',
-            pr.repo,
-            String(pr.number),
-            headSha,
-            verdict,
-            summary,
-            jiraKey,
-            reviewFileName,
-          ]).catch(() => {});
+      const cleanedOut = cleanReviewMarkdownOutput(out);
+      if (cleanedOut && cleanedOut.includes('#')) {
+        fs.writeFileSync(reviewFilePath, `${cleanedOut}\n`, 'utf8');
+      } else if (fs.existsSync(reviewFilePath)) {
+        const diskContent = cleanReviewMarkdownOutput(fs.readFileSync(reviewFilePath, 'utf8'));
+        if (diskContent) {
+          fs.writeFileSync(reviewFilePath, `${diskContent}\n`, 'utf8');
         }
       }
 
+      if (!fs.existsSync(reviewFilePath)) {
+        throw new Error(
+          'AI CLI finished without producing a Markdown review report. Check your AGY / Gemini / Claude CLI authentication.'
+        );
+      }
+
+      const md = fs.readFileSync(reviewFilePath, 'utf8');
+      const findings = parseFindingsFromMarkdown(md, pr.repo);
+      const summary = summarizeFindings(findings);
+      const verdict = inferVerdictFromFindings(findings, md);
+
+      if (cfg.syncScript && fs.existsSync(cfg.syncScript)) {
+        await execFileAsync(cfg.syncScript, [
+          'record',
+          pr.repo,
+          String(pr.number),
+          headSha,
+          verdict,
+          summary,
+          jiraKey,
+          reviewFileName,
+        ]).catch(() => {});
+      }
+
+      job.phase = 'Completed';
       job.status = 'completed';
       job.finishedAt = new Date().toISOString();
     } catch (err) {
+      job.phase = 'Failed';
       job.status = 'failed';
       job.error = err.message || String(err);
       job.finishedAt = new Date().toISOString();
@@ -371,7 +692,7 @@ export async function sendPrChatMessage({
     prKey,
     status: 'running',
     startedAt: new Date().toISOString(),
-    phase: 'Starting Gemini (without external MCP servers)…',
+    phase: 'Starting AI agent…',
     partialText: '',
     activeFile: fileContext?.filePath || findingContext?.filePath || null,
     toolCalls: [],
@@ -446,10 +767,11 @@ export async function sendPrChatMessage({
     const replyText = await runCliPrompt({
       prompt: promptParts.join('\n\n'),
       cwd: repoPath,
-      agentCli: cfg.agentCli || 'gemini',
+      agentCli: cfg.agentCli || 'agy',
       approvalMode: action === 'debrief' ? 'auto_edit' : 'plan',
       timeoutMs: 120000,
       fastChatMode: true,
+      includeDirs: [SKILL_ROOT, cfg.reviewsDir, repoPath],
       onStreamUpdate: ({ phase, partialText, toolName }) => {
         if (phase) streamState.phase = phase;
         if (typeof partialText === 'string') streamState.partialText = partialText;

@@ -39,6 +39,119 @@ export function detectGithubUser() {
   return os.userInfo().username || 'github-user';
 }
 
+export function detectGithubTeamsSync(orgFilter = 'ubitransports') {
+  try {
+    const out = execFileSync(
+      'gh',
+      [
+        'api',
+        'user/teams?per_page=100',
+        '--jq',
+        `[.[] | select(.organization.login == "${orgFilter}") | .slug]`,
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 4500,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }
+    ).trim();
+    const parsed = JSON.parse(out || '[]');
+    if (Array.isArray(parsed)) return parsed.filter(Boolean);
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+export function findCliBinaryPath(cliName = 'agy') {
+  const home = os.homedir();
+  const candidatesByCli = {
+    agy: [
+      path.join(home, '.local/bin/agy'),
+      '/opt/homebrew/bin/agy',
+      '/usr/local/bin/agy',
+      '/Applications/Antigravity.app/Contents/Resources/app/bin/agy',
+      path.join(home, 'Applications/Antigravity.app/Contents/Resources/app/bin/agy'),
+    ],
+    gemini: [
+      '/opt/homebrew/bin/gemini',
+      '/usr/local/bin/gemini',
+      path.join(home, '.local/bin/gemini'),
+      path.join(home, '.npm-global/bin/gemini'),
+      path.join(home, '.bun/bin/gemini'),
+    ],
+    claude: [
+      '/opt/homebrew/bin/claude',
+      '/usr/local/bin/claude',
+      path.join(home, '.local/bin/claude'),
+      path.join(home, '.claude/local/claude'),
+      path.join(home, '.npm-global/bin/claude'),
+      '/Applications/cmux.app/Contents/Resources/bin/claude',
+    ],
+  };
+  const candidates = candidatesByCli[cliName] || candidatesByCli.agy;
+
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+
+  // Check nvm node versions if present
+  const nvmDir = path.join(home, '.nvm/versions/node');
+  if (fs.existsSync(nvmDir)) {
+    try {
+      const versions = fs.readdirSync(nvmDir).sort().reverse();
+      for (const v of versions) {
+        const p = path.join(nvmDir, v, 'bin', cliName);
+        if (fs.existsSync(p)) return p;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  try {
+    const whichOut = execFileSync('which', [cliName], {
+      encoding: 'utf8',
+      timeout: 2000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (whichOut && fs.existsSync(whichOut)) return whichOut;
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+export function detectInstalledAgentCli() {
+  if (process.env.REVIEW_HUB_AGENT_CLI) return process.env.REVIEW_HUB_AGENT_CLI;
+  if (findCliBinaryPath('agy')) return 'agy';
+  if (findCliBinaryPath('gemini')) return 'gemini';
+  if (findCliBinaryPath('claude')) return 'claude';
+  return 'agy';
+}
+
+export function detectLocalProjectsDir() {
+  if (process.env.REVIEW_HUB_PROJECTS_DIR) {
+    return expandHome(process.env.REVIEW_HUB_PROJECTS_DIR);
+  }
+  const home = os.homedir();
+  const candidates = [
+    path.join(home, 'Ubitransport', 'projects'),
+    path.join(home, 'ubitransport', 'projects'),
+    path.join(home, 'Matawan', 'projects'),
+    path.join(home, 'matawan', 'projects'),
+    path.join(home, 'projects'),
+    path.join(home, 'Projects'),
+    path.join(home, 'dev'),
+    path.join(home, 'Code'),
+    path.join(home, 'workspace'),
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(dir)) return dir;
+  }
+  return path.join(home, 'Ubitransport', 'projects');
+}
+
 export async function discoverGithubIdentityAndTeams(orgFilter = '') {
   try {
     const [userRes, teamsRes] = await Promise.all([
@@ -85,9 +198,7 @@ export async function discoverGithubIdentityAndTeams(orgFilter = '') {
 }
 
 export function getDefaultConfig() {
-  const home = os.homedir();
-  const defaultProjectsDir =
-    process.env.REVIEW_HUB_PROJECTS_DIR || path.join(home, 'Ubitransport', 'projects');
+  const defaultProjectsDir = detectLocalProjectsDir();
   const defaultReviewsDir =
     process.env.REVIEWS_DIR || path.join(defaultProjectsDir, 'artifacts', 'reviews');
 
@@ -96,7 +207,7 @@ export function getDefaultConfig() {
     githubUser: detectGithubUser(),
     githubTeams: [],
     teamProfile: process.env.REVIEW_HUB_TEAM_PROFILE || 'popcorn-back',
-    agentCli: process.env.REVIEW_HUB_AGENT_CLI || 'gemini',
+    agentCli: detectInstalledAgentCli(),
     projectsDir: defaultProjectsDir,
     reviewsDir: defaultReviewsDir,
     jiraBaseUrl: 'https://ubitransport.atlassian.net/browse',
@@ -159,4 +270,62 @@ export function saveConfig(partialConfig) {
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
   fs.writeFileSync(configFile, JSON.stringify(updated, null, 2), 'utf8');
   return updated;
+}
+
+/**
+ * Automatically bootstraps config.json and local reference files on first server start
+ * even if the user ran `npm start` directly without running `./install.sh`.
+ */
+export function ensureConfigBootstrapped() {
+  const refDir = path.join(SKILL_ROOT, 'references');
+  const dnaLocal = path.join(refDir, 'reviewer-dna.local.md');
+  const dnaExample = path.join(refDir, 'reviewer-dna.example.md');
+  if (!fs.existsSync(dnaLocal) && fs.existsSync(dnaExample)) {
+    try {
+      fs.copyFileSync(dnaExample, dnaLocal);
+    } catch {
+      // ignore
+    }
+  }
+  const fpLocal = path.join(refDir, 'false-positives.local.md');
+  const fpExample = path.join(refDir, 'false-positives.example.md');
+  if (!fs.existsSync(fpLocal) && fs.existsSync(fpExample)) {
+    try {
+      fs.copyFileSync(fpExample, fpLocal);
+    } catch {
+      // ignore
+    }
+  }
+  const clLocal = path.join(refDir, 'changelog.local.md');
+  if (!fs.existsSync(clLocal)) {
+    try {
+      fs.writeFileSync(clLocal, '# Review Memory Changelog\n\n---\n', 'utf8');
+    } catch {
+      // ignore
+    }
+  }
+
+  const configFile = getConfigFile();
+  if (!fs.existsSync(configFile)) {
+    const defaults = getDefaultConfig();
+    const detectedTeams = detectGithubTeamsSync(defaults.githubOrg);
+    const bootstrapped = saveConfig({
+      ...defaults,
+      githubTeams: detectedTeams,
+    });
+    try {
+      fs.mkdirSync(path.join(bootstrapped.reviewsDir, 'archive'), { recursive: true });
+    } catch {
+      // ignore
+    }
+    return bootstrapped;
+  }
+
+  const cfg = loadConfig();
+  try {
+    fs.mkdirSync(path.join(cfg.reviewsDir, 'archive'), { recursive: true });
+  } catch {
+    // ignore
+  }
+  return cfg;
 }

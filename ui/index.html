@@ -18,14 +18,19 @@
       <div class="sidebar-inner">
         <div class="sidebar-header">
           <div class="sidebar-header-top">
-            <div style="display:flex;align-items:baseline;gap:12px;min-width:0;flex-wrap:wrap;">
+            <div style="display:flex;align-items:baseline;gap:10px;min-width:0;flex-wrap:wrap;">
               <h1>PR Review Hub</h1>
+              <span id="appVersionBadge" class="badge badge-mono" style="font-size:0.7rem;">v1.1.0</span>
+              <button id="appUpdateBtn" class="btn btn-primary btn-xs hidden" title="Pull latest PR Review Hub update from GitHub">
+                ⬆ Update Available
+              </button>
               <p id="brandSubtitle" class="subtitle" title="GitHub account &amp; teams">Loading…</p>
             </div>
             <div class="header-actions">
               <button id="returnToActivePrBtn" class="btn btn-primary btn-xs hidden" title="Return to currently active Pull Request (Enter)">
                 Resume Active PR &rarr;
               </button>
+              <button id="rexFeedbackBtn" class="btn btn-ghost btn-xs" title="Log testing feedback / REX or export your REX report for Slack">Feedback / REX</button>
               <button id="settingsBtn" class="btn btn-ghost btn-xs" title="GitHub, Jira and local paths configuration">Settings</button>
               <button id="themeToggleBtn" class="btn btn-ghost btn-xs" title="Switch theme (Dark / Purple / Light)">Theme</button>
               <button id="reviewAllPendingBtn" class="btn btn-secondary btn-xs" title="Run AI review on all pending PRs">
@@ -145,6 +150,9 @@
             <a id="openGithubPrBtn" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-sm" title="Open Pull Request on GitHub (shortcut: g)">
               GitHub (g) &#8599;
             </a>
+            <button id="prTopbarRexBtn" class="btn btn-secondary btn-sm" title="Log testing feedback / REX on this PR">
+              Feedback / REX
+            </button>
             <button id="openBatchReviewModalBtn" class="btn btn-primary btn-sm" title="Open Submit Review to GitHub modal (shortcut: m)">
               Submit Review (m)
             </button>
