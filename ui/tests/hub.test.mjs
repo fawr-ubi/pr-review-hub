@@ -12,7 +12,8 @@ import {
   resolveFindingAgainstDiff
 } from '../lib/parser.mjs';
 
-import { loadConfig, saveConfig } from '../lib/config.mjs';
+import { loadConfig, saveConfig, inferTeamProfileFromGithubTeams } from '../lib/config.mjs';
+import { recordPrReview, generateIndexMarkdown } from '../lib/sync.mjs';
 import {
   computeAuthorInitials,
   resolveAuthorDisplayName,
@@ -1459,6 +1460,63 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     assert.equal(delRexRes.status, 200);
     const afterDel = await delRexRes.json();
     assert.equal(afterDel.items.length, 0);
+  });
+
+  test('Multi-team auto-inference, zero-jq Node.js sync engine (recordPrReview / generateIndexMarkdown), Doctor modal, and First-Run Welcome Wizard', async () => {
+    // 1. Auto-inference of teamProfile from detected GitHub team slugs
+    assert.equal(inferTeamProfileFromGithubTeams(['popcorn-front']), 'frontend-web');
+    assert.equal(inferTeamProfileFromGithubTeams(['ubitransports/ubi-eng-team-mobile']), 'mobile-kotlin');
+    assert.equal(inferTeamProfileFromGithubTeams(['ubi-eng-team-qa']), 'qa-automation');
+    assert.equal(inferTeamProfileFromGithubTeams(['pili-back']), 'popcorn-back');
+    assert.equal(inferTeamProfileFromGithubTeams(['banana-back']), 'popcorn-back');
+    assert.equal(inferTeamProfileFromGithubTeams([]), 'popcorn-back');
+
+    // 2. Native Node.js sync engine records review state and generates INDEX.md without jq
+    const syncTmpDir = path.join(tmpRoot, 'sync-test-reviews');
+    fs.mkdirSync(syncTmpDir, { recursive: true });
+    const customSyncCfg = {
+      githubOrg: 'ubitransports',
+      githubUser: 'test-colleague',
+      githubTeams: ['pili-back'],
+      teamProfile: 'popcorn-back',
+      projectsDir: tmpRoot,
+      reviewsDir: syncTmpDir,
+      jiraBaseUrl: 'https://ubitransport.atlassian.net/browse',
+    };
+    const recRes = recordPrReview({
+      cfg: customSyncCfg,
+      repo: '2cloud-services',
+      number: 5800,
+      headSha: 'abcdef1234567890',
+      reviewStatus: '🟢 Ready to Approve',
+      findingsSummary: '0 🔴, 0 🟠, 1 🟡, 0 🔵',
+      jiraKey: 'PRD-18000',
+      reviewFile: 'review-2cloud-services-5800.md',
+    });
+    assert.equal(recRes.key, '2cloud-services#5800');
+    assert.ok(fs.existsSync(recRes.indexFile));
+    const indexMd = fs.readFileSync(recRes.indexFile, 'utf8');
+    assert.ok(indexMd.includes('2cloud-services #5800'));
+    assert.ok(indexMd.includes('PRD-18000'));
+    assert.ok(indexMd.includes('abcdef1'));
+
+    // 3. Verify UI includes Doctor button, openDoctorModal, openFirstRunWelcomeModal, and Antigravity CLI (agy) option
+    const [htmlRes, jsRes, docRes] = await Promise.all([
+      fetch(`${baseUrl}/`),
+      fetch(`${baseUrl}/app.js`),
+      fetch(`${baseUrl}/api/doctor`),
+    ]);
+    const html = await htmlRes.text();
+    const js = await jsRes.text();
+    const docData = await docRes.json();
+
+    assert.ok(html.includes('id="doctorBtn"'));
+    assert.ok(js.includes('async function openDoctorModal()'));
+    assert.ok(js.includes('async function openFirstRunWelcomeModal()'));
+    assert.ok(js.includes('Antigravity CLI (agy)'));
+    assert.ok(!docData.checks.some((c) => c.id === 'jq'));
+    assert.ok(docData.checks.some((c) => c.id === 'teamProfile' && c.ok === true));
+    assert.ok(docData.checks.some((c) => c.id === 'skillSymlink' && c.ok === true));
   });
 });
 

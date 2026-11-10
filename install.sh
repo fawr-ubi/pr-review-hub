@@ -15,11 +15,6 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "Error: jq is required. Install via Homebrew: brew install jq"
-  exit 1
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="${SCRIPT_DIR}"
 if [[ -d "${SCRIPT_DIR}/my-review" && -f "${SCRIPT_DIR}/my-review/SKILL.md" ]]; then
@@ -61,14 +56,21 @@ GITHUB_ORG="${INPUT_ORG:-$DEFAULT_ORG}"
 read -r -p "GitHub team slugs (comma-separated) [${DETECTED_TEAMS}]: " INPUT_TEAMS
 RAW_TEAMS="${INPUT_TEAMS:-$DETECTED_TEAMS}"
 
+DEFAULT_TEAM_PROFILE="$(node --input-type=module -e "
+  import { inferTeamProfileFromGithubTeams } from '${TARGET_SKILL_DIR}/ui/lib/config.mjs';
+  const raw = process.argv[1] || '';
+  const slugs = raw.split(',').map(s => s.trim()).filter(Boolean);
+  console.log(inferTeamProfileFromGithubTeams(slugs));
+" "${RAW_TEAMS}" 2>/dev/null || echo "popcorn-back")"
+
 echo ""
 echo "Available Team Agent Profiles (references/teams/<team-id>/):"
-echo "  1) popcorn-back   — Popcorn & Backend PHP (Symfony / API Platform / 2cloud)"
+echo "  1) popcorn-back   — Backend PHP & Squads (Symfony / API Platform / 2cloud)"
 echo "  2) frontend-web   — Frontend Web (TypeScript / VueJS / Angular)"
 echo "  3) mobile-kotlin  — Mobile Android (Kotlin / WanFare / WanPay)"
 echo "  4) qa-automation  — QA & E2E Automation (Cypress / TypeScript / Behat)"
-read -r -p "Active Team Profile slug [popcorn-back]: " INPUT_TEAM_PROFILE
-TEAM_PROFILE="${INPUT_TEAM_PROFILE:-popcorn-back}"
+read -r -p "Active Team Profile slug [${DEFAULT_TEAM_PROFILE}]: " INPUT_TEAM_PROFILE
+TEAM_PROFILE="${INPUT_TEAM_PROFILE:-$DEFAULT_TEAM_PROFILE}"
 case "${TEAM_PROFILE}" in
   1) TEAM_PROFILE="popcorn-back" ;;
   2) TEAM_PROFILE="frontend-web" ;;
@@ -131,15 +133,18 @@ const cfg = {
   jiraBaseUrl: process.argv[6].replace(/\/+$/, ""),
   jiraPrefixes: prefixes,
   syncScript: path.join(process.argv[8], "scripts/sync-queue.sh"),
-  port: 4242
+  port: 4242,
+  onboardingCompleted: true
 };
 fs.writeFileSync(path.join(process.argv[8], "config.json"), JSON.stringify(cfg, null, 2) + "\n");
 ' "${GITHUB_USER}" "${GITHUB_ORG}" "${RAW_TEAMS}" "${PROJECTS_DIR}" "${REVIEWS_DIR}" "${JIRA_BASE_URL}" "${RAW_PREFIXES}" "${TARGET_SKILL_DIR}" "${TEAM_PROFILE}" "${AGENT_CLI}"
 
-# Synchronize 3-layer combined rule files (Common DNA + Team DNA + Local DNA)
+# Synchronize 3-layer combined rule files (Common DNA + Team DNA + Local DNA) and skill symlinks
 node --input-type=module -e "
   import { syncCombinedReferenceFiles } from '${TARGET_SKILL_DIR}/ui/lib/rules.mjs';
+  import { ensureSkillSymlinks } from '${TARGET_SKILL_DIR}/ui/lib/config.mjs';
   syncCombinedReferenceFiles('${TEAM_PROFILE}');
+  ensureSkillSymlinks();
 " || true
 
 # Also symlink for Claude Code if ~/.claude exists or agentCli is claude
@@ -173,24 +178,24 @@ if [[ "${RUN_INITIAL_SYNC}" =~ ^[Yy]$ ]]; then
 fi
 
 LAUNCHER="${REVIEWS_DIR}/Open Review Hub.command"
-cat << 'LAUNCH_EOF' > "${LAUNCHER}"
+cat << LAUNCH_EOF > "${LAUNCHER}"
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT="${PORT:-4242}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVER_SCRIPT="${HOME}/.gemini/config/skills/my-review/ui/server.mjs"
-LOG_FILE="${SCRIPT_DIR}/.hub-server.log"
+PORT="\${PORT:-4242}"
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+SERVER_SCRIPT="${TARGET_SKILL_DIR}/ui/server.mjs"
+LOG_FILE="\${SCRIPT_DIR}/.hub-server.log"
 
-if ! lsof -iTCP:${PORT} -sTCP:LISTEN -t >/dev/null 2>&1; then
-  echo "Starting PR Review Hub on http://localhost:${PORT} ..."
-  nohup node "${SERVER_SCRIPT}" > "${LOG_FILE}" 2>&1 &
+if ! lsof -iTCP:\${PORT} -sTCP:LISTEN -t >/dev/null 2>&1; then
+  echo "Starting PR Review Hub on http://localhost:\${PORT} ..."
+  NO_OPEN=1 nohup node "\${SERVER_SCRIPT}" > "\${LOG_FILE}" 2>&1 &
   sleep 0.8
 else
-  echo "PR Review Hub is already running on http://localhost:${PORT}"
+  echo "PR Review Hub is already running on http://localhost:\${PORT}"
 fi
 
-open "http://localhost:${PORT}"
+open "http://localhost:\${PORT}"
 LAUNCH_EOF
 chmod +x "${LAUNCHER}"
 

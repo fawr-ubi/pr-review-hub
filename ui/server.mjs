@@ -66,6 +66,7 @@ import {
   deleteRexFeedback,
   formatRexMarkdownReport,
 } from './lib/doctor.mjs';
+import { scanPrQueue } from './lib/sync.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -1505,11 +1506,21 @@ export function createHubServer() {
       }
 
       if (req.method === 'POST' && pathname === '/api/sync') {
-        const { stdout } = await execFileAsync(cfg.syncScript, ['scan'], {
-          maxBuffer: 20 * 1024 * 1024,
-          timeout: 120000,
-        });
-        const scanResult = JSON.parse(stdout);
+        const defaultSyncScript = path.join(SKILL_ROOT_DIR, 'scripts', 'sync-queue.sh');
+        let scanResult;
+        if (
+          cfg.syncScript &&
+          path.resolve(cfg.syncScript) !== path.resolve(defaultSyncScript) &&
+          fs.existsSync(cfg.syncScript)
+        ) {
+          const { stdout } = await execFileAsync(cfg.syncScript, ['scan'], {
+            maxBuffer: 20 * 1024 * 1024,
+            timeout: 120000,
+          });
+          scanResult = JSON.parse(stdout);
+        } else {
+          scanResult = await scanPrQueue(cfg);
+        }
         return sendJson(res, 200, {
           ok: true,
           scanResult,
@@ -1878,10 +1889,34 @@ export function createHubServer() {
   });
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
-  const PORT = Number(process.env.PORT || 4242);
+const isDirectEntry = (() => {
+  try {
+    if (!process.argv[1]) return false;
+    return fs.realpathSync(path.resolve(process.argv[1])) === fs.realpathSync(__filename);
+  } catch {
+    return Boolean(process.argv[1] && path.resolve(process.argv[1]) === __filename);
+  }
+})();
+
+if (isDirectEntry) {
+  const bootCfg = ensureConfigBootstrapped();
+  const PORT = Number(process.env.PORT || bootCfg.port || 4242);
   const server = createHubServer();
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`PR Review Hub listening on http://localhost:${PORT}`);
+    const url = `http://localhost:${PORT}`;
+    console.log('');
+    console.log('============================================================');
+    console.log(`  PR Review Hub v${getAppVersion()} — Ready on ${url}`);
+    console.log('============================================================');
+    console.log(`  • GitHub User   : @${bootCfg.githubUser || 'auto'} (${bootCfg.githubOrg || 'ubitransports'})`);
+    console.log(`  • Team Profile  : ${bootCfg.teamProfile || 'popcorn-back'}`);
+    console.log(`  • AI Agent CLI  : ${bootCfg.agentCli || 'agy'}`);
+    console.log(`  • Reviews Cache : ${bootCfg.reviewsDir}`);
+    console.log('============================================================');
+    console.log('');
+    if (process.env.NO_OPEN !== '1' && process.env.NODE_ENV !== 'test') {
+      const openCmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
+      execFile(openCmd, [url], { timeout: 3000 }, () => {});
+    }
   });
 }

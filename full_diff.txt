@@ -1,0 +1,528 @@
+README.md                                  |  40 +-
+ install.sh                                 |  45 +-
+ references/teams/popcorn-back/profile.json |  13 +-
+ scripts/sync-queue.sh                      | 511 +---------------------
+ ui/app.js                                  | 277 ++++++++++++
+ ui/index.html                              |   1 +
+ ui/lib/agent.mjs                           |  23 +-
+ ui/lib/config.mjs                          | 136 +++++-
+ ui/lib/doctor.mjs                          |  67 +--
+ ui/lib/onboarding.mjs                      |  16 +-
+ ui/lib/sync.mjs                            | 669 +++++++++++++++++++++++++++++
+ ui/server.mjs                              |  51 ++-
+ ui/tests/hub.test.mjs                      |  60 ++-
+ 13 files changed, 1308 insertions(+), 601 deletions(-)
+
+--- Changes ---
+
+README.md
+  @@ -8,19 +8,19 @@ Zero-dependency local web cockpit (`http://localhost:4242`) and continuously lea
+  -You don't need `npm install` (zero external dependencies) or manual configuration files. Just make sure `node`, `gh`, `jq`, and an AI CLI (`gemini` or `claude`) are installed:
+  +You don't need `npm install` (zero external dependencies) or manual configuration files. Just make sure `node` (>= 18), `gh` (authenticated), and an AI CLI (`agy`, `gemini`, or `claude`) are installed:
+   
+   ### 1. Prerequisites (macOS / Linux)
+   
+   ```bash
+  -# 1. Core CLI tools (Node.js >= 18, GitHub CLI, jq)
+  -brew install node gh jq
+  +# 1. Core CLI tools (Node.js >= 18 & GitHub CLI)
+  +brew install node gh
+   
+   # 2. Authenticate GitHub CLI (if not already logged in)
+   gh auth status || gh auth login
+   
+   # 3. AI Agent CLI: Antigravity CLI (`agy`), Gemini CLI (`gemini`), or Claude Code CLI (`claude`)
+  -# PR Review Hub auto-detects whichever one is installed on your Mac (prioritizing `agy` -> `gemini` -> `claude`):
+  +# PR Review Hub auto-detects whichever one is installed (prioritizing `agy` -> `gemini` -> `claude`):
+   which agy || which gemini || which claude
+   ```
+   
+  @@ -28,7 +28,7 @@ which agy || which gemini || which claude
+  -Copy-paste this single block in your terminal:
+  +Clone the repository anywhere (either directly into `~/.gemini/config/skills/my-review` or in your usual projects folder — skill symlinks for Antigravity/Gemini and Claude Code are created automatically on startup):
+   
+   ```bash
+   gh repo clone fawr-ubi/pr-review-hub ~/.gemini/config/skills/my-review && \
+  @@ -36,21 +36,21 @@ cd ~/.gemini/config/skills/my-review && \
+  -*(Alternative if you prefer `git clone`: `git clone https://github.com/fawr-ubi/pr-review-hub.git ~/.gemini/config/skills/my-review`)*
+  +*(Alternative if you prefer `git clone`: `git clone https://github.com/fawr-ubi/pr-review-hub.git ~/.gemini/config/skills/my-review && cd ~/.gemini/config/skills/my-review && npm start`)*
+   
+  -Then open **[http://localhost:4242](http://localhost:4242)** in your browser!
+  +**[http://localhost:4242](http://localhost:4242)** opens automatically in your browser!
+   
+   #### What happens automatically on your very first `npm start`?
+  -- **Auto-bootstraps `config.json`** by querying your GitHub login (`gh api user`) and your GitHub teams (`gh api user/teams`).
+  -- **Auto-detects your local workspace** (`~/Ubitransport/projects`, `~/projects`, etc.) and your installed AI CLI (**`agy`** Antigravity CLI, **`gemini`** Gemini CLI, or **`claude`** Claude Code CLI, including `~/.local/bin`, Homebrew, and NVM paths).
+  -- **Initializes your 4-layer engineering rules** (`Common DNA` + `Team DNA` + local personal rules) and **auto-syncs your open Pull Requests** on first browser load.
+  +- **Auto-bootstraps `config.json` & Skill Symlinks**: Queries your GitHub login (`gh api user`), discovers your GitHub teams (`gh api user/teams`), and **auto-matches your Team Agent Profile** (`popcorn-back`, `frontend-web`, `mobile-kotlin`, `qa-automation`, etc.).
+  +- **1-Click Welcome Setup Wizard in the UI**: On first browser load, a pre-filled Welcome modal lets you confirm your **Team Agent Profile**, watched **GitHub Teams**, and **AI CLI runner** (`agy` / `gemini` / `claude`), then syncs your open Pull Requests in 1 click.
+  +- **Zero-`jq` Native Node.js Sync Engine**: Fetches your open Pull Requests, review statuses, CI states, and CODEOWNERS readiness on both macOS and Linux without requiring `jq`.
+   - **Works even without local repo clones**: When you click **`Run Review`** or **`Review All`**, the server fetches the PR diff and metadata directly from GitHub (`gh pr diff`) and streams it to the AI agent (`agy`, `gemini`, or `claude`) with your team's rules and review checklist embedded.
+   
+   ---
+   
+  -### 3. Optional: Interactive Setup & macOS Finder Launcher (`./install.sh`)
+  +### 3. Optional: Interactive CLI Setup & macOS Finder Launcher (`./install.sh`)
+   
+  -If you want to customize your **Team Agent Profile** interactively (`popcorn-back`, `frontend-web`, `mobile-kotlin`, `qa-automation`), mine 1 year of your team's GitHub PR review comments, and create a double-clickable **`Open Review Hub.command`** launcher on your Mac:
+  +If you prefer an interactive terminal wizard that also mines 1 year of your team's GitHub PR review comments and creates a double-clickable **`Open Review Hub.command`** launcher on your Mac:
+   
+   ```bash
+   cd ~/.gemini/config/skills/my-review
+  @@ -68,15 +68,15 @@ cd ~/.gemini/config/skills/my-review
+  -It verifies all 6 required components in 2 seconds:
+  -1. **`node` (>= 18)**
+  +It verifies your environment in 2 seconds and provides 1-click copyable fix commands:
+  +1. **`node` (>= 18)** & **`git`**
+   2. **`gh` CLI & Auth** (`gh auth status`)
+  -3. **`jq` binary** (used by `scripts/sync-queue.sh`)
+  -4. **AI Agent CLI (`agy`, `gemini`, or `claude`)**:
+  -   - Auto-detects **`agy`** (Antigravity CLI), **`gemini`** (Gemini CLI), or **`claude`** (Claude Code CLI) with automatic fallback if one is missing.
+  -   - You can also switch your preferred runner anytime in **`Settings (⚙)`**.
+  -5. **Local Projects Workspace (`projectsDir`)**
+  -6. **Reviews Storage Directory (`reviewsDir`)**
+  +3. **AI Agent CLI (`agy`, `gemini`, or `claude`)**:
+  +   - Auto-detects **`agy`** (Antigravity CLI), **`gemini`** (Gemini CLI), or **`claude`** (Claude Code CLI) across standard, Homebrew, `~/.local/bin`, and NVM paths, with automatic fallback if one is missing.
+  +   - You can switch your preferred runner anytime in **`Settings`**.
+  +4. **Local Projects Workspace (`projectsDir`)** *(Optional — only needed for local Git Worktrees & IDE jump; AI reviews and diffs work 100% remotely via GitHub)*
+  +5. **Reviews Storage Directory (`reviewsDir`)** & **Team Agent Profile**
+  +6. **IDE / CLI Skill Registration (`~/.gemini/config/skills/my-review`)**
+   
+   ---
+   
+  +20 -20
+
+install.sh
+  @@ -15,11 +15,6 @@ if ! command -v gh >/dev/null 2>&1; then
+  -if ! command -v jq >/dev/null 2>&1; then
+  -  echo "Error: jq is required. Install via Homebrew: brew install jq"
+  -  exit 1
+  -fi
+  -
+   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+   SOURCE_DIR="${SCRIPT_DIR}"
+   if [[ -d "${SCRIPT_DIR}/my-review" && -f "${SCRIPT_DIR}/my-review/SKILL.md" ]]; then
+  @@ -61,14 +56,21 @@ GITHUB_ORG="${INPUT_ORG:-$DEFAULT_ORG}"
+  +DEFAULT_TEAM_PROFILE="$(node --input-type=module -e "
+  +  import { inferTeamProfileFromGithubTeams } from '${TARGET_SKILL_DIR}/ui/lib/config.mjs';
+  +  const raw = process.argv[1] || '';
+  +  const slugs = raw.split(',').map(s => s.trim()).filter(Boolean);
+  +  console.log(inferTeamProfileFromGithubTeams(slugs));
+  +" "${RAW_TEAMS}" 2>/dev/null || echo "popcorn-back")"
+  +
+   echo ""
+   echo "Available Team Agent Profiles (references/teams/<team-id>/):"
+  -echo "  1) popcorn-back   — Popcorn & Backend PHP (Symfony / API Platform / 2cloud)"
+  +echo "  1) popcorn-back   — Backend PHP & Squads (Symfony / API Platform / 2cloud)"
+   echo "  2) frontend-web   — Frontend Web (TypeScript / VueJS / Angular)"
+   echo "  3) mobile-kotlin  — Mobile Android (Kotlin / WanFare / WanPay)"
+   echo "  4) qa-automation  — QA & E2E Automation (Cypress / TypeScript / Behat)"
+  -read -r -p "Active Team Profile slug [popcorn-back]: " INPUT_TEAM_PROFILE
+  -TEAM_PROFILE="${INPUT_TEAM_PROFILE:-popcorn-back}"
+  +read -r -p "Active Team Profile slug [${DEFAULT_TEAM_PROFILE}]: " INPUT_TEAM_PROFILE
+  +TEAM_PROFILE="${INPUT_TEAM_PROFILE:-$DEFAULT_TEAM_PROFILE}"
+   case "${TEAM_PROFILE}" in
+     1) TEAM_PROFILE="popcorn-back" ;;
+     2) TEAM_PROFILE="frontend-web" ;;
+  @@ -131,15 +133,18 @@ const cfg = {
+  -  port: 4242
+  +  port: 4242,
+  +  onboardingCompleted: true
+   };
+   fs.writeFileSync(path.join(process.argv[8], "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+   ' "${GITHUB_USER}" "${GITHUB_ORG}" "${RAW_TEAMS}" "${PROJECTS_DIR}" "${REVIEWS_DIR}" "${JIRA_BASE_URL}" "${RAW_PREFIXES}" "${TARGET_SKILL_DIR}" "${TEAM_PROFILE}" "${AGENT_CLI}"
+   
+  -# Synchronize 3-layer combined rule files (Common DNA + Team DNA + Local DNA)
+  +# Synchronize 3-layer combined rule files (Common DNA + Team DNA + Local DNA) and skill symlinks
+   node --input-type=module -e "
+     import { syncCombinedReferenceFiles } from '${TARGET_SKILL_DIR}/ui/lib/rules.mjs';
+  +  import { ensureSkillSymlinks } from '${TARGET_SKILL_DIR}/ui/lib/config.mjs';
+     syncCombinedReferenceFiles('${TEAM_PROFILE}');
+  +  ensureSkillSymlinks();
+   " || true
+   
+   # Also symlink for Claude Code if ~/.claude exists or agentCli is claude
+  @@ -173,24 +178,24 @@ if [[ "${RUN_INITIAL_SYNC}" =~ ^[Yy]$ ]]; then
+  -cat << 'LAUNCH_EOF' > "${LAUNCHER}"
+  +cat << LAUNCH_EOF > "${LAUNCHER}"
+   #!/usr/bin/env bash
+   set -euo pipefail
+   
+  -PORT="${PORT:-4242}"
+  -SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  -SERVER_SCRIPT="${HOME}/.gemini/config/skills/my-review/ui/server.mjs"
+  -LOG_FILE="${SCRIPT_DIR}/.hub-server.log"
+  +PORT="\${PORT:-4242}"
+  +SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+  +SERVER_SCRIPT="${TARGET_SKILL_DIR}/ui/server.mjs"
+  +LOG_FILE="\${SCRIPT_DIR}/.hub-server.log"
+   
+  -if ! lsof -iTCP:${PORT} -sTCP:LISTEN -t >/dev/null 2>&1; then
+  -  echo "Starting PR Review Hub on http://localhost:${PORT} ..."
+  -  nohup node "${SERVER_SCRIPT}" > "${LOG_FILE}" 2>&1 &
+  +if ! lsof -iTCP:\${PORT} -sTCP:LISTEN -t >/dev/null 2>&1; then
+  +  echo "Starting PR Review Hub on http://localhost:\${PORT} ..."
+  +  NO_OPEN=1 nohup node "\${SERVER_SCRIPT}" > "\${LOG_FILE}" 2>&1 &
+     sleep 0.8
+   else
+  -  echo "PR Review Hub is already running on http://localhost:${PORT}"
+  +  echo "PR Review Hub is already running on http://localhost:\${PORT}"
+   fi
+   
+  -open "http://localhost:${PORT}"
+  +open "http://localhost:\${PORT}"
+   LAUNCH_EOF
+   chmod +x "${LAUNCHER}"
+   
+  +25 -20
+
+references/teams/popcorn-back/profile.json
+  @@ -1,10 +1,17 @@
+  -  "name": "Popcorn & Backend PHP (Symfony / API Platform / 2cloud)",
+  -  "description": "Backend engineering standards for 2cloud-services microservices (PHP 8.3+, Symfony, API Platform, Doctrine) and 2cloud (CakePHP).",
+  +  "name": "Backend PHP & Squads (Symfony / API Platform / 2cloud)",
+  +  "description": "Backend engineering standards for 2cloud-services microservices (PHP 8.3+, Symfony, API Platform, Doctrine) and 2cloud (CakePHP) across Popcorn, Pili, Banana, Papaya, and Moneris squads.",
+     "githubTeams": [
+       "ubi-eng-team-popcorn",
+  -    "popcorn-back"
+  +    "popcorn-back",
+  +    "pili-back",
+  +    "ubi-eng-team-pili",
+  +    "banana-back",
+  +    "ubi-eng-team-banana",
+  +    "papaya-back",
+  +    "ubi-eng-team-papaya",
+  +    "moneris-back"
+     ],
+     "repos": [
+       "2cloud-services",
+  +10 -3
+
+scripts/sync-queue.sh
+  @@ -1,510 +1,13 @@
+  +# ==============================================================================
+  +# sync-queue.sh
+  +# Cross-platform CLI entry point for PR Review Hub queue synchronization.
+  +# Delegates to the zero-dependency Node.js engine (`ui/lib/sync.mjs`) so no `jq`
+  +# or BSD-specific `date` flags are required on macOS or Linux.
+  +# ==============================================================================
+   set -euo pipefail
+   
+   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+   SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  -CONFIG_FILE="${REVIEW_HUB_CONFIG:-${SKILL_ROOT}/config.json}"
+   
+  -DEFAULT_PROJECTS_DIR="${HOME}/Ubitransport/projects"
+  -if [[ ! -d "${DEFAULT_PROJECTS_DIR}" ]]; then
+  -  DEFAULT_PROJECTS_DIR="${HOME}/projects"
+  -fi
+  -DEFAULT_REVIEWS_DIR="${DEFAULT_PROJECTS_DIR}/artifacts/reviews"
+  -
+  -CFG_PROJECTS_DIR=""
+  -CFG_REVIEWS_DIR=""
+  -CFG_ORG=""
+  -CFG_USER=""
+  -CFG_JIRA=""
+  -CFG_JIRA_REGEX=""
+  -CFG_TEAMS_LABEL=""
+  -
+  -if [[ -f "${CONFIG_FILE}" ]]; then
+  -  CFG_PROJECTS_DIR=$(jq -r '.projectsDir // empty' "${CONFIG_FILE}" 2>/dev/null || true)
+  -  CFG_REVIEWS_DIR=$(jq -r '.reviewsDir // empty' "${CONFIG_FILE}" 2>/dev/null || true)
+  -  CFG_ORG=$(jq -r '.githubOrg // empty' "${CONFIG_FILE}" 2>/dev/null || true)
+  -  CFG_USER=$(jq -r '.githubUser // empty' "${CONFIG_FILE}" 2>/dev/null || true)
+  -  CFG_JIRA=$(jq -r '.jiraBaseUrl // empty' "${CONFIG_FILE}" 2>/dev/null || true)
+  -  CFG_JIRA_REGEX=$(jq -r 'if (.jiraPrefixes | type == "array" and length > 0) then "(?:" + (.jiraPrefixes | join("|")) + ")-[0-9]+" else empty end' "${CONFIG_FILE}" 2>/dev/null || true)
+  -  CFG_TEAMS_LABEL=$(jq -r 'if (.githubTeams | type == "array" and length > 0) then (.githubTeams | join(", ")) else empty end' "${CONFIG_FILE}" 2>/dev/null || true)
+  -fi
+  -
+  -PROJECTS_DIR="${PROJECTS_DIR:-${CFG_PROJECTS_DIR:-${DEFAULT_PROJECTS_DIR}}}"
+  -REVIEWS_DIR="${REVIEWS_DIR:-${CFG_REVIEWS_DIR:-${DEFAULT_REVIEWS_DIR}}}"
+  -ARCHIVE_DIR="${REVIEWS_DIR}/archive"
+  -STATE_FILE="${REVIEWS_DIR}/.state.json"
+  -INDEX_FILE="${REVIEWS_DIR}/INDEX.md"
+  -ORG="${REVIEW_HUB_ORG:-${CFG_ORG:-ubitransports}}"
+  -USER_LOGIN="${REVIEW_HUB_USER:-${CFG_USER:-$(gh api user --jq .login 2>/dev/null || echo "")}}"
+  -JIRA_BASE_URL="${CFG_JIRA:-https://ubitransport.atlassian.net/browse}"
+  -JIRA_SCAN_REGEX="${CFG_JIRA_REGEX:-(?:PRD|HYB|WAN|POP|OPS|SEC)-[0-9]+}"
+  -DASHBOARD_SCOPE="\`${USER_LOGIN:-reviewer}\`"
+  -if [[ -n "${CFG_TEAMS_LABEL}" ]]; then
+  -  DASHBOARD_SCOPE="\`${USER_LOGIN:-reviewer}\` & \`${CFG_TEAMS_LABEL}\`"
+  -fi
+  -
+  -mkdir -p "${REVIEWS_DIR}" "${ARCHIVE_DIR}"
+  -
+  -if [[ ! -f "${STATE_FILE}" ]]; then
+  -  echo '{"prs":{}}' > "${STATE_FILE}"
+  -fi
+  -
+  -# Helper: Regenerate INDEX.md from .state.json
+  -generate_index() {
+  -  local now
+  -  now=$(date "+%Y-%m-%d %H:%M")
+  -
+  -  cat <<EOF > "${INDEX_FILE}"
+  -# PR Review Queue — Dashboard (${DASHBOARD_SCOPE})
+  -
+  -*Last synced: \`${now}\`*
+  -
+  -## 🟢 Active Open PRs
+  -
+  -| PR | Author | Jira | Status | Head SHA | Findings | Review File | Updated At |
+  -| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+  -EOF
+  -
+  -  jq -r --arg jiraBase "${JIRA_BASE_URL}" '
+  -    .prs | to_entries
+  -    | map(select(.value.state == "OPEN"))
+  -    | sort_by(.value.updatedAt) | reverse
+  -    | if length == 0 then
+  -        "| *No active PRs* | — | — | — | — | — | — | — |"
+  -      else
+  -        .[] | .value |
+  -        "| [\(.repo) #\(.number)](\(.url)) — \(.title | gsub("\\|"; "/")) | `\(.author)` | " +
+  -        (if (.jiraKey // "") != "" and (.jiraKey // "—") != "—" then "[\(.jiraKey)](\($jiraBase)/\(.jiraKey))" else "—" end) +
+  -        " | \(.reviewStatus // "PENDING") | `\((.lastReviewedSha // .headRefOid // "—")[0:7])` | \(.findingsSummary // "—") | " +
+  -        (if (.lastReviewedSha // null) != null and (.reviewFile // "") != "" then "[\(.reviewFile)](./\(.reviewFile))" else "—" end) +
+  -        " | `\((.lastReviewedAt // .updatedAt // "—")[0:16] | gsub("T"; " "))` |"
+  -      end
+  -  ' "${STATE_FILE}" >> "${INDEX_FILE}"
+  -
+  -  cat <<EOF >> "${INDEX_FILE}"
+  -
+  ----
+  -
+  -## 📦 Archived Reviews (Merged / Closed)
+  -
+  -| PR | Author | Jira | Final State | Last SHA | Findings | Archived File |
+  -| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+  -EOF
+  -
+  -  jq -r --arg jiraBase "${JIRA_BASE_URL}" '
+  -    .prs | to_entries
+  ... (416 lines truncated)
+  +7 -503
+
+ui/app.js
+  @@ -595,6 +595,12 @@ async function loadState(preserveSelection = true) {
+  +  if (state.config && state.config.onboardingCompleted === false && !state._welcomeWizardShown) {
+  +    state._welcomeWizardShown = true;
+  +    openFirstRunWelcomeModal();
+  +    return;
+  +  }
+  +
+     if (data.neverSynced && state.prs.length === 0 && !state._autoSyncedFirstRun) {
+       state._autoSyncedFirstRun = true;
+       runQueueSync();
+  @@ -5628,6 +5634,7 @@ async function openSettingsModal() {
+  +          onboardingCompleted: true,
+           }),
+         });
+         const data = await res.json();
+  @@ -5648,6 +5655,276 @@ async function openSettingsModal() {
+  +async function openDoctorModal() {
+  +  const modal = document.getElementById('githubModal');
+  +  const titleEl = document.getElementById('modalTitle');
+  +  const bodyEl = document.getElementById('modalBody');
+  +  const confirmBtn = document.getElementById('confirmModalBtn');
+  +  if (!modal || !titleEl || !bodyEl || !confirmBtn) return;
+  +
+  +  titleEl.textContent = 'Environment Doctor & Setup Check';
+  +  confirmBtn.textContent = 'Open Settings';
+  +
+  +  const renderDoctorContent = async () => {
+  +    bodyEl.innerHTML = `<div class="meta-text" style="padding:12px 0;">Running environment and AI CLI diagnostics…</div>`;
+  +    try {
+  +      const res = await fetch('/api/doctor');
+  +      if (!res.ok) throw new Error('Doctor check failed');
+  +      const report = await res.json();
+  +      const checks = report.checks || [];
+  +      const allGood = Boolean(report.ok);
+  +
+  +      bodyEl.innerHTML = `
+  +        <div style="display:flex;flex-direction:column;gap:12px;">
+  +          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;background:var(--bg-elevated);border:1px solid var(--border-color);">
+  +            <div>
+  +              <div style="font-weight:600;font-size:0.9rem;">
+  +                ${allGood ? '🟢 All core checks passed — Ready to review PRs!' : '🟠 Action needed on one or more prerequisites'}
+  +              </div>
+  +              <div class="meta-text" style="font-size:0.76rem;margin-top:2px;">
+  +                Platform: ${escapeHtml(report.platform || '')} · Version: v${escapeHtml(report.version || state.appVersion || '1.2.0')}
+  +              </div>
+  +            </div>
+  +            <button type="button" id="doctorModalRecheckBtn" class="btn btn-secondary btn-xs">Re-check</button>
+  +          </div>
+  +          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+  +            ${checks
+  +              .map(
+  +                (chk, idx) => `
+  +                <div style="background:var(--bg-elevated);padding:9px 11px;border-radius:6px;border:1px solid var(--border-color);display:flex;flex-direction:column;gap:4px;">
+  +                  <div style="display:flex;align-items:center;gap:6px;font-weight:600;font-size:0.82rem;">
+  +                    <span>${chk.ok ? (chk.optional ? '🔵' : '🟢') : '🔴'}</span>
+  +                    <span>${escapeHtml(chk.label)}</span>
+  +                  </div>
+  +                  <div class="meta-text" style="font-size:0.74rem;word-break:break-word;">${escapeHtml(chk.detail || '')}</div>
+  +                  ${
+  +                    !chk.ok && chk.fixHint
+  +                      ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:4px;padding:4px 6px;background:var(--bg-surface);border-radius:4px;border:1px solid var(--border-subtle);">
+  +                          <code style="font-size:0.71rem;color:var(--accent-warning,#f59e0b);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(chk.fixHint)}</code>
+  +                          <button type="button" class="btn btn-ghost btn-xs doctor-copy-fix-btn" data-fix-cmd="${escapeHtml(chk.fixHint)}" data-idx="${idx}">Copy</button>
+  +                        </div>`
+  +                      : ''
+  +                  }
+  +                </div>
+  +              `
+  +              )
+  +              .join('')}
+  +          </div>
+  +        </div>
+  +      `;
+  +
+  +      bodyEl.querySelector('#doctorModalRecheckBtn')?.addEventListener('click', renderDoctorContent);
+  +      bodyEl.querySelectorAll('.doctor-copy-fix-btn').forEach((btn) => {
+  +        btn.addEventListener('click', async () => {
+  +          const cmd = btn.getAttribute('data-fix-cmd') || '';
+  +          if (!cmd) return;
+  +          await navigator.clipboard.writeText(cmd);
+  +          showToast(`Copied command: ${cmd}`);
+  +        });
+  +      });
+  +    } catch (err) {
+  +      bodyEl.innerHTML = `<div class="meta-text">Could not run diagnostics: ${escapeHtml(err.message)}</div>`;
+  +    }
+  +  };
+  +
+  +  confirmBtn.onclick = () => {
+  +    openSettingsModal();
+  +  };
+  +
+  +  modal.classList.remove('hidden');
+  +  await renderDoctorContent();
+  +}
+  +
+  +document.getElementById('doctorBtn')?.addEventListener('click', openDoctorModal);
+  +
+  +async function openFirstRunWelcomeModal() {
+  +  const cfg = state.config || {};
+  +  if (!state.teamProfiles || state.teamProfiles.length === 0) {
+  +    await loadRules();
+  +  }
+  +  const profiles = state.teamProfiles || [];
+  +  const activeProfileId = cfg.teamProfile || state.activeTeamProfile?.id || 'popcorn-back';
+  +  const activeAgentCli = cfg.agentCli || 'agy';
+  +
+  +  const modal = document.getElementById('githubModal');
+  +  const titleEl = document.getElementById('modalTitle');
+  +  const bodyEl = document.getElementById('modalBody');
+  +  const confirmBtn = document.getElementById('confirmModalBtn');
+  +  if (!modal || !titleEl || !bodyEl || !confirmBtn) return;
+  +
+  +  titleEl.textContent = 'Welcome to PR Review Hub — 1-Click Team Setup';
+  +  confirmBtn.textContent = 'Save & Sync My Pull Requests';
+  +
+  ... (170 lines truncated)
+  +277 -0
+
+ui/index.html
+  @@ -31,6 +31,7 @@
+  +              <button id="doctorBtn" class="btn btn-ghost btn-xs" title="Environment &amp; AI CLI Health Check (Doctor)">Doctor</button>
+                 <button id="settingsBtn" class="btn btn-ghost btn-xs" title="GitHub, Jira and local paths configuration">Settings</button>
+                 <button id="themeToggleBtn" class="btn btn-ghost btn-xs" title="Switch theme (Dark / Purple / Light)">Theme</button>
+                 <button id="reviewAllPendingBtn" class="btn btn-secondary btn-xs" title="Run AI review on all pending PRs">
+  +1 -0
+
+ui/lib/agent.mjs
+  @@ -8,6 +8,7 @@ import { parseFindingsFromMarkdown } from './parser.mjs';
+  +import { recordPrReview } from './sync.mjs';
+   
+   const execFileAsync = promisify(execFile);
+   
+  @@ -639,7 +640,12 @@ export function triggerPrReview({ cfg, pr }) {
+  -      if (cfg.syncScript && fs.existsSync(cfg.syncScript)) {
+  +      const defaultSyncScript = path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh');
+  +      if (
+  +        cfg.syncScript &&
+  +        path.resolve(cfg.syncScript) !== path.resolve(defaultSyncScript) &&
+  +        fs.existsSync(cfg.syncScript)
+  +      ) {
+           await execFileAsync(cfg.syncScript, [
+             'record',
+             pr.repo,
+  @@ -650,6 +656,21 @@ export function triggerPrReview({ cfg, pr }) {
+  +      } else {
+  +        try {
+  +          recordPrReview({
+  +            cfg,
+  +            repo: pr.repo,
+  +            number: Number(pr.number),
+  +            headSha,
+  +            reviewStatus: verdict,
+  +            findingsSummary: summary,
+  +            jiraKey,
+  +            reviewFile: reviewFileName,
+  +          });
+  +        } catch {
+  +          // ignore state update error
+  +        }
+         }
+   
+         job.phase = 'Completed';
+  +22 -1
+
+ui/lib/config.mjs
+  @@ -197,6 +197,112 @@ export async function discoverGithubIdentityAndTeams(orgFilter = '') {
+  +export function inferTeamProfileFromGithubTeams(githubTeams = []) {
+  +  if (process.env.REVIEW_HUB_TEAM_PROFILE) {
+  +    return process.env.REVIEW_HUB_TEAM_PROFILE;
+  +  }
+  +  const cleanSlugs = (Array.isArray(githubTeams) ? githubTeams : [])
+  +    .map((s) =>
+  +      String(s || '')
+  +        .trim()
+  +        .toLowerCase()
+  +        .replace(/^[^/]+\//, '')
+  +    )
+  +    .filter(Boolean);
+  +
+  +  if (cleanSlugs.length === 0) return 'popcorn-back';
+  +
+  +  // 1. Exact match against references/teams/*/profile.json githubTeams list
+  +  const teamsDir =
+  +    process.env.REVIEW_HUB_TEAMS_DIR || path.join(SKILL_ROOT, 'references', 'teams');
+  +  if (fs.existsSync(teamsDir)) {
+  +    try {
+  +      const entries = fs.readdirSync(teamsDir, { withFileTypes: true });
+  +      // Prefer non-default profiles first if user belongs to both a general org team and a specific front/mobile/qa team
+  +      const orderedDirs = entries
+  +        .filter((e) => e.isDirectory())
+  +        .map((e) => e.name)
+  +        .sort((a, b) => (a === 'popcorn-back' ? 1 : b === 'popcorn-back' ? -1 : a.localeCompare(b)));
+  +
+  +      for (const id of orderedDirs) {
+  +        const profilePath = path.join(teamsDir, id, 'profile.json');
+  +        if (!fs.existsSync(profilePath)) continue;
+  +        try {
+  +          const parsed = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+  +          const profileTeams = (Array.isArray(parsed.githubTeams) ? parsed.githubTeams : []).map(
+  +            (t) =>
+  +              String(t || '')
+  +                .trim()
+  +                .toLowerCase()
+  +                .replace(/^[^/]+\//, '')
+  +          );
+  +          if (cleanSlugs.some((slug) => profileTeams.includes(slug))) {
+  +            return id;
+  +          }
+  +        } catch {
+  +          // ignore malformed profile.json
+  +        }
+  +      }
+  +    } catch {
+  +      // ignore read errors
+  +    }
+  +  }
+  +
+
+... (more changes truncated)
+  +51 -0
+[full diff: rtk git diff --no-compact]

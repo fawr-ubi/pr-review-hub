@@ -1,8 +1,8 @@
-import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { loadCandidateRules, saveCandidateRules } from './rules.mjs';
+import { resolveAgentBinary } from './agent.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -10,12 +10,6 @@ let customOnboardingAnalyzer = null;
 
 export function setCustomOnboardingAnalyzerForTests(fn) {
   customOnboardingAnalyzer = fn;
-}
-
-function resolveGeminiBinary() {
-  if (fs.existsSync('/opt/homebrew/bin/gemini')) return '/opt/homebrew/bin/gemini';
-  if (fs.existsSync('/usr/local/bin/gemini')) return '/usr/local/bin/gemini';
-  return 'gemini';
 }
 
 function makeCandidateId(title, section) {
@@ -270,8 +264,12 @@ export async function bootstrapTeamCandidateRules({ cfg, days = 365 } = {}) {
         `Comments sample:\n${sampleComments}`,
       ].join('\n\n');
 
-      const bin = resolveGeminiBinary();
-      const { stdout } = await execFileAsync(bin, ['-p', prompt], {
+      const { cli, bin } = resolveAgentBinary(cfg?.agentCli || 'agy');
+      const cliArgs =
+        cli === 'agy'
+          ? ['--dangerously-skip-permissions', '--disable-slash-commands', '-p', prompt]
+          : ['-p', prompt];
+      const { stdout } = await execFileAsync(bin, cliArgs, {
         timeout: 90000,
         maxBuffer: 10 * 1024 * 1024,
       });

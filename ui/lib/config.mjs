@@ -197,6 +197,112 @@ export async function discoverGithubIdentityAndTeams(orgFilter = '') {
   }
 }
 
+export function inferTeamProfileFromGithubTeams(githubTeams = []) {
+  if (process.env.REVIEW_HUB_TEAM_PROFILE) {
+    return process.env.REVIEW_HUB_TEAM_PROFILE;
+  }
+  const cleanSlugs = (Array.isArray(githubTeams) ? githubTeams : [])
+    .map((s) =>
+      String(s || '')
+        .trim()
+        .toLowerCase()
+        .replace(/^[^/]+\//, '')
+    )
+    .filter(Boolean);
+
+  if (cleanSlugs.length === 0) return 'popcorn-back';
+
+  // 1. Exact match against references/teams/*/profile.json githubTeams list
+  const teamsDir =
+    process.env.REVIEW_HUB_TEAMS_DIR || path.join(SKILL_ROOT, 'references', 'teams');
+  if (fs.existsSync(teamsDir)) {
+    try {
+      const entries = fs.readdirSync(teamsDir, { withFileTypes: true });
+      // Prefer non-default profiles first if user belongs to both a general org team and a specific front/mobile/qa team
+      const orderedDirs = entries
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name)
+        .sort((a, b) => (a === 'popcorn-back' ? 1 : b === 'popcorn-back' ? -1 : a.localeCompare(b)));
+
+      for (const id of orderedDirs) {
+        const profilePath = path.join(teamsDir, id, 'profile.json');
+        if (!fs.existsSync(profilePath)) continue;
+        try {
+          const parsed = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+          const profileTeams = (Array.isArray(parsed.githubTeams) ? parsed.githubTeams : []).map(
+            (t) =>
+              String(t || '')
+                .trim()
+                .toLowerCase()
+                .replace(/^[^/]+\//, '')
+          );
+          if (cleanSlugs.some((slug) => profileTeams.includes(slug))) {
+            return id;
+          }
+        } catch {
+          // ignore malformed profile.json
+        }
+      }
+    } catch {
+      // ignore read errors
+    }
+  }
+
+  // 2. Keyword heuristic fallback
+  const joined = cleanSlugs.join(' ');
+  if (/\b(front|frontend|web|vue|angular)\b/.test(joined)) return 'frontend-web';
+  if (/\b(mobile|android|kotlin|ios|wanfare|wanpay)\b/.test(joined)) return 'mobile-kotlin';
+  if (/\b(qa|cypress|test|e2e|automation)\b/.test(joined)) return 'qa-automation';
+  return 'popcorn-back';
+}
+
+export function ensureSkillSymlinks() {
+  if (process.env.NODE_ENV === 'test' || process.env.REVIEW_HUB_CONFIG) {
+    return { geminiLinked: false, claudeLinked: false };
+  }
+  const home = os.homedir();
+  const results = { geminiLinked: false, claudeLinked: false };
+
+  // 1. Antigravity / Gemini CLI skill path: ~/.gemini/config/skills/my-review
+  try {
+    const geminiSkillsDir = path.join(home, '.gemini', 'config', 'skills');
+    const geminiTarget = path.join(geminiSkillsDir, 'my-review');
+    if (path.resolve(SKILL_ROOT) === path.resolve(geminiTarget)) {
+      results.geminiLinked = true;
+    } else if (!fs.existsSync(geminiTarget)) {
+      fs.mkdirSync(geminiSkillsDir, { recursive: true });
+      fs.symlinkSync(SKILL_ROOT, geminiTarget, 'dir');
+      results.geminiLinked = true;
+    } else {
+      results.geminiLinked = true;
+    }
+  } catch {
+    // ignore symlink permission errors
+  }
+
+  // 2. Claude Code skill path: ~/.claude/skills/my-review
+  try {
+    const claudeDir = path.join(home, '.claude');
+    if (fs.existsSync(claudeDir) || findCliBinaryPath('claude')) {
+      const claudeSkillsDir = path.join(claudeDir, 'skills');
+      const claudeTarget = path.join(claudeSkillsDir, 'my-review');
+      if (path.resolve(SKILL_ROOT) === path.resolve(claudeTarget)) {
+        results.claudeLinked = true;
+      } else if (!fs.existsSync(claudeTarget)) {
+        fs.mkdirSync(claudeSkillsDir, { recursive: true });
+        fs.symlinkSync(SKILL_ROOT, claudeTarget, 'dir');
+        results.claudeLinked = true;
+      } else {
+        results.claudeLinked = true;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return results;
+}
+
 export function getDefaultConfig() {
   const defaultProjectsDir = detectLocalProjectsDir();
   const defaultReviewsDir =
@@ -213,15 +319,22 @@ export function getDefaultConfig() {
     jiraBaseUrl: 'https://ubitransport.atlassian.net/browse',
     jiraPrefixes: ['PRD', 'HYB', 'WAN', 'POP', 'OPS', 'SEC', 'SUP', 'DEV'],
     syncScript: path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh'),
+    port: 4242,
+    onboardingCompleted: false,
   };
 }
 
-export function loadConfig() {
+export function loadConfig(customConfigFile = '') {
   const defaults = getDefaultConfig();
-  const configFile = getConfigFile();
+  const configFile = customConfigFile || getConfigFile();
   try {
     if (fs.existsSync(configFile)) {
       const saved = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+      const hasValidSavedUser = Boolean(
+        saved.githubUser &&
+          saved.githubUser !== 'your-github-login' &&
+          saved.githubUser !== 'github-user'
+      );
       const merged = {
         ...defaults,
         ...saved,
@@ -234,6 +347,10 @@ export function loadConfig() {
               .map((s) => s.trim().toUpperCase())
               .filter(Boolean)
           : defaults.jiraPrefixes,
+        onboardingCompleted:
+          typeof saved.onboardingCompleted === 'boolean'
+            ? saved.onboardingCompleted
+            : hasValidSavedUser,
       };
       merged.projectsDir = expandHome(merged.projectsDir || defaults.projectsDir);
       merged.reviewsDir = expandHome(merged.reviewsDir || defaults.reviewsDir);
@@ -245,9 +362,9 @@ export function loadConfig() {
   return defaults;
 }
 
-export function saveConfig(partialConfig) {
-  const current = loadConfig();
-  const configFile = getConfigFile();
+export function saveConfig(partialConfig, customConfigFile = '') {
+  const current = loadConfig(customConfigFile);
+  const configFile = customConfigFile || getConfigFile();
   const updated = {
     ...current,
     ...partialConfig,
@@ -268,15 +385,17 @@ export function saveConfig(partialConfig) {
   if (updated.reviewsDir) updated.reviewsDir = expandHome(updated.reviewsDir);
 
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
-  fs.writeFileSync(configFile, JSON.stringify(updated, null, 2), 'utf8');
+  fs.writeFileSync(configFile, JSON.stringify(updated, null, 2) + '\n', 'utf8');
   return updated;
 }
 
 /**
- * Automatically bootstraps config.json and local reference files on first server start
+ * Automatically bootstraps config.json, skill symlinks, and local reference files on first server start
  * even if the user ran `npm start` directly without running `./install.sh`.
  */
 export function ensureConfigBootstrapped() {
+  ensureSkillSymlinks();
+
   const refDir = path.join(SKILL_ROOT, 'references');
   const dnaLocal = path.join(refDir, 'reviewer-dna.local.md');
   const dnaExample = path.join(refDir, 'reviewer-dna.example.md');
@@ -309,9 +428,12 @@ export function ensureConfigBootstrapped() {
   if (!fs.existsSync(configFile)) {
     const defaults = getDefaultConfig();
     const detectedTeams = detectGithubTeamsSync(defaults.githubOrg);
+    const inferredProfile = inferTeamProfileFromGithubTeams(detectedTeams);
     const bootstrapped = saveConfig({
       ...defaults,
       githubTeams: detectedTeams,
+      teamProfile: inferredProfile,
+      onboardingCompleted: false,
     });
     try {
       fs.mkdirSync(path.join(bootstrapped.reviewsDir, 'archive'), { recursive: true });

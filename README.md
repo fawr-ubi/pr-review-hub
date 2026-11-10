@@ -8,19 +8,19 @@ Zero-dependency local web cockpit (`http://localhost:4242`) and continuously lea
 
 ## ⚡ 1-Command Zero-Config Quick Start (< 30 Seconds)
 
-You don't need `npm install` (zero external dependencies) or manual configuration files. Just make sure `node`, `gh`, `jq`, and an AI CLI (`gemini` or `claude`) are installed:
+You don't need `npm install` (zero external dependencies) or manual configuration files. Just make sure `node` (>= 18), `gh` (authenticated), and an AI CLI (`agy`, `gemini`, or `claude`) are installed:
 
 ### 1. Prerequisites (macOS / Linux)
 
 ```bash
-# 1. Core CLI tools (Node.js >= 18, GitHub CLI, jq)
-brew install node gh jq
+# 1. Core CLI tools (Node.js >= 18 & GitHub CLI)
+brew install node gh
 
 # 2. Authenticate GitHub CLI (if not already logged in)
 gh auth status || gh auth login
 
 # 3. AI Agent CLI: Antigravity CLI (`agy`), Gemini CLI (`gemini`), or Claude Code CLI (`claude`)
-# PR Review Hub auto-detects whichever one is installed on your Mac (prioritizing `agy` -> `gemini` -> `claude`):
+# PR Review Hub auto-detects whichever one is installed (prioritizing `agy` -> `gemini` -> `claude`):
 which agy || which gemini || which claude
 ```
 
@@ -28,7 +28,7 @@ which agy || which gemini || which claude
 
 ### 2. Clone & Start Immediately (Zero-Config Auto-Setup)
 
-Copy-paste this single block in your terminal:
+Clone the repository anywhere (either directly into `~/.gemini/config/skills/my-review` or in your usual projects folder — skill symlinks for Antigravity/Gemini and Claude Code are created automatically on startup):
 
 ```bash
 gh repo clone fawr-ubi/pr-review-hub ~/.gemini/config/skills/my-review && \
@@ -36,21 +36,21 @@ cd ~/.gemini/config/skills/my-review && \
 npm start
 ```
 
-*(Alternative if you prefer `git clone`: `git clone https://github.com/fawr-ubi/pr-review-hub.git ~/.gemini/config/skills/my-review`)*
+*(Alternative if you prefer `git clone`: `git clone https://github.com/fawr-ubi/pr-review-hub.git ~/.gemini/config/skills/my-review && cd ~/.gemini/config/skills/my-review && npm start`)*
 
-Then open **[http://localhost:4242](http://localhost:4242)** in your browser!
+**[http://localhost:4242](http://localhost:4242)** opens automatically in your browser!
 
 #### What happens automatically on your very first `npm start`?
-- **Auto-bootstraps `config.json`** by querying your GitHub login (`gh api user`) and your GitHub teams (`gh api user/teams`).
-- **Auto-detects your local workspace** (`~/Ubitransport/projects`, `~/projects`, etc.) and your installed AI CLI (**`agy`** Antigravity CLI, **`gemini`** Gemini CLI, or **`claude`** Claude Code CLI, including `~/.local/bin`, Homebrew, and NVM paths).
-- **Initializes your 4-layer engineering rules** (`Common DNA` + `Team DNA` + local personal rules) and **auto-syncs your open Pull Requests** on first browser load.
+- **Auto-bootstraps `config.json` & Skill Symlinks**: Queries your GitHub login (`gh api user`), discovers your GitHub teams (`gh api user/teams`), and **auto-matches your Team Agent Profile** (`popcorn-back`, `frontend-web`, `mobile-kotlin`, `qa-automation`, etc.).
+- **1-Click Welcome Setup Wizard in the UI**: On first browser load, a pre-filled Welcome modal lets you confirm your **Team Agent Profile**, watched **GitHub Teams**, and **AI CLI runner** (`agy` / `gemini` / `claude`), then syncs your open Pull Requests in 1 click.
+- **Zero-`jq` Native Node.js Sync Engine**: Fetches your open Pull Requests, review statuses, CI states, and CODEOWNERS readiness on both macOS and Linux without requiring `jq`.
 - **Works even without local repo clones**: When you click **`Run Review`** or **`Review All`**, the server fetches the PR diff and metadata directly from GitHub (`gh pr diff`) and streams it to the AI agent (`agy`, `gemini`, or `claude`) with your team's rules and review checklist embedded.
 
 ---
 
-### 3. Optional: Interactive Setup & macOS Finder Launcher (`./install.sh`)
+### 3. Optional: Interactive CLI Setup & macOS Finder Launcher (`./install.sh`)
 
-If you want to customize your **Team Agent Profile** interactively (`popcorn-back`, `frontend-web`, `mobile-kotlin`, `qa-automation`), mine 1 year of your team's GitHub PR review comments, and create a double-clickable **`Open Review Hub.command`** launcher on your Mac:
+If you prefer an interactive terminal wizard that also mines 1 year of your team's GitHub PR review comments and creates a double-clickable **`Open Review Hub.command`** launcher on your Mac:
 
 ```bash
 cd ~/.gemini/config/skills/my-review
@@ -68,15 +68,15 @@ cd ~/.gemini/config/skills/my-review
 npm run doctor
 ```
 
-It verifies all 6 required components in 2 seconds:
-1. **`node` (>= 18)**
+It verifies your environment in 2 seconds and provides 1-click copyable fix commands:
+1. **`node` (>= 18)** & **`git`**
 2. **`gh` CLI & Auth** (`gh auth status`)
-3. **`jq` binary** (used by `scripts/sync-queue.sh`)
-4. **AI Agent CLI (`agy`, `gemini`, or `claude`)**:
-   - Auto-detects **`agy`** (Antigravity CLI), **`gemini`** (Gemini CLI), or **`claude`** (Claude Code CLI) with automatic fallback if one is missing.
-   - You can also switch your preferred runner anytime in **`Settings (⚙)`**.
-5. **Local Projects Workspace (`projectsDir`)**
-6. **Reviews Storage Directory (`reviewsDir`)**
+3. **AI Agent CLI (`agy`, `gemini`, or `claude`)**:
+   - Auto-detects **`agy`** (Antigravity CLI), **`gemini`** (Gemini CLI), or **`claude`** (Claude Code CLI) across standard, Homebrew, `~/.local/bin`, and NVM paths, with automatic fallback if one is missing.
+   - You can switch your preferred runner anytime in **`Settings`**.
+4. **Local Projects Workspace (`projectsDir`)** *(Optional — only needed for local Git Worktrees & IDE jump; AI reviews and diffs work 100% remotely via GitHub)*
+5. **Reviews Storage Directory (`reviewsDir`)** & **Team Agent Profile**
+6. **IDE / CLI Skill Registration (`~/.gemini/config/skills/my-review`)**
 
 ---
 

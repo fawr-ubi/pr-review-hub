@@ -8,6 +8,7 @@ import { parseFindingsFromMarkdown } from './parser.mjs';
 import { extractJiraKey } from './metadata.mjs';
 import { getLocalRepoPath, getProjectsDir } from './worktree.mjs';
 import { getReferencePaths, syncCombinedReferenceFiles } from './rules.mjs';
+import { recordPrReview } from './sync.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -639,7 +640,12 @@ export function triggerPrReview({ cfg, pr }) {
       const summary = summarizeFindings(findings);
       const verdict = inferVerdictFromFindings(findings, md);
 
-      if (cfg.syncScript && fs.existsSync(cfg.syncScript)) {
+      const defaultSyncScript = path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh');
+      if (
+        cfg.syncScript &&
+        path.resolve(cfg.syncScript) !== path.resolve(defaultSyncScript) &&
+        fs.existsSync(cfg.syncScript)
+      ) {
         await execFileAsync(cfg.syncScript, [
           'record',
           pr.repo,
@@ -650,6 +656,21 @@ export function triggerPrReview({ cfg, pr }) {
           jiraKey,
           reviewFileName,
         ]).catch(() => {});
+      } else {
+        try {
+          recordPrReview({
+            cfg,
+            repo: pr.repo,
+            number: Number(pr.number),
+            headSha,
+            reviewStatus: verdict,
+            findingsSummary: summary,
+            jiraKey,
+            reviewFile: reviewFileName,
+          });
+        } catch {
+          // ignore state update error
+        }
       }
 
       job.phase = 'Completed';

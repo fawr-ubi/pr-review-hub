@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { findCliBinaryPath } from './config.mjs';
+import { SKILL_ROOT, findCliBinaryPath, ensureSkillSymlinks } from './config.mjs';
 import { listAllRules } from './rules.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -36,19 +36,10 @@ export async function runDoctor(cfg = {}) {
     label: 'Git CLI',
     ok: gitCheck.ok,
     detail: gitCheck.detail,
+    fixHint: 'xcode-select --install',
   });
 
-  // 3. jq CLI
-  const jqCheck = await checkBinary('jq', ['--version']);
-  checks.push({
-    id: 'jq',
-    label: 'jq JSON Processor',
-    ok: jqCheck.ok,
-    detail: jqCheck.detail,
-    fixHint: 'brew install jq',
-  });
-
-  // 4. GitHub CLI (gh) + Auth
+  // 3. GitHub CLI (gh) + Auth
   const ghCheck = await checkBinary('gh', ['--version']);
   let ghAuthOk = false;
   let ghAuthDetail = ghCheck.detail;
@@ -59,7 +50,7 @@ export async function runDoctor(cfg = {}) {
       const combined = `${stdout || ''}\n${stderr || ''}`;
       const match = combined.match(/Logged in to [^\s]+ account ([^\s(]+)/i);
       ghAuthDetail = match ? `Authenticated as ${match[1]}` : 'Authenticated with GitHub CLI';
-    } catch (err) {
+    } catch {
       ghAuthOk = false;
       ghAuthDetail = 'Not authenticated (run: gh auth login)';
     }
@@ -72,13 +63,14 @@ export async function runDoctor(cfg = {}) {
     fixHint: ghCheck.ok ? 'gh auth login' : 'brew install gh && gh auth login',
   });
 
-  // 5. AI Agent CLI (agy, gemini, or claude)
+  // 4. AI Agent CLI (agy, gemini, or claude)
   const preferredCli = ['agy', 'gemini', 'claude'].includes(cfg.agentCli) ? cfg.agentCli : 'agy';
   const allClis = ['agy', 'gemini', 'claude'];
   const fallbackClis = allClis.filter((c) => c !== preferredCli);
   const primaryBin = findCliBinaryPath(preferredCli) || preferredCli;
   const primaryCheck = await checkBinary(primaryBin, ['--version']);
   let agentOk = primaryCheck.ok;
+  let resolvedCli = preferredCli;
   let agentDetail = primaryCheck.ok
     ? `${preferredCli} (${primaryBin}): ${primaryCheck.detail}`
     : `${preferredCli} not found`;
@@ -89,6 +81,7 @@ export async function runDoctor(cfg = {}) {
         const altCheck = await checkBinary(altBin, ['--version']);
         if (altCheck.ok) {
           agentOk = true;
+          resolvedCli = alt;
           agentDetail = `${preferredCli} missing, auto-falling back to ${alt} (${altBin}: ${altCheck.detail})`;
           break;
         }
@@ -97,13 +90,13 @@ export async function runDoctor(cfg = {}) {
   }
   checks.push({
     id: 'agentCli',
-    label: `AI Agent CLI (${preferredCli})`,
+    label: `AI Agent CLI (${resolvedCli})`,
     ok: agentOk,
     detail: agentDetail,
-    fixHint: `Ensure 'agy', 'gemini', or 'claude' is installed and authenticated, or switch Agent CLI in Settings.`,
+    fixHint: 'npm install -g @google/gemini-cli && gemini',
   });
 
-  // 6. Local Projects Workspace & Git Repositories
+  // 5. Local Projects Workspace & Git Repositories (Optional — Remote GitHub mode always works)
   const projectsDir = cfg.projectsDir || '';
   let localRepos = [];
   const projectsDirExists = Boolean(projectsDir && fs.existsSync(projectsDir));
@@ -124,14 +117,15 @@ export async function runDoctor(cfg = {}) {
   checks.push({
     id: 'projectsDir',
     label: 'Local Projects Workspace',
-    ok: projectsDirExists && localRepos.length > 0,
-    detail: projectsDirExists
-      ? `${projectsDir} (${localRepos.length} git repo${localRepos.length === 1 ? '' : 's'}: ${localRepos.slice(0, 5).join(', ')}${localRepos.length > 5 ? '…' : ''})`
-      : `Directory not found: ${projectsDir}`,
-    fixHint: 'Configure your local workspace path in Settings (⚙).',
+    ok: true,
+    optional: !projectsDirExists || localRepos.length === 0,
+    detail:
+      projectsDirExists && localRepos.length > 0
+        ? `${projectsDir} (${localRepos.length} local git repo${localRepos.length === 1 ? '' : 's'}: ${localRepos.slice(0, 5).join(', ')}${localRepos.length > 5 ? '…' : ''})`
+        : `Remote GitHub mode active (clone repos into ${projectsDir || '~/projects'} only if you want local Worktrees / IDE jump)`,
   });
 
-  // 7. Reviews Directory & Queue State
+  // 6. Reviews Directory & Queue State
   const reviewsDir = cfg.reviewsDir || '';
   const statePath = path.join(reviewsDir, '.state.json');
   const hasState = Boolean(reviewsDir && fs.existsSync(statePath));
@@ -150,19 +144,19 @@ export async function runDoctor(cfg = {}) {
     ok: Boolean(reviewsDir && fs.existsSync(reviewsDir)),
     detail: hasState
       ? `${reviewsDir} (${trackedPrCount} PR${trackedPrCount === 1 ? '' : 's'} cached)`
-      : `${reviewsDir} (No sync run yet — click "Sync GitHub")`,
+      : `${reviewsDir} (Ready — click "Sync GitHub" to fetch open PRs)`,
   });
 
-  // 8. Active Team Profile & 4-Layer Rules
+  // 7. Active Team Profile & 4-Layer Rules
   let rulesSummary = { common: 0, team: 0, personal: 0, falsePositives: 0 };
   let activeTeamName = cfg.teamProfile || 'popcorn-back';
   try {
-    const bundle = listAllRules({ teamProfile: cfg.teamProfile });
-    activeTeamName = bundle.activeTeam?.name || activeTeamName;
+    const bundle = listAllRules(cfg.teamProfile || 'popcorn-back');
+    activeTeamName = bundle.activeTeamProfile?.name || activeTeamName;
     rulesSummary = {
       common: (bundle.commonRules || []).length,
       team: (bundle.teamRules || []).length,
-      personal: (bundle.personalRules || []).length,
+      personal: (bundle.dnaRules || []).length,
       falsePositives: (bundle.falsePositives || []).length,
     };
   } catch {
@@ -173,6 +167,23 @@ export async function runDoctor(cfg = {}) {
     label: `Team Agent Profile (${cfg.teamProfile || 'popcorn-back'})`,
     ok: rulesSummary.common + rulesSummary.team > 0,
     detail: `${activeTeamName} — ${rulesSummary.common} Common, ${rulesSummary.team} Team, ${rulesSummary.personal} Personal, ${rulesSummary.falsePositives} False-Positive rules`,
+  });
+
+  // 8. Agent Skill Registration (Symlink to ~/.gemini/config/skills/my-review & ~/.claude/skills/my-review)
+  try {
+    ensureSkillSymlinks();
+  } catch {
+    // ignore
+  }
+  const geminiSkillPath = path.join(os.homedir(), '.gemini', 'config', 'skills', 'my-review');
+  const skillLinked = fs.existsSync(geminiSkillPath) || fs.existsSync(path.join(SKILL_ROOT, 'SKILL.md'));
+  checks.push({
+    id: 'skillSymlink',
+    label: 'IDE / CLI Skill Registration (my-review)',
+    ok: skillLinked,
+    detail: fs.existsSync(geminiSkillPath)
+      ? `Linked at ${geminiSkillPath}`
+      : `Loaded from ${SKILL_ROOT}`,
   });
 
   const allOk = checks.every((c) => c.ok);

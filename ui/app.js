@@ -595,6 +595,12 @@ async function loadState(preserveSelection = true) {
   renderPrList();
   scheduleJobPollingIfNeeded();
 
+  if (state.config && state.config.onboardingCompleted === false && !state._welcomeWizardShown) {
+    state._welcomeWizardShown = true;
+    openFirstRunWelcomeModal();
+    return;
+  }
+
   if (data.neverSynced && state.prs.length === 0 && !state._autoSyncedFirstRun) {
     state._autoSyncedFirstRun = true;
     runQueueSync();
@@ -5628,6 +5634,7 @@ async function openSettingsModal() {
           reviewsDir,
           jiraBaseUrl,
           jiraPrefixes,
+          onboardingCompleted: true,
         }),
       });
       const data = await res.json();
@@ -5647,6 +5654,276 @@ async function openSettingsModal() {
 }
 
 document.getElementById('settingsBtn')?.addEventListener('click', openSettingsModal);
+
+async function openDoctorModal() {
+  const modal = document.getElementById('githubModal');
+  const titleEl = document.getElementById('modalTitle');
+  const bodyEl = document.getElementById('modalBody');
+  const confirmBtn = document.getElementById('confirmModalBtn');
+  if (!modal || !titleEl || !bodyEl || !confirmBtn) return;
+
+  titleEl.textContent = 'Environment Doctor & Setup Check';
+  confirmBtn.textContent = 'Open Settings';
+
+  const renderDoctorContent = async () => {
+    bodyEl.innerHTML = `<div class="meta-text" style="padding:12px 0;">Running environment and AI CLI diagnostics…</div>`;
+    try {
+      const res = await fetch('/api/doctor');
+      if (!res.ok) throw new Error('Doctor check failed');
+      const report = await res.json();
+      const checks = report.checks || [];
+      const allGood = Boolean(report.ok);
+
+      bodyEl.innerHTML = `
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;background:var(--bg-elevated);border:1px solid var(--border-color);">
+            <div>
+              <div style="font-weight:600;font-size:0.9rem;">
+                ${allGood ? '🟢 All core checks passed — Ready to review PRs!' : '🟠 Action needed on one or more prerequisites'}
+              </div>
+              <div class="meta-text" style="font-size:0.76rem;margin-top:2px;">
+                Platform: ${escapeHtml(report.platform || '')} · Version: v${escapeHtml(report.version || state.appVersion || '1.2.0')}
+              </div>
+            </div>
+            <button type="button" id="doctorModalRecheckBtn" class="btn btn-secondary btn-xs">Re-check</button>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            ${checks
+              .map(
+                (chk, idx) => `
+                <div style="background:var(--bg-elevated);padding:9px 11px;border-radius:6px;border:1px solid var(--border-color);display:flex;flex-direction:column;gap:4px;">
+                  <div style="display:flex;align-items:center;gap:6px;font-weight:600;font-size:0.82rem;">
+                    <span>${chk.ok ? (chk.optional ? '🔵' : '🟢') : '🔴'}</span>
+                    <span>${escapeHtml(chk.label)}</span>
+                  </div>
+                  <div class="meta-text" style="font-size:0.74rem;word-break:break-word;">${escapeHtml(chk.detail || '')}</div>
+                  ${
+                    !chk.ok && chk.fixHint
+                      ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:4px;padding:4px 6px;background:var(--bg-surface);border-radius:4px;border:1px solid var(--border-subtle);">
+                          <code style="font-size:0.71rem;color:var(--accent-warning,#f59e0b);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(chk.fixHint)}</code>
+                          <button type="button" class="btn btn-ghost btn-xs doctor-copy-fix-btn" data-fix-cmd="${escapeHtml(chk.fixHint)}" data-idx="${idx}">Copy</button>
+                        </div>`
+                      : ''
+                  }
+                </div>
+              `
+              )
+              .join('')}
+          </div>
+        </div>
+      `;
+
+      bodyEl.querySelector('#doctorModalRecheckBtn')?.addEventListener('click', renderDoctorContent);
+      bodyEl.querySelectorAll('.doctor-copy-fix-btn').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const cmd = btn.getAttribute('data-fix-cmd') || '';
+          if (!cmd) return;
+          await navigator.clipboard.writeText(cmd);
+          showToast(`Copied command: ${cmd}`);
+        });
+      });
+    } catch (err) {
+      bodyEl.innerHTML = `<div class="meta-text">Could not run diagnostics: ${escapeHtml(err.message)}</div>`;
+    }
+  };
+
+  confirmBtn.onclick = () => {
+    openSettingsModal();
+  };
+
+  modal.classList.remove('hidden');
+  await renderDoctorContent();
+}
+
+document.getElementById('doctorBtn')?.addEventListener('click', openDoctorModal);
+
+async function openFirstRunWelcomeModal() {
+  const cfg = state.config || {};
+  if (!state.teamProfiles || state.teamProfiles.length === 0) {
+    await loadRules();
+  }
+  const profiles = state.teamProfiles || [];
+  const activeProfileId = cfg.teamProfile || state.activeTeamProfile?.id || 'popcorn-back';
+  const activeAgentCli = cfg.agentCli || 'agy';
+
+  const modal = document.getElementById('githubModal');
+  const titleEl = document.getElementById('modalTitle');
+  const bodyEl = document.getElementById('modalBody');
+  const confirmBtn = document.getElementById('confirmModalBtn');
+  if (!modal || !titleEl || !bodyEl || !confirmBtn) return;
+
+  titleEl.textContent = 'Welcome to PR Review Hub — 1-Click Team Setup';
+  confirmBtn.textContent = 'Save & Sync My Pull Requests';
+
+  bodyEl.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:14px;">
+      <div class="meta-text" style="font-size:0.84rem;line-height:1.45;">
+        We auto-detected your GitHub account, teams, and local AI CLI. Confirm your <strong>Team Agent Profile</strong> below to load your team's code review rules and sync your open Pull Requests.
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div>
+          <label style="display:block;font-weight:600;margin-bottom:4px;">1. Your Team Agent Profile:</label>
+          <select id="welcomeTeamProfile" class="search-input">
+            ${profiles
+              .map(
+                (p) =>
+                  `<option value="${escapeHtml(p.id)}" ${p.id === activeProfileId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
+              )
+              .join('')}
+          </select>
+        </div>
+        <div>
+          <label style="display:block;font-weight:600;margin-bottom:4px;">2. AI Agent CLI Runner:</label>
+          <select id="welcomeAgentCli" class="search-input">
+            <option value="agy" ${activeAgentCli === 'agy' ? 'selected' : ''}>Antigravity CLI (agy)</option>
+            <option value="gemini" ${activeAgentCli === 'gemini' ? 'selected' : ''}>Gemini CLI (gemini)</option>
+            <option value="claude" ${activeAgentCli === 'claude' ? 'selected' : ''}>Claude Code CLI (claude)</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">GitHub Login:</label>
+          <input type="text" id="welcomeGithubUser" class="search-input" value="${escapeHtml(cfg.githubUser || '')}" />
+        </div>
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">GitHub Organization:</label>
+          <input type="text" id="welcomeGithubOrg" class="search-input" value="${escapeHtml(cfg.githubOrg || 'ubitransports')}" />
+        </div>
+      </div>
+      <div>
+        <label style="display:block;font-weight:600;margin-bottom:4px;">3. Watched GitHub Teams (PRs requested for these teams appear in your queue):</label>
+        <div id="welcomeDiscoveredTeamsBox" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;">
+          <span class="meta-text">Detecting your GitHub teams…</span>
+        </div>
+        <input type="text" id="welcomeGithubTeams" class="search-input" value="${escapeHtml((cfg.githubTeams || []).join(', '))}" placeholder="E.g.: popcorn-back, ubi-eng-team-popcorn" />
+      </div>
+      <div style="border-top:1px solid var(--border-color);padding-top:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <strong style="font-size:0.82rem;">Environment Health Check (Doctor)</strong>
+          <button type="button" id="welcomeRefreshDoctorBtn" class="btn btn-ghost btn-xs">Re-check</button>
+        </div>
+        <div id="welcomeDoctorBox" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:0.76rem;">
+          <span class="meta-text">Checking environment…</span>
+        </div>
+      </div>
+    </div>
+  `;
+
+  modal.classList.remove('hidden');
+
+  const refreshWelcomeDoctor = async () => {
+    const box = document.getElementById('welcomeDoctorBox');
+    if (!box) return;
+    try {
+      const res = await fetch('/api/doctor');
+      if (!res.ok) return;
+      const report = await res.json();
+      box.innerHTML = (report.checks || [])
+        .slice(0, 6)
+        .map(
+          (chk) => `
+          <div style="background:var(--bg-elevated);padding:5px 8px;border-radius:5px;border:1px solid var(--border-color);">
+            <div style="font-weight:600;">${chk.ok ? (chk.optional ? '🔵' : '🟢') : '🔴'} ${escapeHtml(chk.label)}</div>
+            <div class="meta-text" style="font-size:0.7rem;">${escapeHtml(chk.detail || '')}</div>
+          </div>
+        `
+        )
+        .join('');
+    } catch {
+      // ignore
+    }
+  };
+  document.getElementById('welcomeRefreshDoctorBtn')?.addEventListener('click', refreshWelcomeDoctor);
+  refreshWelcomeDoctor();
+
+  (async () => {
+    const box = document.getElementById('welcomeDiscoveredTeamsBox');
+    const orgInput = document.getElementById('welcomeGithubOrg');
+    const teamsInput = document.getElementById('welcomeGithubTeams');
+    if (!box || !teamsInput) return;
+    try {
+      const res = await fetch(`/api/github/teams?org=${encodeURIComponent(orgInput?.value || cfg.githubOrg || 'ubitransports')}`);
+      if (!res.ok) throw new Error('Failed');
+      const data = await res.json();
+      if (data.githubUser && document.getElementById('welcomeGithubUser')) {
+        document.getElementById('welcomeGithubUser').value = data.githubUser;
+      }
+      const teams = data.teams || [];
+      if (teams.length === 0) {
+        box.innerHTML = `<span class="meta-text">No GitHub teams detected automatically — you can type team slugs below.</span>`;
+        return;
+      }
+      const selectedSet = new Set(
+        teamsInput.value
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+      );
+      if (selectedSet.size === 0) {
+        teams.forEach((t) => selectedSet.add(t.slug));
+        teamsInput.value = Array.from(selectedSet).join(', ');
+      }
+      box.innerHTML = teams
+        .map((t) => {
+          const checked = selectedSet.has(t.slug) || selectedSet.has(t.combinedSlug);
+          return `
+            <label class="checkbox-label" style="background:var(--bg-elevated);padding:3px 8px;border-radius:4px;border:1px solid var(--border-color);font-size:11.5px;">
+              <input type="checkbox" class="welcome-team-cb" value="${escapeHtml(t.slug)}" ${checked ? 'checked' : ''} />
+              <span>${escapeHtml(t.slug)}</span>
+            </label>
+          `;
+        })
+        .join('');
+      box.querySelectorAll('.welcome-team-cb').forEach((cb) => {
+        cb.addEventListener('change', () => {
+          const checkedSlugs = Array.from(box.querySelectorAll('.welcome-team-cb:checked')).map((el) => el.value);
+          teamsInput.value = checkedSlugs.join(', ');
+        });
+      });
+    } catch {
+      box.innerHTML = '';
+    }
+  })();
+
+  confirmBtn.onclick = async () => {
+    const teamProfile = document.getElementById('welcomeTeamProfile')?.value || 'popcorn-back';
+    const agentCli = document.getElementById('welcomeAgentCli')?.value || 'agy';
+    const githubUser = document.getElementById('welcomeGithubUser')?.value.trim() || cfg.githubUser || '';
+    const githubOrg = document.getElementById('welcomeGithubOrg')?.value.trim() || cfg.githubOrg || 'ubitransports';
+    const githubTeams = (document.getElementById('welcomeGithubTeams')?.value || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    confirmBtn.disabled = true;
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          githubUser,
+          githubOrg,
+          teamProfile,
+          agentCli,
+          githubTeams,
+          onboardingCompleted: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Error saving configuration');
+      state.config = data.config;
+      modal.classList.add('hidden');
+      await loadRules();
+      await runQueueSync();
+    } catch (err) {
+      showToast(`Setup error: ${err.message}`, 4500);
+    } finally {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Confirm';
+    }
+  };
+}
 
 async function openRexFeedbackModal() {
   const modal = document.getElementById('githubModal');
