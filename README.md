@@ -12,6 +12,8 @@ You don't need `npm install` (zero external dependencies) or manual configuratio
 
 ### 1. Prerequisites (macOS / Linux)
 
+You must install **and configure** your AI runner so it can call the LLM API.
+
 ```bash
 # 1. Core CLI tools (Node.js >= 18 & GitHub CLI)
 brew install node gh
@@ -20,7 +22,8 @@ brew install node gh
 gh auth status || gh auth login
 
 # 3. AI Agent CLI: Antigravity CLI (`agy`), Gemini CLI (`gemini`), or Claude Code CLI (`claude`)
-# PR Review Hub auto-detects whichever one is installed (prioritizing `agy` -> `gemini` -> `claude`):
+# IMPORTANT: Make sure your AI runner is installed AND authenticated (e.g. valid API key configured).
+# Without a working AI runner, clicking "Run Review" will do nothing.
 which agy || which gemini || which claude
 ```
 

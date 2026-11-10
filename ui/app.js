@@ -2989,6 +2989,8 @@ function selectDiffFile(filename, highlightLine = null) {
     fileObj = files.find((f) => f.filename === fileWithFinding) || files[0];
     filename = fileObj.filename;
     highlightLine = null;
+  } else if (!fileObj && files.length === 0) {
+    state.selectedDiffFile = null;
   }
 
   state.selectedDiffFile = filename;
@@ -4246,33 +4248,35 @@ function renderPrOverviewTab() {
 
   const commentsSectionHtml = showComments
     ? `
-      <div class="pr-overview-card">
-        <div class="pr-overview-card-header">
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-            <strong>Conversation &amp; GitHub Review Comments</strong>
-            <span class="badge">${totalDiscussionItems} item${totalDiscussionItems > 1 ? 's' : ''}</span>
-            ${
-              unresolvedThreadsCount > 0
-                ? `<span class="badge badge-warning">${unresolvedThreadsCount} unresolved thread${unresolvedThreadsCount > 1 ? 's' : ''}</span>`
-                : reviewThreads.length > 0
-                ? `<span class="badge badge-pass">All threads resolved</span>`
-                : ''
-            }
-          </div>
+      <div style="margin-top:20px;">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:0 4px;margin-bottom:12px;">
+          <h3 style="margin:0;font-size:14px;font-weight:600;color:var(--text-primary);">Conversation &amp; GitHub Review Comments</h3>
+          <span class="badge">${totalDiscussionItems} item${totalDiscussionItems > 1 ? 's' : ''}</span>
+          ${
+            unresolvedThreadsCount > 0
+              ? `<span class="badge badge-warning">${unresolvedThreadsCount} unresolved thread${unresolvedThreadsCount > 1 ? 's' : ''}</span>`
+              : reviewThreads.length > 0
+              ? `<span class="badge badge-pass">All threads resolved</span>`
+              : ''
+          }
         </div>
-        <div class="pr-overview-card-body" style="display:flex;flex-direction:column;gap:12px;">
+        <div style="display:flex;flex-direction:column;gap:12px;">
           ${
             filteredTimeline.length === 0
-              ? `<div class="empty-state meta-text" style="padding:16px;">No GitHub comments in this view.</div>`
+              ? `<div class="empty-state meta-text" style="padding:16px;background:var(--bg-surface);border:1px solid var(--border-color);border-radius:6px;">No GitHub comments in this view.</div>`
               : `<div class="pr-timeline-list">${timelineHtml}</div>`
           }
-          <form id="overviewGeneralCommentForm" style="display:flex;flex-direction:column;gap:8px;margin-top:6px;padding-top:12px;border-top:1px solid var(--border-color);">
-            <label style="font-size:12px;font-weight:600;color:var(--text-primary);">Write a new general comment on this PR:</label>
-            <textarea id="overviewGeneralCommentInput" class="finding-textarea" rows="3" placeholder="Your general comment on this PR (Markdown supported)..." required></textarea>
-            <div style="display:flex;justify-content:flex-end;">
-              <button type="submit" class="btn btn-primary btn-sm">Publish Comment on GitHub</button>
+          <div class="pr-overview-card" style="margin-top:8px;">
+            <div class="pr-overview-card-body">
+              <form id="overviewGeneralCommentForm" style="display:flex;flex-direction:column;gap:8px;">
+                <label style="font-size:12px;font-weight:600;color:var(--text-primary);">Write a new general comment on this PR:</label>
+                <textarea id="overviewGeneralCommentInput" class="finding-textarea" rows="3" placeholder="Your general comment on this PR (Markdown supported)..." required></textarea>
+                <div style="display:flex;justify-content:flex-end;">
+                  <button type="submit" class="btn btn-primary btn-sm">Publish Comment on GitHub</button>
+                </div>
+              </form>
             </div>
-          </form>
+          </div>
         </div>
       </div>
     `
