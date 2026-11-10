@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "============================================================"
-echo "PR Review Hub & Agent Skill (my-review) — Installer v1.0.0"
+echo "PR Review Hub & Agent Skill (my-review) — Installer v1.1.0"
 echo "============================================================"
 
 if ! command -v node >/dev/null 2>&1; then
@@ -26,7 +26,7 @@ if [[ -d "${SCRIPT_DIR}/my-review" && -f "${SCRIPT_DIR}/my-review/SKILL.md" ]]; 
   SOURCE_DIR="${SCRIPT_DIR}/my-review"
 fi
 
-TARGET_SKILL_DIR="${ REVIEW_HUB_INSTALL_DIR:-${HOME}/.gemini/config/skills/my-review}"
+TARGET_SKILL_DIR="${REVIEW_HUB_INSTALL_DIR:-${HOME}/.gemini/config/skills/my-review}"
 mkdir -p "${TARGET_SKILL_DIR}"
 
 if [[ "${SOURCE_DIR}" != "${TARGET_SKILL_DIR}" ]]; then
@@ -61,6 +61,28 @@ GITHUB_ORG="${INPUT_ORG:-$DEFAULT_ORG}"
 read -r -p "GitHub team slugs (comma-separated) [${DETECTED_TEAMS}]: " INPUT_TEAMS
 RAW_TEAMS="${INPUT_TEAMS:-$DETECTED_TEAMS}"
 
+echo ""
+echo "Available Team Agent Profiles (references/teams/<team-id>/):"
+echo "  1) popcorn-back   — Popcorn & Backend PHP (Symfony / API Platform / 2cloud)"
+echo "  2) frontend-web   — Frontend Web (TypeScript / VueJS / Angular)"
+echo "  3) mobile-kotlin  — Mobile Android (Kotlin / WanFare / WanPay)"
+echo "  4) qa-automation  — QA & E2E Automation (Cypress / TypeScript / Behat)"
+read -r -p "Active Team Profile slug [popcorn-back]: " INPUT_TEAM_PROFILE
+TEAM_PROFILE="${INPUT_TEAM_PROFILE:-popcorn-back}"
+case "${TEAM_PROFILE}" in
+  1) TEAM_PROFILE="popcorn-back" ;;
+  2) TEAM_PROFILE="frontend-web" ;;
+  3) TEAM_PROFILE="mobile-kotlin" ;;
+  4) TEAM_PROFILE="qa-automation" ;;
+esac
+
+DEFAULT_AGENT_CLI="gemini"
+if ! command -v gemini >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
+  DEFAULT_AGENT_CLI="claude"
+fi
+read -r -p "AI Agent CLI runner (gemini / claude) [${DEFAULT_AGENT_CLI}]: " INPUT_AGENT_CLI
+AGENT_CLI="${INPUT_AGENT_CLI:-$DEFAULT_AGENT_CLI}"
+
 read -r -p "Local repositories workspace (projectsDir) [${DEFAULT_PROJECTS_DIR}]: " INPUT_PROJECTS_DIR
 PROJECTS_DIR="${INPUT_PROJECTS_DIR:-$DEFAULT_PROJECTS_DIR}"
 PROJECTS_DIR="${PROJECTS_DIR/#\~/$HOME}"
@@ -85,7 +107,7 @@ if [[ ! -f "${TARGET_SKILL_DIR}/references/false-positives.local.md" && -f "${TA
   cp "${TARGET_SKILL_DIR}/references/false-positives.example.md" "${TARGET_SKILL_DIR}/references/false-positives.local.md"
 fi
 if [[ ! -f "${TARGET_SKILL_DIR}/references/changelog.local.md" ]]; then
-  echo -e "# Review Memory Changelog\n" > "${TARGET_SKILL_DIR}/references/changelog.local.md"
+  echo -e "# Review Memory Changelog\n\n---\n" > "${TARGET_SKILL_DIR}/references/changelog.local.md"
 fi
 
 # Generate config.json
@@ -98,6 +120,8 @@ const cfg = {
   githubUser: process.argv[1],
   githubOrg: process.argv[2],
   githubTeams: teams,
+  teamProfile: process.argv[9] || "popcorn-back",
+  agentCli: process.argv[10] || "gemini",
   projectsDir: process.argv[4],
   reviewsDir: process.argv[5],
   jiraBaseUrl: process.argv[6].replace(/\/+$/, ""),
@@ -106,7 +130,7 @@ const cfg = {
   port: 4242
 };
 fs.writeFileSync(path.join(process.argv[8], "config.json"), JSON.stringify(cfg, null, 2) + "\n");
-' "${GITHUB_USER}" "${GITHUB_ORG}" "${RAW_TEAMS}" "${PROJECTS_DIR}" "${REVIEWS_DIR}" "${JIRA_BASE_URL}" "${RAW_PREFIXES}" "${TARGET_SKILL_DIR}"
+' "${GITHUB_USER}" "${GITHUB_ORG}" "${RAW_TEAMS}" "${PROJECTS_DIR}" "${REVIEWS_DIR}" "${JIRA_BASE_URL}" "${RAW_PREFIXES}" "${TARGET_SKILL_DIR}" "${TEAM_PROFILE}" "${AGENT_CLI}"
 
 read -r -p "Analyze last 1 year (365 days) of team PR review comments to propose candidate rules now? [Y/n]: " RUN_BOOTSTRAP
 RUN_BOOTSTRAP="${RUN_BOOTSTRAP:-Y}"
@@ -118,7 +142,7 @@ if [[ "${RUN_BOOTSTRAP}" =~ ^[Yy]$ ]]; then
     const cfg = loadConfig('${TARGET_SKILL_DIR}/config.json');
     const res = await bootstrapTeamCandidateRules({ cfg, days: 365 });
     console.log(\`Synthesized \${res.addedCandidatesCount} candidate rule(s) from \${res.analyzedCommentsCount} comments across \${res.analyzedPrsCount} PRs.\`);
-    console.log('Open Tab 5 (Règles Agent -> À valider) in PR Review Hub to approve or reject them.');
+    console.log('Open Tab 5 (5. Agent Rules -> Candidates) in PR Review Hub to approve or reject them.');
   " || true
 fi
 
@@ -147,6 +171,8 @@ chmod +x "${LAUNCHER}"
 echo ""
 echo "Installation complete!"
 echo "  • Skill directory : ${TARGET_SKILL_DIR}"
+echo "  • Team Profile    : ${TEAM_PROFILE}"
+echo "  • Agent CLI       : ${AGENT_CLI}"
 echo "  • Reviews folder  : ${REVIEWS_DIR}"
 echo "  • macOS Launcher  : ${LAUNCHER}"
 echo ""

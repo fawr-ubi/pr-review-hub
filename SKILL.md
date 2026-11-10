@@ -21,12 +21,13 @@ Your mission is to audit Pull Requests (from colleagues or the user's own branch
 
 ---
 
-## 3-Tier Rule & Memory Architecture
+## 4-Layer Rule & Multi-Team Agent Architecture
 
-To allow any developer or team to pull updates (`git pull`) without Git merge conflicts while maintaining personal/team standards:
-1. **Tier 1 — Versioned Cross-Team Base (`references/common-dna.md`):** Universal SOLID, Security, Clean Code, and Testing standards shared across teams.
-2. **Tier 2 — Local Active Rules (`references/reviewer-dna.local.md` & `references/false-positives.local.md`, gitignored):** Personal and team-specific rules and false-positive exceptions. Automatically combined with `common-dna.md` into `references/reviewer-dna.md` and `references/false-positives.md`.
-3. **Tier 3 — Candidate Rules Staging Queue (`references/candidate-rules.local.json`, gitignored):** Candidate rules extracted from the last 1 year (`365 days`) of team PR review comments on GitHub, awaiting explicit human validation or rejection in Tab `5. Règles Agent -> À valider`.
+To allow any developer or engineering team to pull updates (`git pull`) without Git merge conflicts while maintaining both shared team profiles and personal rules:
+1. **Layer 1 — Versioned Cross-Team Base (`references/common-dna.md`):** Universal SOLID, Security, Clean Code, and Testing standards shared across all teams.
+2. **Layer 2 — Versioned Team Agent Profiles (`references/teams/<teamProfile>/`):** Per-team directory containing `profile.json` (tech stack, watched GitHub teams, agent skills, custom agent instructions) and `team-dna.md` (shared team rules, e.g., `popcorn-back`, `frontend-web`, `mobile-kotlin`, `qa-automation`).
+3. **Layer 3 — Personal Local Rules (`references/reviewer-dna.local.md` & `references/false-positives.local.md`, gitignored):** Personal overrides and false-positive exceptions. Automatically combined with `common-dna.md` and `teams/<teamProfile>/team-dna.md` into `references/reviewer-dna.md` and `references/false-positives.md`.
+4. **Layer 4 — Candidate Rules Staging Queue (`references/candidate-rules.local.json`, gitignored):** Candidate rules extracted from the last 1 year (`365 days`) of team PR review comments on GitHub, awaiting explicit human validation or rejection in Tab `5. Agent Rules -> Candidates`.
 
 ---
 
@@ -44,8 +45,8 @@ Determine which mode applies based on the user's request:
 
 ### Step 1: Load Your Configuration & Standards
 Before analyzing any diff, read your configuration and knowledge base:
-1. Read `config.json` (if present) to resolve `githubUser`, `githubOrg`, `githubTeams`, `projectsDir`, `reviewsDir`, `jiraBaseUrl`, and `jiraPrefixes`.
-2. Read [`references/common-dna.md`](./references/common-dna.md) and [`references/reviewer-dna.local.md`](./references/reviewer-dna.local.md) (or combined [`references/reviewer-dna.md`](./references/reviewer-dna.md)).
+1. Read `config.json` (if present) to resolve `githubUser`, `githubOrg`, `githubTeams`, `teamProfile` (default `popcorn-back`), `agentCli`, `projectsDir`, `reviewsDir`, `jiraBaseUrl`, and `jiraPrefixes`.
+2. Read [`references/common-dna.md`](./references/common-dna.md), `references/teams/<teamProfile>/profile.json`, `references/teams/<teamProfile>/team-dna.md`, and [`references/reviewer-dna.local.md`](./references/reviewer-dna.local.md) (or combined [`references/reviewer-dna.md`](./references/reviewer-dna.md)).
 3. Read [`references/false-positives.local.md`](./references/false-positives.local.md) (or [`references/false-positives.md`](./references/false-positives.md)) for patterns and exceptions you must **never** flag.
 
 ### Step 2: Gather Full Context (Diff + Jira + Surrounding Code)

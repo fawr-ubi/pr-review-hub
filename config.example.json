@@ -4,6 +4,8 @@
   "githubTeams": [
     "your-github-team-slug"
   ],
+  "teamProfile": "popcorn-back",
+  "agentCli": "gemini",
   "projectsDir": "~/Ubitransport/projects",
   "reviewsDir": "~/Ubitransport/projects/artifacts/reviews",
   "jiraBaseUrl": "https://ubitransport.atlassian.net/browse",
@@ -11,6 +13,9 @@
     "PRD",
     "HYB",
     "WAN",
+    "POP",
+    "OPS",
+    "SEC",
     "SUP",
     "DEV"
   ],

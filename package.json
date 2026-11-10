@@ -1,0 +1,16 @@
+{
+  "name": "pr-review-hub",
+  "version": "1.1.0",
+  "description": "Multi-team local web cockpit and continuously learning AI code review agent (my-review) for GitHub Pull Requests.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node ui/server.mjs",
+    "test": "node --test ui/tests/hub.test.mjs",
+    "sync": "./scripts/sync-queue.sh scan",
+    "setup": "./install.sh"
+  }
+}
