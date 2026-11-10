@@ -173,12 +173,22 @@ export function recordPrReview({
   return { key, indexFile, entry: state.prs[key] };
 }
 
-async function runGraphql(query, timeoutMs = 45000) {
-  const { stdout } = await execFileAsync('gh', ['api', 'graphql', '-f', `query=${query}`], {
-    maxBuffer: 30 * 1024 * 1024,
-    timeout: timeoutMs,
-  });
-  return JSON.parse(stdout || '{}');
+async function runGraphql(query, timeoutMs = 45000, maxRetries = 2) {
+  let attempt = 0;
+  while (attempt <= maxRetries) {
+    try {
+      const { stdout } = await execFileAsync('gh', ['api', 'graphql', '-f', `query=${query}`], {
+        maxBuffer: 30 * 1024 * 1024,
+        timeout: timeoutMs,
+      });
+      return JSON.parse(stdout || '{}');
+    } catch (err) {
+      if (attempt >= maxRetries) throw err;
+      attempt++;
+      console.warn(`GraphQL attempt ${attempt} failed (502 Bad Gateway?), retrying in 3s...`);
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+  }
 }
 
 export async function scanPrQueue(customCfg = null) {
