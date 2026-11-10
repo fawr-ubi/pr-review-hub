@@ -173,7 +173,7 @@ export function recordPrReview({
   return { key, indexFile, entry: state.prs[key] };
 }
 
-async function runGraphql(query, timeoutMs = 45000, maxRetries = 2) {
+async function runGraphql(query, timeoutMs = 45000, maxRetries = 3) {
   let attempt = 0;
   while (attempt <= maxRetries) {
     try {
@@ -185,8 +185,8 @@ async function runGraphql(query, timeoutMs = 45000, maxRetries = 2) {
     } catch (err) {
       if (attempt >= maxRetries) throw err;
       attempt++;
-      console.warn(`GraphQL attempt ${attempt} failed (502 Bad Gateway?), retrying in 3s...`);
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      console.warn(`GraphQL attempt ${attempt} failed (502 Bad Gateway?), retrying in 5s...`);
+      await new Promise(resolve => setTimeout(resolve, 5000 * attempt));
     }
   }
 }
