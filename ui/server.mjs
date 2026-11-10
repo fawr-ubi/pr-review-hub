@@ -21,6 +21,9 @@ import {
   extractJiraKey,
   detectStackedPr,
   normalizeCiState,
+  DEFAULT_TEAM_MEMBERS,
+  parseCodeOwners,
+  computeMergeReadiness,
 } from './lib/metadata.mjs';
 import {
   getProjectsDir,
@@ -45,6 +48,8 @@ import {
 } from './lib/agent.mjs';
 import {
   listAllRules,
+  listTeamProfiles,
+  saveTeamProfile,
   addRule,
   updateRule,
   deleteRule,
@@ -57,6 +62,332 @@ const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const prOverviewCache = new Map();
+let customOverviewHandlerForTests = null;
+
+export function setCustomOverviewHandlerForTests(fn) {
+  customOverviewHandlerForTests = fn;
+}
+
+function getOverviewCacheFilePath(cacheDir, repo, number) {
+  const safeRepo = String(repo || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+  return path.join(cacheDir, `overview-${safeRepo}-${Number(number)}.json`);
+}
+
+function invalidatePrOverviewCache(repo, number) {
+  if (!repo || !number) return;
+  prOverviewCache.delete(`${repo}#${number}`);
+  try {
+    const { cacheDir } = getPaths();
+    const cacheFile = getOverviewCacheFilePath(cacheDir, repo, number);
+    if (fs.existsSync(cacheFile)) {
+      fs.unlinkSync(cacheFile);
+    }
+  } catch {
+    // ignore unlink error
+  }
+}
+
+async function fetchPrOverviewFromGitHub(cfg, repo, number, forceRefresh = false) {
+  if (customOverviewHandlerForTests) {
+    return customOverviewHandlerForTests({ action: 'overview', cfg, repo, number, forceRefresh });
+  }
+  const cacheKey = `${repo}#${number}`;
+  const now = Date.now();
+  const cached = prOverviewCache.get(cacheKey);
+  if (!forceRefresh && cached && now - cached.fetchedAt < 180_000) {
+    return cached.data;
+  }
+
+  let cacheFile = null;
+  let statePr = null;
+  try {
+    const { cacheDir, stateFile } = getPaths();
+    cacheFile = getOverviewCacheFilePath(cacheDir, repo, number);
+    const state = readJsonSafe(stateFile, { prs: {} });
+    statePr = state.prs?.[cacheKey] || null;
+    if (!forceRefresh && cacheFile && fs.existsSync(cacheFile)) {
+      const diskPayload = readJsonSafe(cacheFile, null);
+      if (diskPayload && diskPayload.data && typeof diskPayload.data === 'object') {
+        const expectedSha = statePr?.headRefOid || '';
+        const cachedSha = diskPayload.data.headRefOid || '';
+        const shaMatches = !expectedSha || !cachedSha || expectedSha === cachedSha;
+        if (shaMatches) {
+          prOverviewCache.set(cacheKey, {
+            fetchedAt: diskPayload.fetchedAt || now,
+            data: diskPayload.data,
+          });
+          return diskPayload.data;
+        }
+      }
+    }
+  } catch {
+    // ignore disk cache read errors
+  }
+
+  const org = cfg.githubOrg || 'ubitransports';
+  const query = `
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          number
+          title
+          body
+          state
+          isDraft
+          createdAt
+          updatedAt
+          url
+          additions
+          deletions
+          changedFiles
+          baseRefName
+          headRefName
+          headRefOid
+          author {
+            login
+            ... on User { name }
+          }
+          commits(first: 100) {
+            totalCount
+            nodes {
+              commit {
+                oid
+                abbreviatedOid
+                messageHeadline
+                messageBody
+                committedDate
+                url
+                author {
+                  name
+                  user { login }
+                }
+              }
+            }
+          }
+          comments(first: 100) {
+            totalCount
+            nodes {
+              id
+              databaseId
+              body
+              createdAt
+              url
+              author {
+                login
+                ... on User { name }
+              }
+            }
+          }
+          reviews(first: 50) {
+            totalCount
+            nodes {
+              id
+              databaseId
+              state
+              body
+              submittedAt
+              url
+              commit { abbreviatedOid }
+              author {
+                login
+                ... on User { name }
+              }
+            }
+          }
+          reviewThreads(first: 100) {
+            totalCount
+            nodes {
+              id
+              isResolved
+              isOutdated
+              path
+              line
+              startLine
+              diffSide
+              comments(first: 50) {
+                nodes {
+                  id
+                  databaseId
+                  body
+                  createdAt
+                  url
+                  diffHunk
+                  author {
+                    login
+                    ... on User { name }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const { stdout } = await execFileAsync(
+      'gh',
+      [
+        'api',
+        'graphql',
+        '-f',
+        `query=${query}`,
+        '-F',
+        `owner=${org}`,
+        '-F',
+        `repo=${repo}`,
+        '-F',
+        `number=${Number(number)}`,
+      ],
+      { maxBuffer: 25 * 1024 * 1024 }
+    );
+    const parsed = JSON.parse(stdout);
+    const prNode = parsed?.data?.repository?.pullRequest;
+    if (!prNode) {
+      throw new Error(`Pull request ${repo}#${number} not found on GitHub`);
+    }
+
+    const commits = (prNode.commits?.nodes || [])
+      .map((n) => n?.commit)
+      .filter(Boolean)
+      .map((c) => ({
+        oid: c.oid,
+        shortOid: c.abbreviatedOid || String(c.oid || '').slice(0, 7),
+        messageHeadline: c.messageHeadline || '',
+        messageBody: c.messageBody || '',
+        committedDate: c.committedDate || null,
+        url: c.url || '',
+        authorLogin: c.author?.user?.login || '',
+        authorName: formatPersonDisplayName({
+          login: c.author?.user?.login || '',
+          name: c.author?.name || '',
+        }),
+      }));
+
+    const generalComments = (prNode.comments?.nodes || [])
+      .filter(
+        (c) => c && !/^(ci-cd-matawan|dependabot|renovate|github-actions)/i.test(c.author?.login || '')
+      )
+      .map((c) => ({
+        id: c.id,
+        databaseId: c.databaseId,
+        body: c.body || '',
+        createdAt: c.createdAt,
+        url: c.url || '',
+        authorLogin: c.author?.login || '',
+        authorName: formatPersonDisplayName({
+          login: c.author?.login || '',
+          name: c.author?.name || '',
+        }),
+      }));
+
+    const reviews = (prNode.reviews?.nodes || [])
+      .filter(
+        (r) =>
+          r &&
+          (r.body?.trim() || r.state === 'APPROVED' || r.state === 'CHANGES_REQUESTED') &&
+          !/^(ci-cd-matawan|dependabot|renovate|github-actions)/i.test(r.author?.login || '')
+      )
+      .map((r) => ({
+        id: r.id,
+        databaseId: r.databaseId,
+        state: r.state,
+        body: r.body || '',
+        submittedAt: r.submittedAt,
+        url: r.url || '',
+        commitShortOid: r.commit?.abbreviatedOid || '',
+        authorLogin: r.author?.login || '',
+        authorName: formatPersonDisplayName({
+          login: r.author?.login || '',
+          name: r.author?.name || '',
+        }),
+      }));
+
+    const reviewThreads = (prNode.reviewThreads?.nodes || [])
+      .filter((t) => t && (t.comments?.nodes || []).length > 0)
+      .map((t) => {
+        const comments = (t.comments?.nodes || []).map((c) => ({
+          id: c.id,
+          databaseId: c.databaseId,
+          body: c.body || '',
+          createdAt: c.createdAt,
+          url: c.url || '',
+          diffHunk: c.diffHunk || '',
+          authorLogin: c.author?.login || '',
+          authorName: formatPersonDisplayName({
+            login: c.author?.login || '',
+            name: c.author?.name || '',
+          }),
+        }));
+        return {
+          id: t.id,
+          isResolved: Boolean(t.isResolved),
+          isOutdated: Boolean(t.isOutdated),
+          path: t.path || '',
+          line: t.line || t.startLine || null,
+          startLine: t.startLine || null,
+          diffSide: t.diffSide || 'RIGHT',
+          createdAt: comments[0]?.createdAt || null,
+          comments,
+        };
+      });
+
+    const data = {
+      repo,
+      number: Number(number),
+      title: prNode.title || '',
+      body: prNode.body || '',
+      state: prNode.state || 'OPEN',
+      isDraft: Boolean(prNode.isDraft),
+      createdAt: prNode.createdAt,
+      updatedAt: prNode.updatedAt,
+      url: prNode.url || '',
+      baseRefName: prNode.baseRefName || '',
+      headRefName: prNode.headRefName || '',
+      headRefOid: prNode.headRefOid || '',
+      authorLogin: prNode.author?.login || '',
+      authorName: formatPersonDisplayName({
+        login: prNode.author?.login || '',
+        name: prNode.author?.name || '',
+      }),
+      commitsCount: prNode.commits?.totalCount ?? commits.length,
+      commentsCount: generalComments.length + reviewThreads.length,
+      commits,
+      generalComments,
+      reviews,
+      reviewThreads,
+    };
+
+    prOverviewCache.set(cacheKey, { fetchedAt: now, data });
+    if (cacheFile) {
+      try {
+        writeJsonSafe(cacheFile, { fetchedAt: now, data });
+      } catch {
+        // ignore disk cache write errors
+      }
+    }
+    return data;
+  } catch (err) {
+    return {
+      repo,
+      number: Number(number),
+      title: '',
+      body: '',
+      state: 'OPEN',
+      isDraft: false,
+      commitsCount: 0,
+      commentsCount: 0,
+      commits: [],
+      generalComments: [],
+      reviews: [],
+      reviewThreads: [],
+      offlineError: err.message,
+    };
+  }
+}
 
 function readJsonSafe(filePath, fallback = {}) {
   try {
@@ -107,13 +438,146 @@ async function fetchPrDiffFiles(repo, number, sha = 'latest') {
   return files;
 }
 
+const codeOwnersCache = new Map();
+
+function loadRepoCodeOwners(projectsDir, repo) {
+  if (!repo) return [];
+  if (codeOwnersCache.has(repo)) {
+    return codeOwnersCache.get(repo);
+  }
+  const repoPath = getLocalRepoPath(projectsDir, repo);
+  const candidates = [
+    path.join(repoPath, '.github', 'CODEOWNERS'),
+    path.join(repoPath, 'CODEOWNERS'),
+    path.join(repoPath, 'docs', 'CODEOWNERS'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      try {
+        const rules = parseCodeOwners(fs.readFileSync(candidate, 'utf8'));
+        codeOwnersCache.set(repo, rules);
+        return rules;
+      } catch {
+        // ignore read error
+      }
+    }
+  }
+  codeOwnersCache.set(repo, []);
+  return [];
+}
+
+let teamMembersRefreshInFlight = false;
+
+function loadTeamMembersMap(cacheDir, githubOrg = 'ubitransports') {
+  const cacheFile = path.join(cacheDir, 'team-members.json');
+  const cached = readJsonSafe(cacheFile, null);
+  const now = Date.now();
+  const ttlMs = 6 * 3600 * 1000;
+
+  if ((!cached || !cached.updatedAt || now - cached.updatedAt > ttlMs) && !teamMembersRefreshInFlight) {
+    teamMembersRefreshInFlight = true;
+    const slugs = Object.keys(DEFAULT_TEAM_MEMBERS);
+    Promise.all(
+      slugs.map(async (slug) => {
+        try {
+          const { stdout } = await execFileAsync(
+            'gh',
+            ['api', `orgs/${githubOrg}/teams/${slug}/members`, '--jq', '[.[].login]'],
+            { timeout: 10000 }
+          );
+          const logins = JSON.parse(stdout);
+          return [slug, Array.isArray(logins) && logins.length > 0 ? logins : DEFAULT_TEAM_MEMBERS[slug]];
+        } catch {
+          return [slug, DEFAULT_TEAM_MEMBERS[slug]];
+        }
+      })
+    )
+      .then((entries) => {
+        const members = { ...DEFAULT_TEAM_MEMBERS, ...Object.fromEntries(entries) };
+        writeJsonSafe(cacheFile, { updatedAt: Date.now(), members });
+      })
+      .catch(() => {})
+      .finally(() => {
+        teamMembersRefreshInFlight = false;
+      });
+  }
+
+  return {
+    ...DEFAULT_TEAM_MEMBERS,
+    ...(cached && typeof cached.members === 'object' ? cached.members : {}),
+  };
+}
+
+let prCachesWarmInFlight = false;
+
+function warmOpenPrCachesInBackground(prs, cfg) {
+  if (prCachesWarmInFlight || process.env.NODE_ENV === 'test' || process.env.REVIEW_HUB_CONFIG) {
+    return;
+  }
+  const openPrs = (Array.isArray(prs) ? prs : []).filter(
+    (p) => !p.isArchived && p.repo && p.number
+  );
+  if (openPrs.length === 0) return;
+
+  prCachesWarmInFlight = true;
+  (async () => {
+    try {
+      const { cacheDir } = getPaths();
+      // Warm non-draft open PRs first, then drafts
+      const ordered = [
+        ...openPrs.filter((p) => !p.isDraft),
+        ...openPrs.filter((p) => p.isDraft),
+      ];
+      const concurrency = 2;
+      let idx = 0;
+      const worker = async () => {
+        while (idx < ordered.length) {
+          const pr = ordered[idx++];
+          if (!pr) continue;
+          const safeSha = (pr.headRefOid || pr.lastReviewedSha || 'latest').slice(0, 12);
+          const diffCacheFile = path.join(cacheDir, `diff-${pr.repo}-${pr.number}-${safeSha}.json`);
+          const ovCacheFile = getOverviewCacheFilePath(cacheDir, pr.repo, pr.number);
+          try {
+            if (!fs.existsSync(diffCacheFile)) {
+              await fetchPrDiffFiles(pr.repo, pr.number, pr.headRefOid || pr.lastReviewedSha || 'latest');
+            }
+          } catch {
+            // ignore background diff warm error
+          }
+          try {
+            let needOverview = !fs.existsSync(ovCacheFile);
+            if (!needOverview) {
+              const diskOv = readJsonSafe(ovCacheFile, null);
+              if (
+                !diskOv?.data ||
+                (pr.headRefOid && diskOv.data.headRefOid && diskOv.data.headRefOid !== pr.headRefOid)
+              ) {
+                needOverview = true;
+              }
+            }
+            if (needOverview) {
+              await fetchPrOverviewFromGitHub(cfg, pr.repo, pr.number, false);
+            }
+          } catch {
+            // ignore background overview warm error
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } finally {
+      prCachesWarmInFlight = false;
+    }
+  })();
+}
+
 export function buildStateResponse() {
-  const { cfg, reviewsDir, archiveDir, stateFile, uiStateFile } = getPaths();
+  const { cfg, reviewsDir, archiveDir, cacheDir, stateFile, uiStateFile } = getPaths();
   const projectsDir = getProjectsDir(cfg);
   const state = readJsonSafe(stateFile, { prs: {} });
-  const uiState = readJsonSafe(uiStateFile, { comments: {} });
+  const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
   const prsMap = state.prs || {};
   const jobs = getAgentJobs();
+  const teamMembersMap = loadTeamMembersMap(cacheDir, cfg.githubOrg);
 
   const activeFiles = fs.existsSync(reviewsDir)
     ? fs.readdirSync(reviewsDir).filter((f) => f.startsWith('review-') && f.endsWith('.md'))
@@ -144,6 +608,13 @@ export function buildStateResponse() {
       } catch {
         // ignore read error
       }
+    }
+
+    const manualForPr = Array.isArray(uiState.manualComments?.[key]) ? uiState.manualComments[key] : [];
+    for (const m of manualForPr) {
+      findingsCount++;
+      if (uiState.comments?.[m.cid]?.posted || m.posted) postedCount++;
+      if (uiState.comments?.[m.cid]?.dismissed || m.dismissed) dismissedCount++;
     }
 
     const authorInitials = computeAuthorInitials({ login: pr.author, name: pr.authorName });
@@ -187,9 +658,18 @@ export function buildStateResponse() {
       })
       .filter(Boolean);
 
+    const codeOwnersRules = loadRepoCodeOwners(projectsDir, pr.repo);
+    const mergeReadiness = computeMergeReadiness({
+      pr,
+      ciStatus,
+      codeOwnersRules,
+      teamMembersMap,
+    });
+
     return {
       ...pr,
       key,
+      isDraft: Boolean(pr.isDraft),
       jiraKey: resolvedJira || pr.jiraKey || '—',
       authorInitials,
       authorDisplayName,
@@ -197,6 +677,9 @@ export function buildStateResponse() {
       changesRequestedBy,
       commentedBy,
       pendingReviewers,
+      mergeReadiness,
+      requiredOwnerTeams: mergeReadiness.requiredOwnerTeams,
+      isMergeable: mergeReadiness.isMergeable,
       isStacked: stackInfo.isStacked,
       ciStatus,
       worktreeMounted,
@@ -212,7 +695,7 @@ export function buildStateResponse() {
 
   prs.sort((a, b) => {
     if (a.isArchived !== b.isArchived) return a.isArchived ? 1 : -1;
-    return String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''));
+    return String(b.createdAt || b.updatedAt || '').localeCompare(String(a.createdAt || a.updatedAt || ''));
   });
 
   return { prs, uiState, config: cfg, jobs };
@@ -252,7 +735,9 @@ export function createHubServer() {
       const projectsDir = getProjectsDir(cfg);
 
       if (req.method === 'GET' && pathname === '/api/state') {
-        return sendJson(res, 200, buildStateResponse());
+        const statePayload = buildStateResponse();
+        warmOpenPrCachesInBackground(statePayload.prs, cfg);
+        return sendJson(res, 200, statePayload);
       }
 
       if (req.method === 'GET' && pathname === '/api/config') {
@@ -286,26 +771,52 @@ export function createHubServer() {
       }
 
       if (req.method === 'GET' && pathname === '/api/review') {
-        const file = urlObj.searchParams.get('file');
+        const file = urlObj.searchParams.get('file') || '';
         const prKey = urlObj.searchParams.get('key') || '';
-        if (!file || file.includes('..') || file.includes('/')) {
+        if (file && (file.includes('..') || file.includes('/'))) {
           return sendJson(res, 400, { error: 'Invalid review file name' });
         }
-        let fullPath = path.join(reviewsDir, file);
+
+        const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
+        const manualRaw = Array.isArray(uiState.manualComments?.[prKey])
+          ? uiState.manualComments[prKey]
+          : [];
+        const manualFindings = manualRaw.map((m) => {
+          const saved = uiState.comments?.[m.cid] || {};
+          return {
+            ...m,
+            isManual: true,
+            posted: Boolean(saved.posted ?? m.posted),
+            postedAt: saved.postedAt || m.postedAt || null,
+            postedUrl: saved.postedUrl || m.postedUrl || null,
+            dismissed: Boolean(saved.dismissed ?? m.dismissed),
+            dismissReason: saved.dismissReason || m.dismissReason || null,
+            customComment: saved.customComment ?? m.customComment ?? m.comment,
+          };
+        });
+
+        let fullPath = file ? path.join(reviewsDir, file) : '';
         let archived = false;
-        if (!fs.existsSync(fullPath)) {
+        if (file && !fs.existsSync(fullPath)) {
           fullPath = path.join(archiveDir, file);
           archived = true;
         }
-        if (!fs.existsSync(fullPath)) {
+        if (!file || !fs.existsSync(fullPath)) {
+          if (manualFindings.length > 0) {
+            return sendJson(res, 200, {
+              file: file || null,
+              archived: false,
+              markdown: '',
+              findings: manualFindings,
+            });
+          }
           return sendJson(res, 404, { error: 'Review file not found' });
         }
 
         const markdown = fs.readFileSync(fullPath, 'utf8');
-        const uiState = readJsonSafe(uiStateFile, { comments: {} });
         const rawFindings = parseFindingsFromMarkdown(markdown);
 
-        const findings = rawFindings.map((f) => {
+        const aiFindings = rawFindings.map((f) => {
           const cid = `${prKey}::${f.id}`;
           const saved = uiState.comments?.[cid] || {};
           return {
@@ -324,7 +835,7 @@ export function createHubServer() {
           file,
           archived,
           markdown,
-          findings,
+          findings: [...aiFindings, ...manualFindings],
         });
       }
 
@@ -340,6 +851,7 @@ export function createHubServer() {
         }
 
         const files = await fetchPrDiffFiles(repo, number, sha);
+        const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
         let resolvedFindings = [];
 
         if (reviewFile && !reviewFile.includes('..')) {
@@ -347,7 +859,6 @@ export function createHubServer() {
           if (!fs.existsSync(fullPath)) fullPath = path.join(archiveDir, reviewFile);
           if (fs.existsSync(fullPath)) {
             const md = fs.readFileSync(fullPath, 'utf8');
-            const uiState = readJsonSafe(uiStateFile, { comments: {} });
             resolvedFindings = parseFindingsFromMarkdown(md).map((f) => {
               const cid = `${prKey}::${f.id}`;
               const saved = uiState.comments?.[cid] || {};
@@ -364,7 +875,141 @@ export function createHubServer() {
           }
         }
 
-        return sendJson(res, 200, { files, resolvedFindings });
+        const manualRaw = Array.isArray(uiState.manualComments?.[prKey])
+          ? uiState.manualComments[prKey]
+          : [];
+        const resolvedManual = manualRaw.map((m) => {
+          const saved = uiState.comments?.[m.cid] || {};
+          const resolution = resolveFindingAgainstDiff(m, files);
+          return {
+            ...m,
+            ...resolution,
+            resolvedPath: resolution.resolvedPath || m.filePath,
+            resolvedLine: resolution.resolvedLine || m.endLine || m.startLine || 1,
+            isManual: true,
+            posted: Boolean(saved.posted ?? m.posted),
+            dismissed: Boolean(saved.dismissed ?? m.dismissed),
+            customComment: saved.customComment ?? m.customComment ?? m.comment,
+          };
+        });
+
+        return sendJson(res, 200, {
+          files,
+          resolvedFindings: [...resolvedFindings, ...resolvedManual],
+        });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/manual-comments') {
+        const body = await readRequestBody(req);
+        const {
+          prKey = '',
+          cid = '',
+          filePath = '',
+          line = 1,
+          startLine = null,
+          endLine = null,
+          title = '',
+          comment = '',
+          severity = 'minor',
+        } = body;
+        if (!prKey || !comment.trim()) {
+          return sendJson(res, 400, { error: 'Missing prKey or comment' });
+        }
+
+        const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
+        if (!uiState.comments) uiState.comments = {};
+        if (!uiState.manualComments) uiState.manualComments = {};
+        if (!Array.isArray(uiState.manualComments[prKey])) {
+          uiState.manualComments[prKey] = [];
+        }
+
+        const list = uiState.manualComments[prKey];
+        const rawStart = Number(startLine ?? line) || 1;
+        const rawEnd = Number(endLine ?? line ?? rawStart) || rawStart;
+        const startLineNum = Math.max(1, Math.min(rawStart, rawEnd));
+        const endLineNum = Math.max(startLineNum, Math.max(rawStart, rawEnd));
+        const rangeLabel =
+          startLineNum !== endLineNum ? `${startLineNum}-${endLineNum}` : `${endLineNum}`;
+        const shortBase = filePath ? filePath.split('/').pop() : 'PR';
+        let savedItem = null;
+
+        if (cid) {
+          const existingIdx = list.findIndex((item) => item.cid === cid);
+          if (existingIdx >= 0) {
+            const hasLineOverride = startLine !== null || endLine !== null || body.line !== undefined;
+            list[existingIdx] = {
+              ...list[existingIdx],
+              ...(hasLineOverride
+                ? { startLine: startLineNum, endLine: endLineNum }
+                : {}),
+              title: title.trim() || list[existingIdx].title,
+              comment: comment.trim(),
+              customComment: comment.trim(),
+              severity: severity || list[existingIdx].severity || 'minor',
+              updatedAt: new Date().toISOString(),
+            };
+            savedItem = list[existingIdx];
+          }
+        }
+
+        if (!savedItem) {
+          const nextIndex = list.length + 1;
+          const id = `#M${nextIndex}`;
+          const newCid = `${prKey}::${id}-${Date.now()}`;
+          savedItem = {
+            id,
+            cid: newCid,
+            prKey,
+            filePath,
+            startLine: startLineNum,
+            endLine: endLineNum,
+            title: title.trim() || `Comment on ${shortBase}:${rangeLabel}`,
+            severity: severity || 'minor',
+            category: 'Manual Comment',
+            comment: comment.trim(),
+            customComment: comment.trim(),
+            isManual: true,
+            posted: false,
+            dismissed: false,
+            createdAt: new Date().toISOString(),
+          };
+          list.push(savedItem);
+        }
+
+        uiState.comments[savedItem.cid] = {
+          ...(uiState.comments[savedItem.cid] || {}),
+          customComment: savedItem.customComment,
+        };
+
+        writeJsonSafe(uiStateFile, uiState);
+        return sendJson(res, 200, {
+          ok: true,
+          comment: savedItem,
+          manualComments: list,
+        });
+      }
+
+      if (req.method === 'DELETE' && pathname === '/api/manual-comments') {
+        const body = await readRequestBody(req);
+        const { prKey = '', cid = '' } = body;
+        if (!prKey || !cid) {
+          return sendJson(res, 400, { error: 'Missing prKey or cid' });
+        }
+
+        const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
+        if (Array.isArray(uiState.manualComments?.[prKey])) {
+          uiState.manualComments[prKey] = uiState.manualComments[prKey].filter(
+            (item) => item.cid !== cid
+          );
+        }
+        if (uiState.comments?.[cid]) {
+          delete uiState.comments[cid];
+        }
+        writeJsonSafe(uiStateFile, uiState);
+        return sendJson(res, 200, {
+          ok: true,
+          manualComments: uiState.manualComments?.[prKey] || [],
+        });
       }
 
       // =========================================================================
@@ -603,16 +1248,37 @@ export function createHubServer() {
       }
 
       // =========================================================================
-      // Continuous Learning & Rules Management Endpoints (DNA & False Positives)
+      // Continuous Learning, Team Profiles & Rules Management Endpoints
       // =========================================================================
+      if (req.method === 'GET' && pathname === '/api/teams/profiles') {
+        const rulesState = listAllRules(cfg.teamProfile);
+        return sendJson(res, 200, {
+          profiles: rulesState.teamProfiles,
+          activeTeamProfile: rulesState.activeTeamProfile,
+        });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/teams/profiles') {
+        const reqBody = await readRequestBody(req);
+        const profile = saveTeamProfile(reqBody);
+        if (reqBody.activate !== false) {
+          saveConfig({ teamProfile: profile.id });
+        }
+        const updatedCfg = loadConfig();
+        const rulesState = listAllRules(updatedCfg.teamProfile);
+        return sendJson(res, 200, { ok: true, profile, config: updatedCfg, ...rulesState });
+      }
+
       if (req.method === 'GET' && pathname === '/api/rules') {
-        return sendJson(res, 200, listAllRules());
+        const teamParam = urlObj.searchParams.get('teamProfile') || cfg.teamProfile || '';
+        return sendJson(res, 200, listAllRules(teamParam));
       }
 
       if (req.method === 'POST' && pathname === '/api/rules') {
         const reqBody = await readRequestBody(req);
         const {
           target = 'dna',
+          teamProfile = cfg.teamProfile || '',
           section = '',
           title = '',
           body: ruleBody = '',
@@ -622,6 +1288,7 @@ export function createHubServer() {
         } = reqBody;
         const rulesState = addRule({
           target,
+          teamProfile,
           section,
           title,
           body: ruleBody || description,
@@ -632,15 +1299,21 @@ export function createHubServer() {
 
       if (req.method === 'PUT' && pathname === '/api/rules') {
         const body = await readRequestBody(req);
-        const { id, target = 'dna', title = '', body: ruleBody = '' } = body;
-        const rulesState = updateRule({ id, target, title, body: ruleBody });
+        const {
+          id,
+          target = 'dna',
+          teamProfile = cfg.teamProfile || '',
+          title = '',
+          body: ruleBody = '',
+        } = body;
+        const rulesState = updateRule({ id, target, teamProfile, title, body: ruleBody });
         return sendJson(res, 200, { ok: true, ...rulesState });
       }
 
       if (req.method === 'DELETE' && pathname === '/api/rules') {
         const body = await readRequestBody(req);
-        const { id, target = 'dna' } = body;
-        const rulesState = deleteRule({ id, target });
+        const { id, target = 'dna', teamProfile = cfg.teamProfile || '' } = body;
+        const rulesState = deleteRule({ id, target, teamProfile });
         return sendJson(res, 200, { ok: true, ...rulesState });
       }
 
@@ -648,18 +1321,34 @@ export function createHubServer() {
         const body = await readRequestBody(req);
         const days = Number(body.days || 365);
         const bootstrapResult = await bootstrapTeamCandidateRules({ cfg, days });
-        const rulesState = listAllRules();
+        const rulesState = listAllRules(cfg.teamProfile);
         return sendJson(res, 200, { ok: true, ...bootstrapResult, ...rulesState });
       }
 
       if (req.method === 'POST' && pathname === '/api/rules/candidates/decision') {
         const body = await readRequestBody(req);
-        const { action = 'approve', id = '', target = 'dna', title = '', body: ruleBody = '', section = '' } = body;
+        const {
+          action = 'approve',
+          id = '',
+          target = 'dna',
+          teamProfile = cfg.teamProfile || '',
+          title = '',
+          body: ruleBody = '',
+          section = '',
+        } = body;
         if (action === 'approve-all') {
-          const rulesState = approveAllCandidateRules({ target });
+          const rulesState = approveAllCandidateRules({ target, teamProfile });
           return sendJson(res, 200, { ok: true, ...rulesState });
         }
-        const rulesState = decideCandidateRule({ id, action, target, title, body: ruleBody, section });
+        const rulesState = decideCandidateRule({
+          id,
+          action,
+          target,
+          teamProfile,
+          title,
+          body: ruleBody,
+          section,
+        });
         return sendJson(res, 200, { ok: true, ...rulesState });
       }
 
@@ -700,7 +1389,18 @@ export function createHubServer() {
       // Explicit User Action: Post a single comment (inline or general) to GitHub
       if (req.method === 'POST' && pathname === '/api/github/comment') {
         const body = await readRequestBody(req);
-        const { repo, number, headSha, commentBody, filePath, line, mode, cid } = body;
+        const {
+          repo,
+          number,
+          headSha,
+          commentBody,
+          filePath,
+          line,
+          startLine,
+          endLine,
+          mode,
+          cid,
+        } = body;
 
         if (!repo || !number || !commentBody) {
           return sendJson(res, 400, { error: 'Missing repo, number, or commentBody' });
@@ -710,16 +1410,28 @@ export function createHubServer() {
 
         if (mode === 'inline' && filePath && headSha) {
           const files = await fetchPrDiffFiles(repo, number, headSha);
-          const resolved = resolveFindingAgainstDiff({ filePath, endLine: Number(line) || 1 }, files);
+          const reqStart = Number(startLine ?? line) || null;
+          const reqEnd = Number(endLine ?? line ?? reqStart) || 1;
+          const resolved = resolveFindingAgainstDiff(
+            { filePath, startLine: reqStart, endLine: reqEnd },
+            files
+          );
 
           if (resolved.inDiff && resolved.resolvedPath && resolved.resolvedLine) {
-            const payload = JSON.stringify({
+            const payloadObj = {
               body: commentBody,
               commit_id: headSha,
               path: resolved.resolvedPath,
               line: Number(resolved.resolvedLine),
               side: 'RIGHT',
-            });
+              ...(resolved.resolvedStartLine && resolved.resolvedStartLine < resolved.resolvedLine
+                ? {
+                    start_line: Number(resolved.resolvedStartLine),
+                    start_side: 'RIGHT',
+                  }
+                : {}),
+            };
+            const payload = JSON.stringify(payloadObj);
 
             const proc = execFile('gh', [
               'api',
@@ -781,6 +1493,7 @@ export function createHubServer() {
           writeJsonSafe(uiStateFile, uiState);
         }
 
+        invalidatePrOverviewCache(repo, number);
         return sendJson(res, 200, { ok: true, githubResponse: resultData });
       }
 
@@ -799,8 +1512,10 @@ export function createHubServer() {
         if (Array.isArray(inlineComments) && inlineComments.length > 0) {
           const files = await fetchPrDiffFiles(repo, number, headSha);
           for (const item of inlineComments) {
+            const reqStart = Number(item.startLine ?? item.line) || null;
+            const reqEnd = Number(item.endLine ?? item.line ?? reqStart) || 1;
             const resolved = resolveFindingAgainstDiff(
-              { filePath: item.filePath, endLine: Number(item.line) || 1 },
+              { filePath: item.filePath, startLine: reqStart, endLine: reqEnd },
               files
             );
             if (resolved.inDiff && resolved.resolvedPath && resolved.resolvedLine) {
@@ -808,6 +1523,12 @@ export function createHubServer() {
                 path: resolved.resolvedPath,
                 line: Number(resolved.resolvedLine),
                 side: 'RIGHT',
+                ...(resolved.resolvedStartLine && resolved.resolvedStartLine < resolved.resolvedLine
+                  ? {
+                      start_line: Number(resolved.resolvedStartLine),
+                      start_side: 'RIGHT',
+                    }
+                  : {}),
                 body: item.body,
               });
             } else {
@@ -863,7 +1584,137 @@ export function createHubServer() {
           writeJsonSafe(uiStateFile, uiState);
         }
 
+        invalidatePrOverviewCache(repo, number);
         return sendJson(res, 200, { ok: true, githubResponse: resultData });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/github/overview') {
+        const repo = urlObj.searchParams.get('repo') || '';
+        const number = urlObj.searchParams.get('number') || '';
+        const forceRefresh = urlObj.searchParams.get('refresh') === '1';
+        if (!repo || !number) {
+          return sendJson(res, 400, { error: 'Missing repo or number' });
+        }
+        const overview = await fetchPrOverviewFromGitHub(cfg, repo, number, forceRefresh);
+        return sendJson(res, 200, overview);
+      }
+
+      if (req.method === 'POST' && pathname === '/api/github/thread-reply') {
+        const body = await readRequestBody(req);
+        const { repo, number, threadId = '' } = body;
+        const commentBody = String(body.commentBody ?? body.body ?? '').trim();
+        if (!repo || !number || !threadId || !commentBody) {
+          return sendJson(res, 400, { error: 'Missing repo, number, threadId, or commentBody' });
+        }
+        if (customOverviewHandlerForTests) {
+          const mockRes = await customOverviewHandlerForTests({
+            action: 'reply',
+            cfg,
+            repo,
+            number,
+            threadId,
+            body: commentBody,
+            commentBody,
+          });
+          invalidatePrOverviewCache(repo, number);
+          return sendJson(res, 200, mockRes);
+        }
+
+        const mutation = `
+          mutation($threadId: ID!, $body: String!) {
+            addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {
+              comment {
+                id
+                databaseId
+                body
+                createdAt
+                url
+                author {
+                  login
+                  ... on User { name }
+                }
+              }
+            }
+          }
+        `;
+        const { stdout } = await execFileAsync('gh', [
+          'api',
+          'graphql',
+          '-f',
+          `query=${mutation}`,
+          '-F',
+          `threadId=${threadId}`,
+          '-F',
+          `body=${commentBody.trim()}`,
+        ]);
+        const parsed = JSON.parse(stdout);
+        const rawComment = parsed?.data?.addPullRequestReviewThreadReply?.comment;
+        invalidatePrOverviewCache(repo, number);
+        return sendJson(res, 200, {
+          ok: true,
+          comment: rawComment
+            ? {
+                id: rawComment.id,
+                databaseId: rawComment.databaseId,
+                body: rawComment.body,
+                createdAt: rawComment.createdAt,
+                url: rawComment.url,
+                authorLogin: rawComment.author?.login || '',
+                authorName: formatPersonDisplayName({
+                  login: rawComment.author?.login || '',
+                  name: rawComment.author?.name || '',
+                }),
+              }
+            : null,
+        });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/github/thread-resolve') {
+        const body = await readRequestBody(req);
+        const { repo, number, threadId = '', resolve = true } = body;
+        if (!repo || !number || !threadId) {
+          return sendJson(res, 400, { error: 'Missing repo, number, or threadId' });
+        }
+        if (customOverviewHandlerForTests) {
+          const mockRes = await customOverviewHandlerForTests({
+            action: 'resolve',
+            cfg,
+            repo,
+            number,
+            threadId,
+            resolve: Boolean(resolve),
+          });
+          invalidatePrOverviewCache(repo, number);
+          return sendJson(res, 200, mockRes);
+        }
+
+        const mutationField = resolve ? 'resolveReviewThread' : 'unresolveReviewThread';
+        const mutation = `
+          mutation($threadId: ID!) {
+            ${mutationField}(input: { threadId: $threadId }) {
+              thread {
+                id
+                isResolved
+              }
+            }
+          }
+        `;
+        const { stdout } = await execFileAsync('gh', [
+          'api',
+          'graphql',
+          '-f',
+          `query=${mutation}`,
+          '-F',
+          `threadId=${threadId}`,
+        ]);
+        const parsed = JSON.parse(stdout);
+        const updatedThread = parsed?.data?.[mutationField]?.thread;
+        invalidatePrOverviewCache(repo, number);
+        return sendJson(res, 200, {
+          ok: true,
+          threadId,
+          isResolved: Boolean(updatedThread?.isResolved ?? resolve),
+        });
       }
 
       // Static assets serving

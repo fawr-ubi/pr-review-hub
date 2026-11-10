@@ -95,6 +95,8 @@ export function getDefaultConfig() {
     githubOrg: process.env.REVIEW_HUB_ORG || 'ubitransports',
     githubUser: detectGithubUser(),
     githubTeams: [],
+    teamProfile: process.env.REVIEW_HUB_TEAM_PROFILE || 'popcorn-back',
+    agentCli: process.env.REVIEW_HUB_AGENT_CLI || 'gemini',
     projectsDir: defaultProjectsDir,
     reviewsDir: defaultReviewsDir,
     jiraBaseUrl: 'https://ubitransport.atlassian.net/browse',

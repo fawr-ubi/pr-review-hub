@@ -1,9 +1,144 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { SKILL_ROOT } from './config.mjs';
+import { SKILL_ROOT, loadConfig } from './config.mjs';
 
-export function getReferencePaths() {
+export function getTeamsDir() {
+  const dir = process.env.REVIEW_HUB_TEAMS_DIR || path.join(SKILL_ROOT, 'references', 'teams');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export function sanitizeTeamProfileId(rawId = '') {
+  return String(rawId || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+export function listTeamProfiles() {
+  const teamsDir = getTeamsDir();
+  if (!fs.existsSync(teamsDir)) return [];
+  const entries = fs.readdirSync(teamsDir, { withFileTypes: true });
+  const profiles = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const id = entry.name;
+    const profilePath = path.join(teamsDir, id, 'profile.json');
+    const dnaPath = path.join(teamsDir, id, 'team-dna.md');
+    let meta = {
+      id,
+      name: id,
+      description: '',
+      githubTeams: [],
+      repos: [],
+      techStack: [],
+      agentSkills: [],
+      agentInstructions: '',
+    };
+    if (fs.existsSync(profilePath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+        meta = { ...meta, ...parsed, id };
+      } catch {
+        // ignore malformed profile.json
+      }
+    }
+    profiles.push({
+      ...meta,
+      dnaPath,
+      hasDnaFile: fs.existsSync(dnaPath),
+    });
+  }
+  return profiles.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function getActiveTeamProfile(requestedProfileId = '') {
+  const profiles = listTeamProfiles();
+  const cfg = loadConfig();
+  const targetId = sanitizeTeamProfileId(requestedProfileId || cfg.teamProfile || 'popcorn-back');
+  const found = profiles.find((p) => p.id === targetId);
+  if (found) return found;
+  if (profiles.length > 0) return profiles[0];
+  const fallbackDir = path.join(getTeamsDir(), targetId || 'default-team');
+  fs.mkdirSync(fallbackDir, { recursive: true });
+  const dnaPath = path.join(fallbackDir, 'team-dna.md');
+  if (!fs.existsSync(dnaPath)) {
+    fs.writeFileSync(dnaPath, `# Team Reviewer DNA (${targetId || 'default-team'})\n\n---\n`, 'utf8');
+  }
+  return {
+    id: targetId || 'default-team',
+    name: targetId || 'Default Team',
+    description: '',
+    githubTeams: [],
+    repos: [],
+    techStack: [],
+    agentSkills: [],
+    agentInstructions: '',
+    dnaPath,
+    hasDnaFile: true,
+  };
+}
+
+export function saveTeamProfile({
+  id,
+  name,
+  description = '',
+  githubTeams = [],
+  repos = [],
+  techStack = [],
+  agentSkills = [],
+  agentInstructions = '',
+}) {
+  const cleanId = sanitizeTeamProfileId(id || name);
+  if (!cleanId) {
+    throw new Error('Team profile ID or name is required');
+  }
+  const teamDir = path.join(getTeamsDir(), cleanId);
+  fs.mkdirSync(teamDir, { recursive: true });
+  const profilePath = path.join(teamDir, 'profile.json');
+  const dnaPath = path.join(teamDir, 'team-dna.md');
+
+  const normalizeList = (val) =>
+    Array.isArray(val)
+      ? val.map((s) => String(s).trim()).filter(Boolean)
+      : String(val || '')
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+  const profileData = {
+    id: cleanId,
+    name: String(name || cleanId).trim(),
+    description: String(description || '').trim(),
+    githubTeams: normalizeList(githubTeams),
+    repos: normalizeList(repos),
+    techStack: normalizeList(techStack),
+    agentSkills: normalizeList(agentSkills),
+    agentInstructions: String(agentInstructions || '').trim(),
+  };
+
+  fs.writeFileSync(profilePath, JSON.stringify(profileData, null, 2) + '\n', 'utf8');
+  if (!fs.existsSync(dnaPath)) {
+    const initialDna = [
+      `# Team Reviewer DNA — ${profileData.name}`,
+      '',
+      profileData.description || `Shared team-level code review rules for ${profileData.name}.`,
+      '',
+      '---',
+      '',
+      '## 1. Architecture, Serialization & Clean Code',
+      '',
+    ].join('\n');
+    fs.writeFileSync(dnaPath, initialDna, 'utf8');
+  }
+
+  syncCombinedReferenceFiles();
+  return getActiveTeamProfile(cleanId);
+}
+
+export function getReferencePaths(teamProfileId = '') {
   const refDir = path.join(SKILL_ROOT, 'references');
   fs.mkdirSync(refDir, { recursive: true });
 
@@ -40,8 +175,10 @@ export function getReferencePaths() {
     }
   }
 
+  const activeTeam = getActiveTeamProfile(teamProfileId);
   const commonDnaPath =
     process.env.REVIEW_HUB_COMMON_DNA_FILE || path.join(refDir, 'common-dna.md');
+  const teamDnaPath = process.env.REVIEW_HUB_TEAM_DNA_FILE || activeTeam.dnaPath;
   const dnaPath = process.env.REVIEW_HUB_DNA_FILE || localDnaDefault;
   const fpPath = process.env.REVIEW_HUB_FP_FILE || localFpDefault;
   const changelogPath = process.env.REVIEW_HUB_CHANGELOG_FILE || localChangelogDefault;
@@ -50,7 +187,10 @@ export function getReferencePaths() {
 
   return {
     commonDnaPath,
+    teamDnaPath,
+    activeTeam,
     dnaPath,
+    combinedDnaPath: legacyDnaPath,
     fpPath,
     changelogPath,
     candidatesPath,
@@ -61,16 +201,18 @@ export function getReferencePaths() {
 
 /**
  * Keeps legacy `references/reviewer-dna.md` and `references/false-positives.md` synchronized
- * on disk (both gitignored) by combining `common-dna.md` + `reviewer-dna.local.md` so any external
- * skill invocation reading `references/reviewer-dna.md` automatically gets both layers.
+ * on disk (both gitignored) by combining `common-dna.md` + `teams/<team>/team-dna.md` + `reviewer-dna.local.md`
+ * so any external skill invocation reading `references/reviewer-dna.md` automatically gets all 3 layers.
  */
-export function syncCombinedReferenceFiles() {
+export function syncCombinedReferenceFiles(teamProfileId = '') {
   if (process.env.REVIEW_HUB_DNA_FILE || process.env.REVIEW_HUB_FP_FILE) return;
-  const { commonDnaPath, dnaPath, fpPath, legacyDnaPath, legacyFpPath } = getReferencePaths();
+  const { commonDnaPath, teamDnaPath, dnaPath, fpPath, legacyDnaPath, legacyFpPath } =
+    getReferencePaths(teamProfileId);
   try {
     const commonMd = fs.existsSync(commonDnaPath) ? fs.readFileSync(commonDnaPath, 'utf8').trim() : '';
+    const teamMd = fs.existsSync(teamDnaPath) ? fs.readFileSync(teamDnaPath, 'utf8').trim() : '';
     const localMd = fs.existsSync(dnaPath) ? fs.readFileSync(dnaPath, 'utf8').trim() : '';
-    const combinedDna = [commonMd, localMd].filter(Boolean).join('\n\n---\n\n') + '\n';
+    const combinedDna = [commonMd, teamMd, localMd].filter(Boolean).join('\n\n---\n\n') + '\n';
     if (combinedDna.trim()) {
       fs.writeFileSync(legacyDnaPath, combinedDna, 'utf8');
     }
@@ -242,39 +384,51 @@ export function saveCandidateRules(candidates = []) {
   return candidates;
 }
 
-export function listAllRules() {
-  const { commonDnaPath, dnaPath, fpPath } = getReferencePaths();
+export function listAllRules(teamProfileId = '') {
+  const { commonDnaPath, teamDnaPath, activeTeam, dnaPath, fpPath } =
+    getReferencePaths(teamProfileId);
   const commonMd = fs.existsSync(commonDnaPath) ? fs.readFileSync(commonDnaPath, 'utf8') : '';
+  const teamMd = fs.existsSync(teamDnaPath) ? fs.readFileSync(teamDnaPath, 'utf8') : '';
   const dnaMd = fs.existsSync(dnaPath) ? fs.readFileSync(dnaPath, 'utf8') : '';
   const fpMd = fs.existsSync(fpPath) ? fs.readFileSync(fpPath, 'utf8') : '';
 
   const commonParsed = parseRulesMarkdown(commonMd, 'common');
+  const teamParsed = parseRulesMarkdown(teamMd, 'team');
   const dnaParsed = parseRulesMarkdown(dnaMd, 'dna');
   const fpParsed = parseRulesMarkdown(fpMd, 'false-positive');
   const candidateRules = loadCandidateRules();
+  const teamProfiles = listTeamProfiles();
 
   return {
+    teamProfiles,
+    activeTeamProfile: activeTeam,
     commonSections: commonParsed.sections,
+    teamSections: teamParsed.sections,
     dnaSections: dnaParsed.sections,
     fpSections: fpParsed.sections,
     commonRules: commonParsed.rules,
+    teamRules: teamParsed.rules,
     dnaRules: dnaParsed.rules,
     falsePositives: fpParsed.rules,
     candidateRules,
     candidates: candidateRules,
-    rules: [...dnaParsed.rules, ...commonParsed.rules, ...fpParsed.rules],
+    rules: [...dnaParsed.rules, ...teamParsed.rules, ...commonParsed.rules, ...fpParsed.rules],
   };
 }
 
-function resolveTargetFilePath(target) {
-  const { commonDnaPath, dnaPath, fpPath } = getReferencePaths();
+function resolveTargetFilePath(target, teamProfileId = '') {
+  const { commonDnaPath, teamDnaPath, activeTeam, dnaPath, fpPath } =
+    getReferencePaths(teamProfileId);
   if (target === 'common') return { filePath: commonDnaPath, label: 'common-dna.md' };
+  if (target === 'team')
+    return { filePath: teamDnaPath, label: `teams/${activeTeam.id}/team-dna.md` };
   if (target === 'false-positive') return { filePath: fpPath, label: 'false-positives.md' };
   return { filePath: dnaPath, label: 'reviewer-dna.md' };
 }
 
 export function addRule({
   target = 'dna',
+  teamProfile = '',
   section = '',
   title = '',
   body = '',
@@ -289,8 +443,8 @@ export function addRule({
     throw new Error('Rule title and description are required');
   }
 
-  const { changelogPath } = getReferencePaths();
-  const { filePath, label } = resolveTargetFilePath(target);
+  const { changelogPath } = getReferencePaths(teamProfile);
+  const { filePath, label } = resolveTargetFilePath(target, teamProfile);
   const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
 
   const formattedBody = cleanDesc
@@ -331,32 +485,35 @@ export function addRule({
     lines.push('', '---', '', `## ${secHeader}`, '', ...newRuleBlock.split('\n'));
   }
 
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, lines.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n', 'utf8');
-  syncCombinedReferenceFiles();
+  syncCombinedReferenceFiles(teamProfile);
   logChangelogEntry(
     changelogPath,
     target === 'false-positive'
       ? 'Added False Positive'
       : target === 'common'
       ? 'Added Common DNA rule'
+      : target === 'team'
+      ? 'Added Team DNA rule'
       : 'Added DNA rule',
     label,
     cleanTitle,
     cleanPrKey
   );
 
-  return listAllRules();
+  return listAllRules(teamProfile);
 }
 
-export function updateRule({ id, target = 'dna', title = '', body = '' }) {
+export function updateRule({ id, target = 'dna', teamProfile = '', title = '', body = '' }) {
   const cleanTitle = String(title || '').trim();
   const cleanBody = String(body || '').trim();
   if (!id || !cleanTitle) {
     throw new Error('Rule id and title are required');
   }
 
-  const { changelogPath } = getReferencePaths();
-  const { filePath, label } = resolveTargetFilePath(target);
+  const { changelogPath } = getReferencePaths(teamProfile);
+  const { filePath, label } = resolveTargetFilePath(target, teamProfile);
   if (!fs.existsSync(filePath)) {
     throw new Error('Reference file not found');
   }
@@ -385,17 +542,17 @@ export function updateRule({ id, target = 'dna', title = '', body = '' }) {
   lines.splice(match.startLineIndex, removeCount, ...replacementBlock.split('\n'));
 
   fs.writeFileSync(filePath, lines.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n', 'utf8');
-  syncCombinedReferenceFiles();
+  syncCombinedReferenceFiles(teamProfile);
   logChangelogEntry(changelogPath, 'Updated Rule', label, cleanTitle);
 
-  return listAllRules();
+  return listAllRules(teamProfile);
 }
 
-export function deleteRule({ id, target = 'dna' }) {
+export function deleteRule({ id, target = 'dna', teamProfile = '' }) {
   if (!id) throw new Error('Rule id is required');
 
-  const { changelogPath } = getReferencePaths();
-  const { filePath, label } = resolveTargetFilePath(target);
+  const { changelogPath } = getReferencePaths(teamProfile);
+  const { filePath, label } = resolveTargetFilePath(target, teamProfile);
   if (!fs.existsSync(filePath)) {
     throw new Error('Reference file not found');
   }
@@ -412,7 +569,7 @@ export function deleteRule({ id, target = 'dna' }) {
   lines.splice(match.startLineIndex, removeCount);
 
   fs.writeFileSync(filePath, lines.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n', 'utf8');
-  syncCombinedReferenceFiles();
+  syncCombinedReferenceFiles(teamProfile);
   logChangelogEntry(
     changelogPath,
     target === 'false-positive' ? 'Removed False Positive' : 'Removed DNA rule',
@@ -420,7 +577,7 @@ export function deleteRule({ id, target = 'dna' }) {
     match.title
   );
 
-  return listAllRules();
+  return listAllRules(teamProfile);
 }
 
 /**
@@ -431,6 +588,7 @@ export function decideCandidateRule({
   action = '',
   decision = 'approve',
   target = 'dna',
+  teamProfile = '',
   section = '',
   title = '',
   body = '',
@@ -447,8 +605,17 @@ export function decideCandidateRule({
   saveCandidateRules(candidates);
 
   if (effectiveDecision === 'approve') {
+    const resolvedTarget =
+      target === 'common'
+        ? 'common'
+        : target === 'team'
+        ? 'team'
+        : target === 'false-positive'
+        ? 'false-positive'
+        : 'dna';
     addRule({
-      target: target === 'common' ? 'common' : target === 'false-positive' ? 'false-positive' : 'dna',
+      target: resolvedTarget,
+      teamProfile,
       section: section || candidate.section || '1. Architecture, Serialization & Clean Code',
       title: title || candidate.title,
       body: body || candidate.body,
@@ -456,14 +623,16 @@ export function decideCandidateRule({
     });
   }
 
-  return listAllRules();
+  return listAllRules(teamProfile);
 }
 
-export function approveAllCandidateRules({ target = 'dna' } = {}) {
+export function approveAllCandidateRules({ target = 'dna', teamProfile = '' } = {}) {
   const candidates = loadCandidateRules();
+  const resolvedTarget = target === 'common' ? 'common' : target === 'team' ? 'team' : 'dna';
   for (const candidate of candidates) {
     addRule({
-      target: target === 'common' ? 'common' : 'dna',
+      target: resolvedTarget,
+      teamProfile,
       section: candidate.section || '1. Architecture, Serialization & Clean Code',
       title: candidate.title,
       body: candidate.body,
@@ -471,5 +640,5 @@ export function approveAllCandidateRules({ target = 'dna' } = {}) {
     });
   }
   saveCandidateRules([]);
-  return listAllRules();
+  return listAllRules(teamProfile);
 }

@@ -219,9 +219,10 @@ for key in ${CHECK_KEYS}; do
   pr_info=$(gh api graphql -f query="{
     repository(owner: \"${ORG}\", name: \"${repo}\") {
       pullRequest(number: ${num}) {
-        state headRefOid updatedAt createdAt additions deletions changedFiles mergeable reviewDecision
+        state isDraft headRefOid updatedAt createdAt additions deletions changedFiles mergeable mergeStateStatus reviewDecision
         author { login ... on User { name } }
         labels(first: 10) { nodes { name color } }
+        files(first: 100) { nodes { path } }
         latestOpinionatedReviews(first: 20) {
           nodes {
             state
@@ -244,6 +245,7 @@ for key in ${CHECK_KEYS}; do
     TMP_STATE=$(mktemp)
     jq --arg k "$key" --argjson pr "$pr_info" '
       .prs[$k].state = $pr.state |
+      .prs[$k].isDraft = ($pr.isDraft // false) |
       .prs[$k].headRefOid = $pr.headRefOid |
       .prs[$k].updatedAt = $pr.updatedAt |
       .prs[$k].createdAt = ($pr.createdAt // .prs[$k].createdAt // null) |
@@ -251,7 +253,9 @@ for key in ${CHECK_KEYS}; do
       .prs[$k].additions = ($pr.additions // .prs[$k].additions // null) |
       .prs[$k].deletions = ($pr.deletions // .prs[$k].deletions // null) |
       .prs[$k].changedFiles = ($pr.changedFiles // .prs[$k].changedFiles // null) |
+      .prs[$k].changedFilePaths = ([$pr.files.nodes[]?.path] // .prs[$k].changedFilePaths // []) |
       .prs[$k].mergeable = ($pr.mergeable // .prs[$k].mergeable // null) |
+      .prs[$k].mergeStateStatus = ($pr.mergeStateStatus // .prs[$k].mergeStateStatus // null) |
       .prs[$k].reviewDecision = ($pr.reviewDecision // .prs[$k].reviewDecision // null) |
       .prs[$k].labels = ([$pr.labels.nodes[]? | { name: .name, color: .color }]) |
       .prs[$k].latestReviews = ([$pr.latestOpinionatedReviews.nodes[]? | select(.author.login != null) | {
@@ -306,10 +310,16 @@ PR_FRAGMENT='
   baseRefName
   headRefName
   mergeable
+  mergeStateStatus
   reviewDecision
   url
   author { login ... on User { name } }
   repository { name }
+  files(first: 100) {
+    nodes {
+      path
+    }
+  }
   labels(first: 10) {
     nodes {
       name
@@ -317,6 +327,7 @@ PR_FRAGMENT='
     }
   }
   commits(last: 1) {
+    totalCount
     nodes {
       commit {
         statusCheckRollup {
@@ -324,6 +335,12 @@ PR_FRAGMENT='
         }
       }
     }
+  }
+  comments {
+    totalCount
+  }
+  reviewThreads {
+    totalCount
   }
   latestOpinionatedReviews(first: 20) {
     nodes {
@@ -357,7 +374,7 @@ if [[ -f "${CONFIG_FILE}" ]] && jq -e '.githubTeams | type == "array" and length
     [[ -n "${team_slug}" ]] || continue
     clean_slug="${team_slug#${ORG}/}"
     TEAM_QUERIES+="
-  team_${idx}: search(query: \"org:${ORG} is:pr is:open draft:false updated:>=${CUTOFF_DATE} team-review-requested:${ORG}/${clean_slug}\", type: ISSUE, first: 30) {
+  team_${idx}: search(query: \"org:${ORG} is:pr is:open updated:>=${CUTOFF_DATE} team-review-requested:${ORG}/${clean_slug}\", type: ISSUE, first: 30) {
     nodes { ... on PullRequest { ${PR_FRAGMENT} } }
   }"
     idx=$((idx + 1))
@@ -365,13 +382,16 @@ if [[ -f "${CONFIG_FILE}" ]] && jq -e '.githubTeams | type == "array" and length
 fi
 
 RAW_SEARCH=$(gh api graphql -f query="{
-  me: search(query: \"org:${ORG} is:pr is:open draft:false updated:>=${CUTOFF_DATE} review-requested:${USER_LOGIN}\", type: ISSUE, first: 30) {
+  me: search(query: \"org:${ORG} is:pr is:open updated:>=${CUTOFF_DATE} review-requested:${USER_LOGIN}\", type: ISSUE, first: 30) {
     nodes { ... on PullRequest { ${PR_FRAGMENT} } }
   }${TEAM_QUERIES}
-  reviewedByMe: search(query: \"org:${ORG} is:pr is:open draft:false updated:>=${CUTOFF_DATE} reviewed-by:${USER_LOGIN}\", type: ISSUE, first: 30) {
+  reviewedByMe: search(query: \"org:${ORG} is:pr is:open updated:>=${CUTOFF_DATE} reviewed-by:${USER_LOGIN}\", type: ISSUE, first: 30) {
     nodes { ... on PullRequest { ${PR_FRAGMENT} } }
   }
-  authoredByMe: search(query: \"org:${ORG} is:pr is:open draft:false updated:>=${CUTOFF_DATE} author:${USER_LOGIN}\", type: ISSUE, first: 30) {
+  authoredByMe: search(query: \"org:${ORG} is:pr is:open updated:>=${CUTOFF_DATE} author:${USER_LOGIN}\", type: ISSUE, first: 30) {
+    nodes { ... on PullRequest { ${PR_FRAGMENT} } }
+  }
+  draftsInMainRepos: search(query: \"repo:${ORG}/2cloud-services is:pr is:open is:draft updated:>=${CUTOFF_DATE}\", type: ISSUE, first: 20) {
     nodes { ... on PullRequest { ${PR_FRAGMENT} } }
   }
 }")
@@ -384,7 +404,7 @@ SCAN_RESULT=$(jq -n \
   --arg user "${USER_LOGIN}" \
   --arg jiraRegex "${JIRA_SCAN_REGEX}" '
   ([ $search.data | to_entries[] | .value.nodes[]? ])
-  | map(select(.number != null and .isDraft == false))
+  | map(select(.number != null))
   | unique_by("\(.repository.name)#\(.number)")
   | map(select(.author.login | test("^(ci-cd-matawan|dependabot|renovate|github-actions)") | not))
   | map(
@@ -398,6 +418,8 @@ SCAN_RESULT=$(jq -n \
       (
         if $localSha == $pr.headRefOid then
           "UP_TO_DATE"
+        elif ($pr.isDraft == true) then
+          "DRAFT"
         elif $localSha != null and $localSha != $pr.headRefOid then
           "NEEDS_UPDATE"
         elif $ghSha == $pr.headRefOid then
@@ -414,6 +436,7 @@ SCAN_RESULT=$(jq -n \
         number: $pr.number,
         title: $pr.title,
         state: $pr.state,
+        isDraft: ($pr.isDraft // false),
         author: $pr.author.login,
         authorName: ($pr.author.name // $st.authorName // null),
         reviewMode: (if $pr.author.login == $user then "Self-Review" else "Peer-Review" end),
@@ -424,7 +447,11 @@ SCAN_RESULT=$(jq -n \
         additions: ($pr.additions // $st.additions // null),
         deletions: ($pr.deletions // $st.deletions // null),
         changedFiles: ($pr.changedFiles // $st.changedFiles // null),
+        commitsCount: ($pr.commits.totalCount // $st.commitsCount // null),
+        githubCommentsCount: ((($pr.comments.totalCount // 0) + ($pr.reviewThreads.totalCount // 0)) // $st.githubCommentsCount // 0),
+        changedFilePaths: ([$pr.files.nodes[]?.path] // $st.changedFilePaths // []),
         mergeable: ($pr.mergeable // $st.mergeable // null),
+        mergeStateStatus: ($pr.mergeStateStatus // $st.mergeStateStatus // null),
         reviewDecision: ($pr.reviewDecision // $st.reviewDecision // null),
         labels: ([$pr.labels.nodes[]? | { name: .name, color: .color }]),
         latestReviews: ([$pr.latestOpinionatedReviews.nodes[]? | select(.author.login != null) | {
@@ -448,6 +475,7 @@ SCAN_RESULT=$(jq -n \
         syncStatus: $syncStatus,
         reviewStatus: (
           if $syncStatus == "UP_TO_DATE" then ($st.reviewStatus // "✅ Reviewed")
+          elif $syncStatus == "DRAFT" then "📝 Draft (audit manuel)"
           elif $syncStatus == "REVIEWED_ON_GITHUB" then "✅ Reviewed on GH (\($lastGhReview.state))"
           elif $syncStatus == "NEEDS_UPDATE" then "🔄 Update Needed (new commits)"
           else "⏳ Pending Review"
@@ -455,7 +483,7 @@ SCAN_RESULT=$(jq -n \
         ),
         jiraKey: ($st.jiraKey // ([($pr.title + " " + $pr.headRefName) | scan($jiraRegex)] | first // "—")),
         findingsSummary: ($st.findingsSummary // "—"),
-        reviewFile: (if $syncStatus == "REVIEWED_ON_GITHUB" and ($st == null) then "" else $rFile end),
+        reviewFile: (if ($syncStatus == "REVIEWED_ON_GITHUB" or $syncStatus == "DRAFT") and ($st == null) then "" else $rFile end),
         lastReviewedAt: ($st.lastReviewedAt // $lastGhReview.submittedAt // null)
       }
     ) as $activePrs |
@@ -468,6 +496,7 @@ SCAN_RESULT=$(jq -n \
     report: {
       archived: $archived,
       actionable: ($activePrs | map(select(.syncStatus == "NEEDS_REVIEW" or .syncStatus == "NEEDS_UPDATE"))),
+      drafts: ($activePrs | map(select(.syncStatus == "DRAFT"))),
       upToDate: ($activePrs | map(select(.syncStatus == "UP_TO_DATE" or .syncStatus == "REVIEWED_ON_GITHUB")))
     }
   }

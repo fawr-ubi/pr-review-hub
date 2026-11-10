@@ -1,0 +1,26 @@
+{
+  "id": "frontend-web",
+  "name": "Frontend Web (TypeScript / VueJS / Angular)",
+  "description": "Frontend engineering standards for TypeScript, Vue 3 Composition API, Angular, state management, and web accessibility.",
+  "githubTeams": [
+    "popcorn-front",
+    "ubi-eng-team-front"
+  ],
+  "repos": [
+    "2cloud-front",
+    "front-partner"
+  ],
+  "techStack": [
+    "TypeScript",
+    "VueJS 3",
+    "Angular",
+    "Pinia / RxJS",
+    "Vitest / Jest",
+    "CSS / Design System"
+  ],
+  "agentSkills": [
+    "VueJS",
+    "angular"
+  ],
+  "agentInstructions": "Focus on strict TypeScript typing (ban implicit any), component single responsibility, reactive state hygiene (computed vs watchers, subscription cleanup), accessibility (ARIA, keyboard navigation), and deterministic unit/component tests."
+}

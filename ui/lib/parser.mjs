@@ -389,7 +389,8 @@ export function parseFindingsFromMarkdown(markdown, repoHint = '') {
 }
 
 /**
- * Parses unified diff patch hunk headers to extract valid RIGHT-side line numbers.
+ * Parses unified diff patch hunk headers to extract valid RIGHT-side line numbers
+ * and per-hunk line sets (for validating GitHub multi-line comments).
  */
 export function parsePatchRightLines(patch) {
   const validRightLines = new Set();
@@ -419,17 +420,42 @@ export function parsePatchRightLines(patch) {
   return validRightLines;
 }
 
+export function parsePatchRightHunks(patch) {
+  const hunks = [];
+  if (!patch || typeof patch !== 'string') return hunks;
+  const lines = patch.split('\n');
+  let rightLine = 0;
+  let currentSet = null;
+
+  for (const line of lines) {
+    const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunkMatch) {
+      rightLine = Number(hunkMatch[1]);
+      currentSet = new Set();
+      hunks.push(currentSet);
+      continue;
+    }
+    if (!currentSet) continue;
+    if (line.startsWith('+') || line.startsWith(' ')) {
+      currentSet.add(rightLine);
+      rightLine++;
+    }
+  }
+  return hunks;
+}
+
 /**
- * Resolves a finding's file path and line number against the PR's changed files.
+ * Resolves a finding's file path and line number (or multi-line range) against the PR's changed files.
  */
 export function resolveFindingAgainstDiff(finding, diffFiles) {
   const rawFilePath = finding?.filePath || finding?.path || null;
-  const rawStartLine = finding?.startLine ?? finding?.lineStart ?? null;
-  const rawEndLine = finding?.endLine ?? finding?.lineEnd ?? null;
+  const rawStartLine = Number(finding?.startLine ?? finding?.lineStart) || null;
+  const rawEndLine = Number(finding?.endLine ?? finding?.lineEnd ?? finding?.line) || null;
 
   if (!rawFilePath || !Array.isArray(diffFiles) || diffFiles.length === 0) {
     return {
       resolvedPath: rawFilePath,
+      resolvedStartLine: rawStartLine && rawEndLine && rawStartLine < rawEndLine ? rawStartLine : null,
       resolvedLine: rawEndLine || rawStartLine || null,
       inDiff: false,
     };
@@ -451,25 +477,40 @@ export function resolveFindingAgainstDiff(finding, diffFiles) {
   if (!matchedFile) {
     return {
       resolvedPath: rawFilePath,
+      resolvedStartLine: rawStartLine && rawEndLine && rawStartLine < rawEndLine ? rawStartLine : null,
       resolvedLine: rawEndLine || rawStartLine || null,
       inDiff: false,
     };
   }
 
   const validLines = parsePatchRightLines(matchedFile.patch || '');
+  const hunks = parsePatchRightHunks(matchedFile.patch || '');
   const desiredLine = rawEndLine || rawStartLine;
 
   if (!desiredLine || validLines.size === 0) {
     const firstLine = validLines.size > 0 ? [...validLines][0] : 1;
     return {
       resolvedPath: matchedFile.filename,
+      resolvedStartLine: null,
       resolvedLine: desiredLine || firstLine,
       inDiff: validLines.size > 0,
     };
   }
 
   if (validLines.has(desiredLine)) {
-    return { resolvedPath: matchedFile.filename, resolvedLine: desiredLine, inDiff: true };
+    let resolvedStartLine = null;
+    if (rawStartLine && rawStartLine < desiredLine) {
+      const sameHunk = hunks.some((h) => h.has(rawStartLine) && h.has(desiredLine));
+      if (sameHunk) {
+        resolvedStartLine = rawStartLine;
+      }
+    }
+    return {
+      resolvedPath: matchedFile.filename,
+      resolvedStartLine,
+      resolvedLine: desiredLine,
+      inDiff: true,
+    };
   }
 
   // Snap to closest line in the diff patch so GitHub API accepts inline comments
@@ -482,5 +523,11 @@ export function resolveFindingAgainstDiff(finding, diffFiles) {
       closest = l;
     }
   }
-  return { resolvedPath: matchedFile.filename, resolvedLine: closest, inDiff: true, snappedFrom: desiredLine };
+  return {
+    resolvedPath: matchedFile.filename,
+    resolvedStartLine: null,
+    resolvedLine: closest,
+    inDiff: true,
+    snappedFrom: desiredLine,
+  };
 }

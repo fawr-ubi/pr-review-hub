@@ -63,7 +63,12 @@ export function appendPrChatMessage(reviewsDir, repo, number, msg) {
   return entry;
 }
 
-function resolveGeminiBinary() {
+function resolveAgentBinary(agentCli = 'gemini') {
+  if (agentCli === 'claude') {
+    if (fs.existsSync('/opt/homebrew/bin/claude')) return '/opt/homebrew/bin/claude';
+    if (fs.existsSync('/usr/local/bin/claude')) return '/usr/local/bin/claude';
+    return 'claude';
+  }
   if (fs.existsSync('/opt/homebrew/bin/gemini')) return '/opt/homebrew/bin/gemini';
   if (fs.existsSync('/usr/local/bin/gemini')) return '/usr/local/bin/gemini';
   return 'gemini';
@@ -99,6 +104,7 @@ function inferVerdictFromFindings(findings = [], rawMarkdown = '') {
 async function runCliPrompt({
   prompt,
   cwd,
+  agentCli = 'gemini',
   approvalMode = 'yolo',
   timeoutMs = 240000,
   fastChatMode = false,
@@ -106,12 +112,25 @@ async function runCliPrompt({
 }) {
   if (customAgentRunner) {
     if (onStreamUpdate) {
-      onStreamUpdate({ phase: 'Exécution de l’agent…', partialText: '' });
+      onStreamUpdate({ phase: 'Running agent…', partialText: '' });
     }
-    return customAgentRunner({ prompt, cwd, approvalMode });
+    return customAgentRunner({ prompt, cwd, approvalMode, agentCli });
   }
-  const bin = resolveGeminiBinary();
+  const bin = resolveAgentBinary(agentCli);
   const workingDir = fs.existsSync(cwd) ? cwd : process.cwd();
+
+  if (agentCli === 'claude') {
+    const args = ['-p', prompt];
+    if (approvalMode === 'yolo' || approvalMode === 'auto_edit') {
+      args.push('--dangerously-skip-permissions');
+    }
+    const { stdout } = await execFileAsync(bin, args, {
+      cwd: workingDir,
+      maxBuffer: 25 * 1024 * 1024,
+      timeout: timeoutMs,
+    });
+    return stdout.trim();
+  }
 
   if (!fastChatMode) {
     const { stdout } = await execFileAsync(bin, ['-p', prompt, '--approval-mode', approvalMode], {
@@ -147,7 +166,7 @@ async function runCliPrompt({
 
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
-      reject(new Error(`Délai dépassé (${Math.round(timeoutMs / 1000)}s)`));
+      reject(new Error(`Timeout exceeded (${Math.round(timeoutMs / 1000)}s)`));
     }, timeoutMs);
 
     const processJsonLine = (line) => {
@@ -157,13 +176,13 @@ async function runCliPrompt({
         const evt = JSON.parse(trimmed);
         if (evt.type === 'init') {
           onStreamUpdate?.({
-            phase: 'Modèle initialisé — analyse du code et du diff…',
+            phase: 'Model initialized — analyzing code and diff…',
             partialText,
           });
         } else if (evt.type === 'tool_use' || evt.tool_name) {
-          const toolLabel = evt.tool_name || evt.name || 'outil';
+          const toolLabel = evt.tool_name || evt.name || 'tool';
           onStreamUpdate?.({
-            phase: `Inspection en cours (${toolLabel})…`,
+            phase: `Inspecting (${toolLabel})…`,
             partialText,
             toolName: toolLabel,
           });
@@ -174,7 +193,7 @@ async function runCliPrompt({
             partialText = evt.content;
           }
           onStreamUpdate?.({
-            phase: 'Rédaction de la réponse en direct…',
+            phase: 'Streaming response…',
             partialText,
           });
         }
@@ -207,7 +226,7 @@ async function runCliPrompt({
       } else if (code === 0 && rawStdout.trim()) {
         resolve(rawStdout.trim());
       } else {
-        reject(new Error(`Le processus Gemini s'est terminé avec le code ${code}`));
+        reject(new Error(`Gemini process exited with code ${code}`));
       }
     });
   });
@@ -262,19 +281,29 @@ export function triggerPrReview({ cfg, pr }) {
         }
       }
 
-      const { commonDnaPath, dnaPath, fpPath } = getReferencePaths();
-      syncCombinedReferenceFiles();
+      const { commonDnaPath, teamDnaPath, activeTeam, dnaPath, fpPath } = getReferencePaths(
+        cfg.teamProfile
+      );
+      syncCombinedReferenceFiles(cfg.teamProfile);
+
+      const teamContextLine = activeTeam
+        ? `Active Team Profile: "${activeTeam.name}" (${activeTeam.id}). Tech Stack: ${(activeTeam.techStack || []).join(', ') || 'General'}.${activeTeam.agentInstructions ? ` Team Agent Focus: ${activeTeam.agentInstructions}` : ''}`
+        : '';
 
       const prompt = [
         `Execute a Mode 1 code review using the skill at ${path.join(SKILL_ROOT, 'SKILL.md')} for PR ${cfg.githubOrg}/${pr.repo}#${pr.number} ("${pr.title || ''}", author: ${pr.author || 'unknown'}, head SHA: ${headSha}).`,
-        `Read ${commonDnaPath}, ${dnaPath}, ${path.join(SKILL_ROOT, 'references/review-checklist.md')}, and ${fpPath}.`,
+        teamContextLine,
+        `Read ${commonDnaPath}, ${teamDnaPath}, ${dnaPath}, ${path.join(SKILL_ROOT, 'references/review-checklist.md')}, and ${fpPath}.`,
         `Write the full Markdown review report in 100% English to ${reviewFilePath}, starting with "## 1. Task Summary & Functional Problem Solved" (Business & Functional Problem Solved, Technical & Feature Solution, Jira & Scope Compliance), and providing a single English "Ready-to-paste GitHub comment:" block per finding.`,
         `Never publish any comment to GitHub.`,
-      ].join('\n');
+      ]
+        .filter(Boolean)
+        .join('\n');
 
       const out = await runCliPrompt({
         prompt,
         cwd: repoPath,
+        agentCli: cfg.agentCli || 'gemini',
         approvalMode: 'yolo',
         timeoutMs: 300000,
       });
@@ -342,7 +371,7 @@ export async function sendPrChatMessage({
     prKey,
     status: 'running',
     startedAt: new Date().toISOString(),
-    phase: 'Démarrage de Gemini (sans serveurs MCP externes)…',
+    phase: 'Starting Gemini (without external MCP servers)…',
     partialText: '',
     activeFile: fileContext?.filePath || findingContext?.filePath || null,
     toolCalls: [],
@@ -359,13 +388,14 @@ export async function sendPrChatMessage({
       reviewMd = fs.readFileSync(activeReviewPath, 'utf8');
     }
 
-    syncCombinedReferenceFiles();
-    const refPaths = getReferencePaths();
+    syncCombinedReferenceFiles(cfg.teamProfile);
+    const refPaths = getReferencePaths(cfg.teamProfile);
     const dnaPath = refPaths.combinedDnaPath;
     const fpPath = refPaths.fpPath;
     const dnaText = fs.existsSync(dnaPath) ? fs.readFileSync(dnaPath, 'utf8') : '';
     const fpText = fs.existsSync(fpPath) ? fs.readFileSync(fpPath, 'utf8') : '';
     const reviewerName = cfg.githubUser || 'Reviewer';
+    const activeTeam = refPaths.activeTeam;
 
     const history = getPrChatHistory(cfg.reviewsDir, pr.repo, pr.number).slice(-8);
     const historyTranscript = history
@@ -373,48 +403,50 @@ export async function sendPrChatMessage({
       .join('\n\n');
 
     const promptParts = [
-      `Tu es l'agent personnel de code review de ${reviewerName} dans le PR Review Hub.`,
-      `Réponds de façon concise, directe, technique et SANS emoji décoratif en français (code et identifiants en anglais).`,
-      `Privilégie une réponse immédiate à partir du diff et du rapport fournis ci-dessous sans lancer de commandes shell inutiles, sauf si l'utilisateur demande explicitement de modifier un fichier.`,
-      `Contexte PR : ${pr.repo}#${pr.number} — "${pr.title || ''}" (auteur: ${pr.author || ''}, branche: ${pr.headRefName || ''} -> ${pr.baseRefName || 'develop'}, SHA: ${pr.headRefOid || ''}).`,
-    ];
+      `You are ${reviewerName}'s personal code review agent inside PR Review Hub${activeTeam ? ` (Active Team Profile: ${activeTeam.name})` : ''}.`,
+      `Answer concisely, directly, technically, and WITHOUT decorative emojis in English.`,
+      activeTeam?.agentInstructions ? `Team Agent Instructions: ${activeTeam.agentInstructions}` : '',
+      `Prefer answering immediately from the diff and audit report provided below without running unnecessary shell commands, unless the user explicitly asks to edit a file.`,
+      `PR Context: ${pr.repo}#${pr.number} — "${pr.title || ''}" (author: ${pr.author || ''}, branch: ${pr.headRefName || ''} -> ${pr.baseRefName || 'develop'}, SHA: ${pr.headRefOid || ''}).`,
+    ].filter(Boolean);
 
     if (fileContext?.filePath) {
       promptParts.push(
-        `--- Fichier Actuellement Affiché à l'Écran ("ici") ---\nFichier : ${fileContext.filePath}${fileContext.line ? ` (ligne ${fileContext.line})` : ''}\n${fileContext.patch ? `Diff du fichier :\n\`\`\`diff\n${String(fileContext.patch).slice(0, 10000)}\n\`\`\`` : ''}`
+        `--- File Currently Displayed on Screen ("here") ---\nFile: ${fileContext.filePath}${fileContext.line ? ` (line ${fileContext.line})` : ''}\n${fileContext.patch ? `File diff:\n\`\`\`diff\n${String(fileContext.patch).slice(0, 10000)}\n\`\`\`` : ''}`
       );
     }
 
     if (findingContext) {
       promptParts.push(
-        `Finding ciblé : ${findingContext.id} (${findingContext.title || ''}) sur ${findingContext.filePath || 'la PR'}:${findingContext.startLine || ''}.\nCommentaire proposé :\n${findingContext.customComment || findingContext.comment || ''}`
+        `Targeted Finding: ${findingContext.id} (${findingContext.title || ''}) on ${findingContext.filePath || 'the PR'}:${findingContext.startLine || ''}.\nProposed comment:\n${findingContext.customComment || findingContext.comment || ''}`
       );
     }
 
     if (action === 'debrief') {
       promptParts.push(
-        `Mode 2 Debrief actif : si ${reviewerName} rejette un finding ou t'enseigne une règle projet, mets à jour ${fpPath} ou ${refPaths.dnaPath} et adapte ${activeReviewPath} si pertinent.`
+        `Mode 2 Debrief active: if ${reviewerName} dismisses a finding or teaches you a project rule, update ${fpPath} or ${refPaths.dnaPath} and update ${activeReviewPath} if relevant.`
       );
     }
 
     if (reviewMd) {
-      promptParts.push(`--- Rapport d'Audit Actuel ---\n${reviewMd.slice(0, 12000)}`);
+      promptParts.push(`--- Current Audit Report ---\n${reviewMd.slice(0, 12000)}`);
     }
 
     if (fpText) {
-      promptParts.push(`--- Exceptions & Faux Positifs Connus ---\n${fpText.slice(0, 3500)}`);
+      promptParts.push(`--- Known Exceptions & False Positives ---\n${fpText.slice(0, 3500)}`);
     }
 
     if (dnaText) {
-      promptParts.push(`--- ADN de Review (${reviewerName}) ---\n${dnaText.slice(0, 3500)}`);
+      promptParts.push(`--- Review DNA (${reviewerName}) ---\n${dnaText.slice(0, 3500)}`);
     }
 
-    promptParts.push(`--- Historique de discussion ---\n${historyTranscript}`);
-    promptParts.push(`Réponds maintenant à la dernière demande de ${reviewerName} :`);
+    promptParts.push(`--- Discussion History ---\n${historyTranscript}`);
+    promptParts.push(`Now reply to ${reviewerName}'s latest request:`);
 
     const replyText = await runCliPrompt({
       prompt: promptParts.join('\n\n'),
       cwd: repoPath,
+      agentCli: cfg.agentCli || 'gemini',
       approvalMode: action === 'debrief' ? 'auto_edit' : 'plan',
       timeoutMs: 120000,
       fastChatMode: true,
@@ -429,7 +461,7 @@ export async function sendPrChatMessage({
 
     const assistantMsg = appendPrChatMessage(cfg.reviewsDir, pr.repo, pr.number, {
       role: 'assistant',
-      text: replyText || 'Réponse enregistrée.',
+      text: replyText || 'Response recorded.',
       findingId: findingContext?.id || null,
       filePath: fileContext?.filePath || null,
     });
@@ -489,7 +521,7 @@ export function dismissFindingAsFalsePositive({
 
   appendPrChatMessage(cfg.reviewsDir, pr.repo, pr.number, {
     role: 'assistant',
-    text: `Finding ${finding.id} marqué comme faux positif et ajouté à references/false-positives.md (${cleanReason}).`,
+    text: `Finding ${finding.id} marked as false positive and added to references/false-positives.md (${cleanReason}).`,
     findingId: finding.id,
   });
 

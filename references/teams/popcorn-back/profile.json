@@ -1,0 +1,27 @@
+{
+  "id": "popcorn-back",
+  "name": "Popcorn & Backend PHP (Symfony / API Platform / 2cloud)",
+  "description": "Backend engineering standards for 2cloud-services microservices (PHP 8.3+, Symfony, API Platform, Doctrine) and 2cloud (CakePHP).",
+  "githubTeams": [
+    "ubi-eng-team-popcorn",
+    "popcorn-back"
+  ],
+  "repos": [
+    "2cloud-services",
+    "2cloud",
+    "keycloak-security-bundle"
+  ],
+  "techStack": [
+    "PHP 8.3+",
+    "Symfony",
+    "API Platform",
+    "Doctrine ORM",
+    "CakePHP",
+    "PHPUnit",
+    "Behat"
+  ],
+  "agentSkills": [
+    "wanfare-php"
+  ],
+  "agentInstructions": "Enforce strict PHP 8.3+ typing, readonly classes, API Platform Resource vs DTO separation with AutoMapper, multi-tenant security & voter isolation, LegacyId-to-Uuid conversion (ban getCustomUuid()), and declarative PHPUnit/Behat testing without property-by-property mutation."
+}

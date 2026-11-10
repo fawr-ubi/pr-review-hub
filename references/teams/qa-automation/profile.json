@@ -1,0 +1,22 @@
+{
+  "id": "qa-automation",
+  "name": "QA & E2E Automation (Cypress / TypeScript / Behat)",
+  "description": "QA automation standards for Cypress E2E tests, Xray scenario alignment, and Gherkin/Behat feature specifications.",
+  "githubTeams": [
+    "ubi-eng-team-qa"
+  ],
+  "repos": [
+    "2cloud-cypress",
+    "2cloud-services"
+  ],
+  "techStack": [
+    "Cypress",
+    "TypeScript",
+    "Gherkin / Behat",
+    "Xray"
+  ],
+  "agentSkills": [
+    "cypress"
+  ],
+  "agentInstructions": "Focus on deterministic selectors (data-cy / accessible roles), zero arbitrary cy.wait(ms) sleeps, network interception via cy.intercept(), scenario independence, and alignment with Xray test specifications."
+}

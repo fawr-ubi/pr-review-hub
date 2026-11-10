@@ -1,0 +1,23 @@
+{
+  "id": "mobile-kotlin",
+  "name": "Mobile Android (Kotlin / WanFare / WanPay)",
+  "description": "Mobile Android engineering standards for Kotlin, Coroutines/Flow, Jetpack Compose, and Clean Architecture.",
+  "githubTeams": [
+    "ubi-eng-team-mobile"
+  ],
+  "repos": [
+    "wanfare",
+    "wanpay"
+  ],
+  "techStack": [
+    "Kotlin",
+    "Coroutines & Flow",
+    "Jetpack Compose",
+    "Clean Architecture",
+    "JUnit / MockK"
+  ],
+  "agentSkills": [
+    "wanfare-kotlin"
+  ],
+  "agentInstructions": "Enforce Clean Architecture layer boundaries (Domain/Data/Presentation), structured concurrency with Kotlin Coroutines and StateFlow, immutable UI state, null-safety without !! force-unwraps, and unit test coverage for UseCases and ViewModels."
+}
