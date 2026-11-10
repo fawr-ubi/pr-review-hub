@@ -5482,7 +5482,17 @@ async function openSettingsModal() {
 
         <div>
           <label style="display:block;font-weight:500;margin-bottom:4px;">AI Model (leave empty for CLI default):</label>
-          <input type="text" id="cfgModel" class="search-input" value="${escapeHtml(cfg.model || '')}" placeholder="e.g. gemini-2.0-pro-exp-02-05" />
+          <input type="text" id="cfgModel" list="cfgModelList" class="search-input" value="${escapeHtml(cfg.model || '')}" placeholder="e.g. gemini-2.5-pro" />
+          <datalist id="cfgModelList">
+            <option value="gemini-2.5-pro"></option>
+            <option value="gemini-2.5-flash"></option>
+            <option value="gemini-2.0-pro-exp-02-05"></option>
+            <option value="gemini-2.0-flash-exp"></option>
+            <option value="claude-3-7-sonnet-20250219"></option>
+            <option value="claude-3-5-sonnet-20241022"></option>
+            <option value="pro"></option>
+            <option value="flash"></option>
+          </datalist>
         </div>
       </div>
       <div>
