@@ -314,6 +314,7 @@ export function getDefaultConfig() {
     githubTeams: [],
     teamProfile: process.env.REVIEW_HUB_TEAM_PROFILE || 'popcorn-back',
     agentCli: detectInstalledAgentCli(),
+    model: process.env.REVIEW_HUB_MODEL || '',
     projectsDir: defaultProjectsDir,
     reviewsDir: defaultReviewsDir,
     jiraBaseUrl: 'https://ubitransport.atlassian.net/browse',

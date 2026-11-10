@@ -131,6 +131,7 @@ function cleanReviewMarkdownOutput(rawText = '') {
 }
 
 async function runCliPrompt({
+
   prompt,
   cwd,
   agentCli = 'agy',
@@ -139,6 +140,7 @@ async function runCliPrompt({
   fastChatMode = false,
   includeDirs = [],
   onStreamUpdate = null,
+  model = '',
 }) {
   if (customAgentRunner) {
     if (onStreamUpdate) {
@@ -176,6 +178,9 @@ async function runCliPrompt({
         '--output-format',
         'stream-json',
       ];
+      if (model) {
+        args.push('--model', model);
+      }
       for (const dir of dirsToAdd) {
         args.push('--add-dir', dir);
       }
@@ -298,6 +303,9 @@ async function runCliPrompt({
       if (approvalMode === 'yolo' || approvalMode === 'auto_edit') {
         args.push('--dangerously-skip-permissions');
       }
+      if (model) {
+        args.push('--model', model);
+      }
       for (const dir of validIncludeDirs) {
         args.push('--add-dir', dir);
       }
@@ -362,6 +370,9 @@ async function runCliPrompt({
       '-e',
       'none',
     ];
+    if (model) {
+      args.push('--model', model);
+    }
     for (const dir of validIncludeDirs) {
       args.push('--include-directories', dir);
     }
@@ -614,6 +625,7 @@ export function triggerPrReview({ cfg, pr }) {
         approvalMode: 'yolo',
         timeoutMs: 300000,
         includeDirs: [SKILL_ROOT, cfg.reviewsDir, repoPath],
+        model: cfg.model || '',
         onStreamUpdate: ({ phase }) => {
           if (phase) job.phase = phase;
         },
@@ -793,6 +805,7 @@ export async function sendPrChatMessage({
       timeoutMs: 120000,
       fastChatMode: true,
       includeDirs: [SKILL_ROOT, cfg.reviewsDir, repoPath],
+      model: cfg.model || '',
       onStreamUpdate: ({ phase, partialText, toolName }) => {
         if (phase) streamState.phase = phase;
         if (typeof partialText === 'string') streamState.partialText = partialText;

@@ -5459,7 +5459,7 @@ async function openSettingsModal() {
           <input type="text" id="cfgGithubOrg" class="search-input" value="${escapeHtml(cfg.githubOrg || 'ubitransports')}" />
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:1.3fr 1fr;gap:10px;">
+      <div style="display:grid;grid-template-columns:1.3fr 1fr 1.3fr;gap:10px;">
         <div>
           <label style="display:block;font-weight:500;margin-bottom:4px;">Active Team Profile (Agent &amp; Team DNA):</label>
           <select id="cfgTeamProfile" class="search-input">
@@ -5478,6 +5478,11 @@ async function openSettingsModal() {
             <option value="gemini" ${activeAgentCli === 'gemini' ? 'selected' : ''}>Gemini CLI (gemini)</option>
             <option value="claude" ${activeAgentCli === 'claude' ? 'selected' : ''}>Claude Code CLI (claude)</option>
           </select>
+        </div>
+
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">AI Model (leave empty for CLI default):</label>
+          <input type="text" id="cfgModel" class="search-input" value="${escapeHtml(cfg.model || '')}" placeholder="e.g. gemini-2.0-pro-exp-02-05" />
         </div>
       </div>
       <div>
@@ -5609,6 +5614,7 @@ async function openSettingsModal() {
     const githubOrg = document.getElementById('cfgGithubOrg').value.trim();
     const teamProfile = document.getElementById('cfgTeamProfile')?.value || 'popcorn-back';
     const agentCli = document.getElementById('cfgAgentCli')?.value || 'agy';
+    const model = document.getElementById('cfgModel')?.value.trim() || '';
     const githubTeams = document
       .getElementById('cfgGithubTeams')
       .value.split(',')
@@ -5633,6 +5639,7 @@ async function openSettingsModal() {
           githubOrg,
           teamProfile,
           agentCli,
+          model,
           githubTeams,
           projectsDir,
           reviewsDir,
