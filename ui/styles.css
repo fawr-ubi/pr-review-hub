@@ -759,6 +759,7 @@ code.inline-code {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 0 24px;
   background: var(--bg-sidebar);
@@ -768,13 +769,16 @@ code.inline-code {
 .view-tabs-left {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
 .view-tabs-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
+  padding: 4px 0;
 }
 
 .view-tab {
@@ -1079,7 +1083,7 @@ code.inline-code {
 /* Diff Viewer Layout */
 .diff-layout {
   display: grid;
-  grid-template-columns: 290px 1fr;
+  grid-template-columns: var(--file-sidebar-width, 320px) 5px 1fr;
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -1089,7 +1093,8 @@ code.inline-code {
   grid-template-columns: 1fr;
 }
 
-.diff-layout.file-tree-collapsed .diff-file-tree {
+.diff-layout.file-tree-collapsed .diff-file-tree,
+.diff-layout.file-tree-collapsed .file-tree-resizer {
   display: none;
 }
 
@@ -1097,18 +1102,108 @@ code.inline-code {
   grid-template-columns: 1fr !important;
 }
 
-.tree-layout.file-tree-collapsed .tree-sidebar {
+.tree-layout.file-tree-collapsed .tree-sidebar,
+.tree-layout.file-tree-collapsed .file-tree-resizer {
   display: none !important;
+}
+
+.file-tree-resizer {
+  width: 5px;
+  cursor: col-resize;
+  background: var(--border-color);
+  transition: background 0.12s ease;
+  user-select: none;
+  z-index: 25;
+}
+
+.file-tree-resizer:hover,
+.file-tree-resizer.resizing {
+  background: var(--accent-border);
 }
 
 .diff-file-tree {
   background: var(--bg-sidebar);
-  border-right: 1px solid var(--border-color);
   overflow-y: auto;
+  overflow-x: auto;
   padding: 8px;
   display: flex;
   flex-direction: column;
   gap: 2px;
+  min-width: 180px;
+}
+
+.diff-tree-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 2px 4px 6px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-wrap: wrap;
+}
+
+.diff-folder-filter-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  margin-bottom: 6px;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--accent-border);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-primary);
+}
+
+.diff-folder-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 3px;
+}
+
+.diff-folder-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  user-select: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.diff-folder-header:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.diff-folder-header-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  word-break: break-all;
+}
+
+.diff-folder-children {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border-subtle);
+  margin-left: 7px;
+}
+
+.diff-folder-group.collapsed .diff-folder-children {
+  display: none;
 }
 
 .diff-file-item {
@@ -1118,7 +1213,7 @@ code.inline-code {
   cursor: pointer;
   font-size: 11.5px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
   color: var(--text-secondary);
@@ -1135,11 +1230,30 @@ code.inline-code {
   color: var(--text-primary);
 }
 
+.diff-file-item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
 .diff-file-name {
   font-family: var(--font-mono);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text-primary);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  line-height: 1.3;
+}
+
+.diff-file-path-sub {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  line-height: 1.25;
 }
 
 .diff-stats {
@@ -1175,16 +1289,99 @@ code.inline-code {
   position: sticky;
   top: 0;
   z-index: 30;
-  padding: 8px 14px;
+  padding: 4px 10px;
   background: var(--bg-sidebar);
   border-bottom: 1px solid var(--border-color);
   display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.diff-file-header-identity {
+  display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: nowrap;
+}
+
+.diff-file-identity-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.diff-file-identity-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.diff-file-header-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  padding-top: 2px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.diff-file-header-main,
+.diff-file-header-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.diff-nav-group,
+.diff-hunk-nav-group {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--bg-surface);
+}
+
+.diff-nav-group .btn,
+.diff-hunk-nav-group .btn {
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 3px 8px;
+  background: transparent;
   font-family: var(--font-mono);
-  font-size: 12px;
+}
+
+.diff-nav-group .btn:hover:not(:disabled),
+.diff-hunk-nav-group .btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.diff-nav-group .diff-nav-counter {
+  border-left: 1px solid var(--border-subtle);
+  border-right: 1px solid var(--border-subtle);
+  padding: 2px 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
   color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.diff-hunk-nav-group .btn + .btn {
+  border-left: 1px solid var(--border-subtle);
 }
 
 .diff-scroll-area {
@@ -1204,8 +1401,8 @@ code.inline-code {
   border: 1px solid var(--border-color);
   border-radius: 4px;
   padding: 3px 8px;
-  max-width: 560px;
-  min-width: 180px;
+  max-width: min(560px, 100%);
+  min-width: 140px;
   cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1234,13 +1431,25 @@ code.inline-code {
 }
 
 .diff-line-num {
-  width: 46px;
-  min-width: 46px;
+  width: 56px;
+  min-width: 56px;
   padding: var(--diff-line-py, 2px) 8px;
   text-align: right;
   color: var(--text-muted);
   user-select: none;
   border-right: 1px solid var(--border-subtle);
+  position: relative;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.diff-line-num.commentable-line {
+  cursor: pointer;
+}
+
+.diff-line-num.commentable-line:hover {
+  color: var(--accent);
+  background: var(--bg-elevated);
 }
 
 .diff-line-code {
@@ -1259,38 +1468,52 @@ code.inline-code {
 .diff-row-hunk {
   background: var(--diff-hunk-bg);
   color: var(--text-muted);
+  height: 20px;
+}
+
+.diff-row-hunk .diff-line-num,
+.diff-row-hunk .diff-line-code {
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  white-space: nowrap !important;
+  line-height: var(--diff-line-height, 1.35);
+  vertical-align: middle;
 }
 
 .diff-hunk-expand-cell {
   width: 92px;
   min-width: 92px;
-  padding: 2px 4px;
+  padding: 0 3px !important;
   text-align: center;
   vertical-align: middle;
   border-right: 1px solid var(--border-subtle);
   user-select: none;
+  white-space: nowrap;
+  line-height: 1;
 }
 
 .diff-hunk-actions {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 3px;
+  gap: 2px;
+  line-height: 1;
 }
 
 .diff-expand-btn {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  padding: 2px 6px;
+  gap: 2px;
+  height: 15px;
+  padding: 0 4px;
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 9.5px;
   font-weight: 600;
-  line-height: 1.2;
+  line-height: 1;
   color: var(--text-secondary);
   background: var(--bg-surface);
   border: 1px solid var(--border-color);
-  border-radius: 3px;
+  border-radius: 2px;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
@@ -1307,10 +1530,12 @@ code.inline-code {
 }
 
 .diff-hunk-header-bar {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  width: 100%;
+  gap: 8px;
+  line-height: 1.25;
 }
 
 .diff-row-expanded-ctx {
@@ -1531,20 +1756,42 @@ code.inline-code {
   min-width: 0;
 }
 
-/* In Split-Screen mode, show Report on the left and active code view (Diff or Tree) on the right */
-.panels-container.split-mode #tab-report {
-  display: block !important;
-  flex: 1;
-  border-right: 1px solid var(--border-color);
-  min-width: 0;
+/* In Split-Screen mode, dynamically place any tab on Left (order:1) and any tab on Right (order:2) */
+.panels-container.split-mode > .tab-panel {
+  display: none !important;
 }
 
-.panels-container.split-mode .tab-panel.split-right-active {
+.panels-container.split-mode > .tab-panel[data-split-pane="left"],
+.panels-container.split-mode > .tab-panel.split-left-active {
+  display: block !important;
+  flex: 1;
+  order: 1;
+  border-right: 1px solid var(--border-color);
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.panels-container.split-mode > .tab-panel.diff-panel[data-split-pane="left"],
+.panels-container.split-mode > .tab-panel.tree-panel[data-split-pane="left"] {
   display: flex !important;
-  flex: 1.15;
   padding: 0;
   overflow: hidden;
+}
+
+.panels-container.split-mode > .tab-panel[data-split-pane="right"],
+.panels-container.split-mode > .tab-panel.split-right-active {
+  display: block !important;
+  flex: 1.15;
+  order: 2;
   min-width: 0;
+  overflow-y: auto;
+}
+
+.panels-container.split-mode > .tab-panel.diff-panel[data-split-pane="right"],
+.panels-container.split-mode > .tab-panel.tree-panel[data-split-pane="right"] {
+  display: flex !important;
+  padding: 0;
+  overflow: hidden;
 }
 
 /* Popout Window Mode (hide sidebar) */
@@ -1565,7 +1812,7 @@ code.inline-code {
 
 .tree-layout {
   display: grid;
-  grid-template-columns: 310px 1fr;
+  grid-template-columns: var(--file-sidebar-width, 320px) 5px 1fr;
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -1573,11 +1820,11 @@ code.inline-code {
 
 .tree-sidebar {
   background: var(--bg-sidebar);
-  border-right: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  min-width: 180px;
 }
 
 .tree-search-box {
@@ -1674,14 +1921,17 @@ code.inline-code {
 }
 
 .blob-line-num {
-  width: 50px;
-  min-width: 50px;
+  width: 56px;
+  min-width: 56px;
   padding: var(--diff-line-py, 1px) 10px;
   text-align: right;
   color: var(--text-muted);
   user-select: none;
   border-right: 1px solid var(--border-subtle);
   cursor: pointer;
+  position: relative;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 
 .blob-line-code {
@@ -2297,7 +2547,7 @@ code.inline-code {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 5px 8px;
+  padding: 6px 10px;
   background: var(--bg-app);
   border: 1px solid var(--border-subtle);
   border-radius: 4px;
@@ -2312,14 +2562,878 @@ code.inline-code {
   font-family: var(--font-mono);
 }
 
-.shortcut-keys kbd {
+.shortcut-keys kbd,
+.shortcut-recorder-btn {
   background: var(--bg-elevated);
   border: 1px solid var(--border-color);
   border-radius: 3px;
-  padding: 1px 6px;
+  padding: 2px 7px;
   font-size: 11px;
+  font-family: var(--font-mono);
   color: var(--text-primary);
 }
 
+.shortcut-recorder-btn {
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
 
+.shortcut-recorder-btn:hover {
+  border-color: var(--accent-border);
+  background: var(--bg-hover);
+}
+
+.shortcut-recorder-btn.recording {
+  border-color: var(--accent);
+  background: var(--accent-emphasis);
+  color: #ffffff;
+  animation: pulseRecord 1s ease-in-out infinite alternate;
+}
+
+@keyframes pulseRecord {
+  from { opacity: 0.78; }
+  to { opacity: 1; }
+}
+
+/* Clickable Breadcrumb Bar */
+.clickable-breadcrumb-bar {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 2px 7px;
+  max-width: 100%;
+}
+
+.crumb-segment {
+  cursor: pointer;
+  color: var(--accent);
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: none;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  transition: background 0.12s, color 0.12s;
+}
+
+.crumb-segment:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  text-decoration: underline;
+}
+
+.crumb-segment.crumb-file {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.crumb-sep {
+  color: var(--text-muted);
+  user-select: none;
+  font-size: 10.5px;
+}
+
+/* Inline Comment Add Button & Composer */
+.diff-line-add-btn {
+  position: absolute;
+  left: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  border: 1px solid var(--accent-border);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  margin: 0;
+  padding: 0;
+  transition: opacity 0.1s ease, background 0.1s ease;
+  z-index: 2;
+}
+
+tr:hover .diff-line-add-btn,
+.diff-line-num:hover .diff-line-add-btn,
+.blob-line-num:hover .diff-line-add-btn,
+.diff-line-add-btn:focus {
+  opacity: 1;
+}
+
+.diff-line-add-btn:hover {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.inline-comment-composer-cell {
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--border-color);
+  border-left: 3px solid var(--accent);
+  padding: 12px 16px;
+  font-family: var(--font-sans);
+}
+
+.inline-comment-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 880px;
+}
+
+.inline-comment-composer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.inline-comment-composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Multi-line selection highlight (GitHub-style line range) */
+tr.comment-range-selected td {
+  background: rgba(139, 92, 246, 0.16) !important;
+}
+
+tr.comment-range-selected td.diff-line-num,
+tr.comment-range-selected td.blob-line-num {
+  background: rgba(139, 92, 246, 0.32) !important;
+  color: var(--text-primary) !important;
+  font-weight: 700;
+}
+
+.line-range-inputs {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.line-range-input {
+  width: 64px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-app);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+/* Draft, Mergeable & CODEOWNERS Team Badges */
+.badge-draft {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--text-secondary);
+  border: 1px dashed var(--border-color);
+  font-weight: 600;
+}
+
+.badge-mergeable-ok,
+.pr-tag.pr-tag-mergeable-ok {
+  background: rgba(34, 197, 94, 0.14);
+  color: var(--status-ok);
+  border: 1px solid rgba(34, 197, 94, 0.38);
+  font-weight: 600;
+}
+
+.badge-mergeable-blocked,
+.pr-tag.pr-tag-mergeable-blocked {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--status-warn);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.pr-codeowners-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.pr-owner-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  border: 1px solid var(--border-color);
+}
+
+.pr-owner-tag.owner-approved {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--status-ok);
+  border-color: rgba(34, 197, 94, 0.35);
+}
+
+.pr-owner-tag.owner-pending {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--status-warn);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+/* Split Mode Left / Right Pane Selectors */
+.split-pane-selectors {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-right: 4px;
+}
+
+.split-pane-select-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.split-pane-select {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11.5px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+}
+
+.view-tab.split-left-tab {
+  border-bottom: 2px solid var(--accent);
+  color: var(--text-primary);
+}
+
+.view-tab.split-right-tab {
+  border-bottom: 2px dashed var(--status-ok);
+  color: var(--text-primary);
+}
+
+/* ============================================================================
+   Tab 2: PR Description, Commits & GitHub Conversation Overview
+   ============================================================================ */
+.pr-overview-container {
+  max-width: 1040px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding-bottom: 36px;
+}
+
+.pr-overview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.pr-overview-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.pr-overview-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.pr-overview-card-body {
+  padding: 14px 16px;
+}
+
+.pr-commits-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.pr-commit-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12.5px;
+}
+
+.pr-commit-item:last-child {
+  border-bottom: none;
+}
+
+.pr-commit-top-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.pr-commit-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.pr-commit-index-badge {
+  flex-shrink: 0;
+  min-width: 28px;
+  justify-content: center;
+  font-family: var(--font-mono);
+}
+
+.pr-commit-headline {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pr-commit-sub-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 36px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.pr-commit-author {
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.pr-commit-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+}
+
+.pr-commit-sha,
+.pr-commit-sha-badge {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  color: var(--accent);
+  cursor: pointer;
+  line-height: 1.3;
+}
+
+.pr-commit-sha:hover,
+.pr-commit-sha-badge:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.pr-timeline-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pr-thread-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.pr-thread-card.resolved,
+.pr-thread-card.thread-resolved {
+  opacity: 0.82;
+  border-color: var(--border-subtle);
+}
+
+.pr-thread-header,
+.pr-thread-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: nowrap;
+  padding: 8px 14px;
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+}
+
+.pr-thread-card.compact-review .pr-thread-header {
+  border-bottom: none;
+}
+
+.pr-thread-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.pr-thread-header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.pr-thread-comments {
+  display: flex;
+  flex-direction: column;
+}
+
+.pr-thread-comment,
+.pr-thread-comment-item {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.pr-thread-comment:last-child,
+.pr-thread-comment-item:last-child {
+  border-bottom: none;
+}
+
+.pr-thread-comment-body p:first-child {
+  margin-top: 0;
+}
+
+.pr-thread-comment-body p:last-child {
+  margin-bottom: 0;
+}
+
+.pr-thread-comment-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.pr-thread-reply-box {
+  padding: 10px 14px;
+  background: var(--bg-app);
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Inline GitHub Colleague Review Threads inside Tab 3 (Diff Git) */
+.diff-github-thread {
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--border-color);
+  border-left: 3px solid var(--accent);
+  padding: 10px 14px;
+  font-family: var(--font-sans);
+}
+
+.diff-github-thread.thread-resolved {
+  border-left-color: var(--status-ok);
+  padding: 6px 14px;
+}
+
+/* ============================================================================
+   File Status Badges, Extension Color Tags & Enhanced Filename Visibility
+   ============================================================================ */
+.file-status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+  line-height: 1;
+  user-select: none;
+}
+
+.file-status-badge.status-added {
+  background: rgba(34, 197, 94, 0.16);
+  color: var(--diff-add-text);
+  border: 1px solid rgba(34, 197, 94, 0.38);
+}
+
+.file-status-badge.status-modified {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--status-major);
+  border: 1px solid rgba(245, 158, 11, 0.36);
+}
+
+.file-status-badge.status-removed {
+  background: rgba(239, 68, 68, 0.16);
+  color: var(--diff-del-text);
+  border: 1px solid rgba(239, 68, 68, 0.38);
+}
+
+.file-status-badge.status-renamed {
+  background: rgba(168, 85, 247, 0.16);
+  color: #c084fc;
+  border: 1px solid rgba(168, 85, 247, 0.38);
+}
+
+.file-ext-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+  line-height: 1.3;
+  user-select: none;
+  border: 1px solid transparent;
+}
+
+.file-ext-badge.ext-php {
+  background: rgba(119, 123, 180, 0.18);
+  color: #9ba3eb;
+  border-color: rgba(119, 123, 180, 0.38);
+}
+
+.file-ext-badge.ext-feature {
+  background: rgba(16, 185, 129, 0.16);
+  color: #6ee7b7;
+  border-color: rgba(16, 185, 129, 0.36);
+}
+
+.file-ext-badge.ext-ts,
+.file-ext-badge.ext-vue {
+  background: rgba(59, 130, 246, 0.16);
+  color: #93c5fd;
+  border-color: rgba(59, 130, 246, 0.36);
+}
+
+.file-ext-badge.ext-js,
+.file-ext-badge.ext-json {
+  background: rgba(234, 179, 8, 0.16);
+  color: #fde047;
+  border-color: rgba(234, 179, 8, 0.36);
+}
+
+.file-ext-badge.ext-yaml,
+.file-ext-badge.ext-xml {
+  background: rgba(236, 72, 153, 0.15);
+  color: #f472b6;
+  border-color: rgba(236, 72, 153, 0.34);
+}
+
+.file-ext-badge.ext-sql,
+.file-ext-badge.ext-sh {
+  background: rgba(14, 165, 233, 0.16);
+  color: #7dd3fc;
+  border-color: rgba(14, 165, 233, 0.36);
+}
+
+.file-ext-badge.ext-other {
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border-color: var(--border-color);
+}
+
+[data-theme="light"] .file-ext-badge.ext-php {
+  background: rgba(79, 85, 155, 0.13);
+  color: #3f4685;
+}
+[data-theme="light"] .file-ext-badge.ext-feature {
+  background: rgba(5, 150, 105, 0.13);
+  color: #065f46;
+}
+[data-theme="light"] .file-ext-badge.ext-ts,
+[data-theme="light"] .file-ext-badge.ext-vue {
+  background: rgba(37, 99, 235, 0.13);
+  color: #1e40af;
+}
+[data-theme="light"] .file-ext-badge.ext-js,
+[data-theme="light"] .file-ext-badge.ext-json {
+  background: rgba(180, 83, 9, 0.13);
+  color: #92400e;
+}
+[data-theme="light"] .file-ext-badge.ext-yaml,
+[data-theme="light"] .file-ext-badge.ext-xml {
+  background: rgba(190, 24, 93, 0.12);
+  color: #9d174d;
+}
+
+.diff-file-name-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.diff-file-header-identity .clickable-breadcrumb-bar {
+  font-size: 11.5px;
+  padding: 1px 6px;
+  background: var(--bg-app);
+  border-color: var(--border-color);
+  flex-wrap: nowrap;
+  white-space: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+  min-width: 0;
+}
+
+.diff-file-header-identity .clickable-breadcrumb-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.diff-file-header-identity .crumb-segment.crumb-file {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid var(--accent-border);
+}
+
+.finding-file-btn .finding-file-dir {
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+
+.finding-file-btn .finding-file-basename {
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.finding-file-btn .finding-file-line {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+/* ============================================================================
+   Split-Mode Layout & Button Compaction
+   ============================================================================ */
+.panels-container.split-mode > .tab-panel:not(.diff-panel) {
+  padding: 14px 16px;
+}
+
+.panels-container.split-mode .report-executive-header,
+.panels-container.split-mode .report-findings-quickbar,
+.panels-container.split-mode .markdown-body,
+.panels-container.split-mode .comments-toolbar,
+.panels-container.split-mode .findings-list,
+.panels-container.split-mode .pr-overview-container {
+  max-width: 100%;
+}
+
+.panels-container.split-mode .report-finding-row {
+  padding: 7px 10px;
+  gap: 5px;
+}
+
+.panels-container.split-mode .report-finding-actions,
+.panels-container.split-mode .report-detail-header-right,
+.panels-container.split-mode .finding-actions-left,
+.panels-container.split-mode .finding-actions-right,
+.panels-container.split-mode .comments-toolbar-left,
+.panels-container.split-mode .comments-toolbar-right {
+  gap: 4px;
+}
+
+.panels-container.split-mode .report-finding-actions .btn,
+.panels-container.split-mode .report-detail-header-right .btn,
+.panels-container.split-mode .finding-actions .btn,
+.panels-container.split-mode .comments-toolbar .btn,
+.panels-container.split-mode .pr-overview-toolbar .btn,
+.panels-container.split-mode .diff-file-header-toolbar .btn {
+  padding: 2px 7px;
+  font-size: 10.5px;
+}
+
+.panels-container.split-mode .diff-file-header {
+  padding: 3px 8px;
+  gap: 2px;
+}
+
+.panels-container.split-mode .diff-file-jump-select {
+  max-width: 290px;
+  min-width: 120px;
+  font-size: 11px;
+  padding: 2px 6px;
+}
+
+.panels-container.split-mode .diff-scroll-area {
+  padding: 8px 10px 22px;
+}
+
+/* ============================================================================
+   GitHub-Style Syntax Highlighting inside Diff Table (.diff-line-code)
+   ============================================================================ */
+.diff-line-prefix {
+  display: inline-block;
+  width: 14px;
+  user-select: none;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.diff-row-add .diff-line-prefix {
+  color: var(--diff-add-text);
+}
+
+.diff-row-del .diff-line-prefix {
+  color: var(--diff-del-text);
+}
+
+.diff-line-syntax {
+  color: var(--text-primary);
+}
+
+/* Dark & Purple theme syntax palette (GitHub Dark inspired) */
+[data-theme="dark"] .diff-line-syntax .hljs-keyword,
+[data-theme="dark"] .diff-line-syntax .hljs-selector-tag,
+[data-theme="dark"] .diff-line-syntax .hljs-literal,
+[data-theme="purple"] .diff-line-syntax .hljs-keyword,
+[data-theme="purple"] .diff-line-syntax .hljs-selector-tag,
+[data-theme="purple"] .diff-line-syntax .hljs-literal {
+  color: #ff7b72;
+  font-weight: 600;
+}
+
+[data-theme="dark"] .diff-line-syntax .hljs-string,
+[data-theme="dark"] .diff-line-syntax .hljs-doctag,
+[data-theme="dark"] .diff-line-syntax .hljs-regexp,
+[data-theme="purple"] .diff-line-syntax .hljs-string,
+[data-theme="purple"] .diff-line-syntax .hljs-doctag,
+[data-theme="purple"] .diff-line-syntax .hljs-regexp {
+  color: #a5d6ff;
+}
+
+[data-theme="dark"] .diff-line-syntax .hljs-title,
+[data-theme="dark"] .diff-line-syntax .hljs-title.class_,
+[data-theme="dark"] .diff-line-syntax .hljs-title.function_,
+[data-theme="dark"] .diff-line-syntax .hljs-function,
+[data-theme="purple"] .diff-line-syntax .hljs-title,
+[data-theme="purple"] .diff-line-syntax .hljs-title.class_,
+[data-theme="purple"] .diff-line-syntax .hljs-title.function_,
+[data-theme="purple"] .diff-line-syntax .hljs-function {
+  color: #d2a8ff;
+}
+
+[data-theme="dark"] .diff-line-syntax .hljs-variable,
+[data-theme="dark"] .diff-line-syntax .hljs-template-variable,
+[data-theme="dark"] .diff-line-syntax .hljs-attr,
+[data-theme="dark"] .diff-line-syntax .hljs-property,
+[data-theme="purple"] .diff-line-syntax .hljs-variable,
+[data-theme="purple"] .diff-line-syntax .hljs-template-variable,
+[data-theme="purple"] .diff-line-syntax .hljs-attr,
+[data-theme="purple"] .diff-line-syntax .hljs-property {
+  color: #79c0ff;
+}
+
+[data-theme="dark"] .diff-line-syntax .hljs-number,
+[data-theme="dark"] .diff-line-syntax .hljs-type,
+[data-theme="dark"] .diff-line-syntax .hljs-built_in,
+[data-theme="dark"] .diff-line-syntax .hljs-meta,
+[data-theme="purple"] .diff-line-syntax .hljs-number,
+[data-theme="purple"] .diff-line-syntax .hljs-type,
+[data-theme="purple"] .diff-line-syntax .hljs-built_in,
+[data-theme="purple"] .diff-line-syntax .hljs-meta {
+  color: #ffa657;
+}
+
+[data-theme="dark"] .diff-line-syntax .hljs-comment,
+[data-theme="purple"] .diff-line-syntax .hljs-comment {
+  color: #8b949e;
+  font-style: italic;
+}
+
+/* Light theme syntax palette (GitHub Light inspired) */
+[data-theme="light"] .diff-line-syntax .hljs-keyword,
+[data-theme="light"] .diff-line-syntax .hljs-selector-tag,
+[data-theme="light"] .diff-line-syntax .hljs-literal {
+  color: #cf222e;
+  font-weight: 600;
+}
+
+[data-theme="light"] .diff-line-syntax .hljs-string,
+[data-theme="light"] .diff-line-syntax .hljs-doctag,
+[data-theme="light"] .diff-line-syntax .hljs-regexp {
+  color: #0a3069;
+}
+
+[data-theme="light"] .diff-line-syntax .hljs-title,
+[data-theme="light"] .diff-line-syntax .hljs-title.class_,
+[data-theme="light"] .diff-line-syntax .hljs-title.function_,
+[data-theme="light"] .diff-line-syntax .hljs-function {
+  color: #8250df;
+}
+
+[data-theme="light"] .diff-line-syntax .hljs-variable,
+[data-theme="light"] .diff-line-syntax .hljs-template-variable,
+[data-theme="light"] .diff-line-syntax .hljs-attr,
+[data-theme="light"] .diff-line-syntax .hljs-property {
+  color: #0550ae;
+}
+
+[data-theme="light"] .diff-line-syntax .hljs-number,
+[data-theme="light"] .diff-line-syntax .hljs-type,
+[data-theme="light"] .diff-line-syntax .hljs-built_in,
+[data-theme="light"] .diff-line-syntax .hljs-meta {
+  color: #953800;
+}
+
+[data-theme="light"] .diff-line-syntax .hljs-comment {
+  color: #6e7781;
+  font-style: italic;
+}
 

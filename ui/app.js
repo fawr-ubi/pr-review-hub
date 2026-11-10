@@ -15,24 +15,31 @@ const state = {
   activeFilter: 'open',
   activeRepo: 'all',
   activeAuthor: null,
+  prSortOrder: localStorage.getItem('prHub.prSortOrder') || 'desc', // 'desc' (newest createdAt first) | 'asc' (oldest createdAt first / FIFO)
   searchQuery: '',
   selectedPrKey: initialUrlPrKey,
-  activeTab: initialUrlTab,
+  activeTab: initialUrlTab === 'tree' ? 'overview' : initialUrlTab,
   splitMode: false,
+  splitLeftTab:
+    localStorage.getItem('prHub.splitLeftTab') === 'tree'
+      ? 'overview'
+      : localStorage.getItem('prHub.splitLeftTab') || 'report',
+  splitRightTab:
+    localStorage.getItem('prHub.splitRightTab') === 'tree'
+      ? 'diff'
+      : localStorage.getItem('prHub.splitRightTab') || 'diff',
+  lineRangeAnchor: null, // { filePath, line }
+  isDraggingLineRange: false,
   chatOpen: false,
   chatFindingContext: null,
   chatMessages: [],
   currentReview: null, // { file, archived, markdown, findings }
+  currentOverview: null, // { body, commits, generalComments, reviews, reviewThreads, commitsCount, commentsCount }
+  overviewFilter: 'all', // 'all' | 'comments' | 'commits'
   currentDiff: null, // { files, resolvedFindings }
   selectedDiffFile: null,
   highlightedLine: null,
   selectedCommentCids: new Set(),
-  // Working tree explorer state
-  treeDir: '',
-  treeEntries: [],
-  allRepoFiles: null, // cached recursive list for current PR
-  selectedTreeFile: null,
-  selectedTreeLine: null,
   worktreeStatus: { mounted: false, worktreePath: null },
   // Agent rules state (Tab 5)
   rules: [],
@@ -51,9 +58,299 @@ const state = {
   activeHunkIndex: -1,
   activeFindingIndex: -1,
   diffZoom: Number(localStorage.getItem('prReviewHub.diffZoom')) || 100,
+  fileSidebarWidth: Number(localStorage.getItem('prHub.fileSidebarWidth')) || 320,
+  diffTreeMode: localStorage.getItem('prHub.diffTreeMode') || 'tree', // 'tree' | 'list'
+  diffCollapsedFolders: new Set(),
+  diffFolderFilter: '',
   diffBlobCache: {}, // key: `${prKey}::${filePath}` -> string[] (lines of file at HEAD)
   diffExpandedRanges: {}, // key: `${prKey}::${filePath}` -> Array<{ startRight, endRight, startLeft, endLeft }>
+  prDiffCache: {}, // key: `${prKey}::${headRefOid}` -> diff response
+  prOverviewCache: {}, // key: `${prKey}::${headRefOid}` -> overview response
+  prReviewCache: {}, // key: `${prKey}::${headRefOid}` -> review response
+  _prefetchInFlight: new Set(),
+  keybindings: {},
 };
+
+const DEFAULT_KEYBINDINGS = {
+  openPr: { key: 'Enter', label: 'Open PR on 1. Audit Report' },
+  nextPr: { key: 'j', label: 'Next PR in queue' },
+  prevPr: { key: 'k', label: 'Previous PR in queue' },
+  prQueue: { key: 'q', label: 'Return to full-page PR selection queue (All PRs)' },
+  prevFile: { key: 'ArrowLeft', label: 'Previous modified file (Diff)' },
+  nextFile: { key: 'ArrowRight', label: 'Next modified file (Diff)' },
+  toggleFiles: { key: 'b', label: 'Show / Hide modified files tree on the left' },
+  nextHunk: { key: 'n', label: 'Next Hunk or Finding' },
+  prevHunk: { key: 'p', label: 'Previous Hunk or Finding' },
+  focusDiff: { key: 'z', label: 'Full-screen Focus Diff mode (show/hide PR header)' },
+  openIde: { key: 'i', label: 'Open current file in PhpStorm' },
+  splitMode: { key: 's', label: 'Side-by-side Split Mode (Left / Right pane choice)' },
+  popout: { key: 'o', label: 'Open Diff in a Pop-out window' },
+  agentChat: { key: 'c', label: 'Open Agent Q&A (Enter or Cmd+Enter to send)' },
+  rerunReview: { key: 'r', label: 'Run / Re-run AI review on PR' },
+  openGithub: { key: 'g', label: 'Open Pull Request on GitHub' },
+  publishModal: { key: 'm', label: 'Open Submit Review to GitHub modal' },
+  searchPr: { key: '/', label: 'Search / Filter PRs' },
+  zoomOut: { key: '-', label: 'Zoom out in diff' },
+  zoomIn: { key: '+', label: 'Zoom in in diff' },
+  zoomReset: { key: '0', label: 'Reset diff zoom to 100%' },
+  helpModal: { key: '?', label: 'Show / Customize keyboard shortcuts' },
+  tab1: { key: '1', label: 'Tab 1: Audit Report' },
+  tab2: { key: '2', label: 'Tab 2: Description & Conversation' },
+  tab3: { key: '3', label: 'Tab 3: Git Diff' },
+  tab4: { key: '4', label: 'Tab 4: AI Proposals' },
+  tab5: { key: '5', label: 'Tab 5: Agent Rules' },
+};
+
+function loadSavedKeybindings() {
+  const map = {};
+  for (const [id, def] of Object.entries(DEFAULT_KEYBINDINGS)) {
+    map[id] = def.key;
+  }
+  try {
+    const raw = localStorage.getItem('prHub.keybindings');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        for (const [id, val] of Object.entries(parsed)) {
+          if (DEFAULT_KEYBINDINGS[id] && typeof val === 'string' && val.length > 0) {
+            map[id] = val;
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore invalid JSON
+  }
+  state.keybindings = map;
+  return map;
+}
+
+function saveKeybindings() {
+  try {
+    localStorage.setItem('prHub.keybindings', JSON.stringify(state.keybindings));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+function getKeybind(actionId) {
+  return state.keybindings?.[actionId] || DEFAULT_KEYBINDINGS[actionId]?.key || '';
+}
+
+function formatKeybindLabel(key) {
+  if (!key) return '';
+  if (key === 'ArrowLeft') return '←';
+  if (key === 'ArrowRight') return '→';
+  if (key === 'ArrowUp') return '↑';
+  if (key === 'ArrowDown') return '↓';
+  if (key === 'Enter') return 'Enter';
+  if (key === 'Escape') return 'Esc';
+  if (key === ' ') return 'Space';
+  return key;
+}
+
+function setKeybind(actionId, newKey) {
+  if (!DEFAULT_KEYBINDINGS[actionId] || !newKey) return;
+  const previousKey = getKeybind(actionId);
+  // Swap if another action already uses newKey
+  for (const [otherId, boundKey] of Object.entries(state.keybindings)) {
+    if (otherId !== actionId && boundKey === newKey) {
+      state.keybindings[otherId] = previousKey;
+    }
+  }
+  state.keybindings[actionId] = newKey;
+  saveKeybindings();
+  syncKeybindingLegends();
+}
+
+function resetKeybind(actionId) {
+  if (!DEFAULT_KEYBINDINGS[actionId]) return;
+  setKeybind(actionId, DEFAULT_KEYBINDINGS[actionId].key);
+}
+
+function resetAllKeybindings() {
+  for (const [id, def] of Object.entries(DEFAULT_KEYBINDINGS)) {
+    state.keybindings[id] = def.key;
+  }
+  saveKeybindings();
+  syncKeybindingLegends();
+}
+
+function syncKeybindingLegends() {
+  // Update all <kbd data-kb-id="..."> elements across the UI
+  document.querySelectorAll('[data-kb-id]').forEach((el) => {
+    const kbId = el.dataset.kbId;
+    if (kbId === 'tabRange') {
+      el.textContent = `${formatKeybindLabel(getKeybind('tab1'))}–${formatKeybindLabel(getKeybind('tab5'))}`;
+    } else if (DEFAULT_KEYBINDINGS[kbId]) {
+      el.textContent = formatKeybindLabel(getKeybind(kbId));
+    }
+  });
+
+  const qLbl = formatKeybindLabel(getKeybind('prQueue'));
+  const bLbl = formatKeybindLabel(getKeybind('toggleFiles'));
+  const zLbl = formatKeybindLabel(getKeybind('focusDiff'));
+  const cLbl = formatKeybindLabel(getKeybind('agentChat'));
+  const sLbl = formatKeybindLabel(getKeybind('splitMode'));
+  const pLbl = formatKeybindLabel(getKeybind('prevHunk'));
+  const nLbl = formatKeybindLabel(getKeybind('nextHunk'));
+  const tLbl = formatKeybindLabel(getKeybind('toggleTreeView'));
+  const iLbl = formatKeybindLabel(getKeybind('openIde'));
+  const gLbl = formatKeybindLabel(getKeybind('quickJump'));
+  const prevFileLbl = formatKeybindLabel(getKeybind('prevFile'));
+  const nextFileLbl = formatKeybindLabel(getKeybind('nextFile'));
+
+  const searchInput = document.getElementById('searchInput');
+  if (searchInput) {
+    searchInput.placeholder = `Search by PR number, Jira ticket, title, branch or author name… (shortcut: ${formatKeybindLabel(getKeybind('searchPr'))} · navigate: ${formatKeybindLabel(getKeybind('nextPr'))}/${formatKeybindLabel(getKeybind('prevPr'))} + ${formatKeybindLabel(getKeybind('openPr'))})`;
+  }
+
+  const backBtn = document.getElementById('backToPrQueueBtn');
+  if (backBtn) {
+    backBtn.textContent = `← All PRs (${qLbl})`;
+    backBtn.title = `Return to full-page PR selection queue (shortcut: ${qLbl})`;
+  }
+
+  const toggleTreeBtn = document.getElementById('toggleFileTreeBtn');
+  if (toggleTreeBtn) {
+    toggleTreeBtn.textContent = state.fileTreeCollapsed
+      ? `Show Files (${bLbl})`
+      : `Hide Files (${bLbl})`;
+    toggleTreeBtn.title = `Show / Hide modified files tree on the left (shortcut: ${bLbl})`;
+  }
+
+  const inlineFilesBtn = document.getElementById('diffToggleFilesInlineBtn');
+  if (inlineFilesBtn) {
+    const total = (state.currentDiff?.files || []).length;
+    inlineFilesBtn.textContent = state.fileTreeCollapsed
+      ? `Files (${total}) (${bLbl})`
+      : `Hide Files (${bLbl})`;
+    inlineFilesBtn.title = `Show / Hide modified files tree (shortcut: ${bLbl})`;
+  }
+
+  const inlineFocusBtn = document.getElementById('diffToggleFocusInlineBtn');
+  if (inlineFocusBtn) {
+    inlineFocusBtn.textContent = state.focusDiffMode
+      ? `Exit Focus (${zLbl})`
+      : `Focus (${zLbl})`;
+    inlineFocusBtn.title = `Show / Hide PR header and tabs (shortcut: ${zLbl} or Esc)`;
+  }
+
+  const inlineChatBtn = document.getElementById('diffOpenChatInlineBtn');
+  if (inlineChatBtn) {
+    inlineChatBtn.textContent = `Q&A (${cLbl})`;
+    inlineChatBtn.title = `Ask AI about this file (shortcut: ${cLbl})`;
+  }
+
+  const topChatBtn = document.getElementById('toggleChatDrawerBtn');
+  if (topChatBtn) {
+    topChatBtn.textContent = `Agent Q&A (${cLbl})`;
+    topChatBtn.title = `Ask review agent about this PR (shortcut: ${cLbl})`;
+  }
+
+  const splitBtn = document.getElementById('toggleSplitModeBtn') || document.getElementById('toggleSplitViewBtn');
+  if (splitBtn) {
+    splitBtn.textContent = `Split (${sLbl})`;
+    splitBtn.title = `Side-by-side Report + Diff view (shortcut: ${sLbl})`;
+  }
+
+  const rLbl = formatKeybindLabel(getKeybind('rerunReview'));
+  const oLbl = formatKeybindLabel(getKeybind('popout'));
+  const ghLbl = formatKeybindLabel(getKeybind('openGithub'));
+  const mLbl = formatKeybindLabel(getKeybind('publishModal'));
+
+  const triggerReviewBtn = document.getElementById('triggerReviewBtn');
+  const triggerReviewLabel = document.getElementById('triggerReviewLabel');
+  if (triggerReviewBtn) {
+    triggerReviewBtn.title = `Run or re-run AI review now (shortcut: ${rLbl})`;
+  }
+  if (triggerReviewLabel) {
+    const activePr = state.prs.find((p) => p.key === state.selectedPrKey);
+    if (!activePr?.runningJob) {
+      const baseText = activePr?.hasReviewFile ? 'Re-run Review' : 'Run Review';
+      triggerReviewLabel.textContent = `${baseText} (${rLbl})`;
+    }
+  }
+
+  const popoutBtn = document.getElementById('popoutWorkspaceBtn');
+  if (popoutBtn) {
+    popoutBtn.textContent = `Pop-out (${oLbl}) ↗`;
+    popoutBtn.title = `Open Diff workspace in a separate synchronized window (shortcut: ${oLbl})`;
+  }
+
+  const openGithubBtn = document.getElementById('openGithubPrBtn');
+  if (openGithubBtn) {
+    openGithubBtn.textContent = `GitHub (${ghLbl}) ↗`;
+    openGithubBtn.title = `Open Pull Request on GitHub (shortcut: ${ghLbl})`;
+  }
+
+  const submitReviewBtn = document.getElementById('openBatchReviewModalBtn');
+  if (submitReviewBtn) {
+    submitReviewBtn.textContent = `Submit Review (${mLbl})`;
+    submitReviewBtn.title = `Open Submit Review to GitHub modal (shortcut: ${mLbl})`;
+  }
+
+  const prevFileBtn = document.getElementById('diffPrevFileBtn');
+  if (prevFileBtn) prevFileBtn.title = `Previous file (${prevFileLbl})`;
+  const nextFileBtn = document.getElementById('diffNextFileBtn');
+  if (nextFileBtn) nextFileBtn.title = `Next file (${nextFileLbl})`;
+  const prevHunkBtn = document.getElementById('diffPrevHunkBtn');
+  if (prevHunkBtn) prevHunkBtn.title = `Previous Hunk / Finding (shortcut: ${pLbl})`;
+  const nextHunkBtn = document.getElementById('diffNextHunkBtn');
+  if (nextHunkBtn) nextHunkBtn.title = `Next Hunk / Finding (shortcut: ${nLbl})`;
+}
+
+function applySidebarWidthVariables(widthPx = state.fileSidebarWidth) {
+  const clamped = Math.max(200, Math.min(780, Number(widthPx) || 320));
+  state.fileSidebarWidth = clamped;
+  try {
+    localStorage.setItem('prHub.fileSidebarWidth', String(clamped));
+  } catch {
+    // Ignore storage quota errors
+  }
+  document.documentElement.style.setProperty('--file-sidebar-width', `${clamped}px`);
+}
+
+function initSidebarResizers() {
+  const resizers = [
+    document.getElementById('diffSidebarResizer'),
+    document.getElementById('treeSidebarResizer'),
+  ].filter(Boolean);
+
+  resizers.forEach((resizer) => {
+    resizer.addEventListener('mousedown', (startEvent) => {
+      startEvent.preventDefault();
+      resizer.classList.add('resizing');
+      const startX = startEvent.clientX;
+      const startWidth = state.fileSidebarWidth || 320;
+
+      const onMouseMove = (moveEvent) => {
+        const deltaX = moveEvent.clientX - startX;
+        applySidebarWidthVariables(startWidth + deltaX);
+      };
+
+      const onMouseUp = () => {
+        resizer.classList.remove('resizing');
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+      };
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    });
+
+    resizer.addEventListener('dblclick', () => {
+      // Auto-fit to longest file path or toggle between 320px and 480px
+      const files = state.currentDiff?.files || [];
+      const maxLen = files.reduce(
+        (acc, f) => Math.max(acc, f.filename.replace(/^projects\/services\//, '').length),
+        32
+      );
+      const target = state.fileSidebarWidth > 420 ? 320 : Math.min(680, Math.max(420, maxLen * 7.2));
+      applySidebarWidthVariables(Math.round(target));
+    });
+  });
+}
 
 function applyDiffZoomVariables(zoomPct = state.diffZoom) {
   const clamped = Math.max(60, Math.min(180, Number(zoomPct) || 100));
@@ -80,9 +377,9 @@ function adjustDiffZoom(stepDelta) {
 
 const THEME_ORDER = ['light', 'purple', 'dark'];
 const THEME_LABELS = {
-  light: 'Clair',
-  purple: 'Lavande (Purple)',
-  dark: 'Sombre',
+  light: 'Light',
+  purple: 'Lavender (Purple)',
+  dark: 'Dark',
 };
 
 function applySavedTheme(themeName) {
@@ -95,8 +392,12 @@ function applySavedTheme(themeName) {
   }
 }
 
+loadSavedKeybindings();
 applySavedTheme(localStorage.getItem('prReviewHub.theme') || 'dark');
 applyDiffZoomVariables(state.diffZoom);
+applySidebarWidthVariables(state.fileSidebarWidth);
+initSidebarResizers();
+syncKeybindingLegends();
 
 if (isPopoutWindow) {
   document.getElementById('appShell')?.classList.add('popout-mode');
@@ -217,7 +518,7 @@ function formatShortFilePath(filePath, startLine = null) {
 }
 
 function isActionablePr(pr) {
-  if (pr.isArchived) return false;
+  if (pr.isArchived || pr.isDraft) return false;
   const status = String(pr.reviewStatus || '');
   const sync = String(pr.syncStatus || '');
   const summary = String(pr.findingsSummary || '');
@@ -246,7 +547,7 @@ function scheduleJobPollingIfNeeded() {
         if (state.selectedPrKey) {
           selectPr(state.selectedPrKey, false);
         }
-        showToast('Audit IA terminé.');
+        showToast('AI review completed.');
       }
     }, 3000);
   }
@@ -293,22 +594,107 @@ async function loadState(preserveSelection = true) {
     }
   }
   renderCollapsibleLayoutState();
+  scheduleClientPrPrefetch();
+}
+
+function getPrClientCacheKey(pr) {
+  if (!pr || !pr.key) return '';
+  return `${pr.key}::${pr.headRefOid || pr.lastReviewedSha || 'latest'}`;
+}
+
+async function prefetchPrData(pr) {
+  if (!pr || !pr.key || pr.isArchived) return;
+  const cacheKey = getPrClientCacheKey(pr);
+  if (!cacheKey || state._prefetchInFlight.has(cacheKey)) return;
+
+  const needReview = pr.reviewFile && !state.prReviewCache[cacheKey];
+  const needDiff = !state.prDiffCache[cacheKey];
+  const needOverview = !state.prOverviewCache[cacheKey];
+  if (!needReview && !needDiff && !needOverview) return;
+
+  state._prefetchInFlight.add(cacheKey);
+  try {
+    const tasks = [];
+    if (needReview) {
+      tasks.push(
+        fetch(
+          `/api/review?file=${encodeURIComponent(pr.reviewFile)}&key=${encodeURIComponent(pr.key)}`
+        )
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => {
+            if (d) state.prReviewCache[cacheKey] = d;
+          })
+          .catch(() => {})
+      );
+    }
+    if (needDiff) {
+      tasks.push(
+        fetch(
+          `/api/diff?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&reviewFile=${encodeURIComponent(pr.reviewFile || '')}`
+        )
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => {
+            if (d) state.prDiffCache[cacheKey] = d;
+          })
+          .catch(() => {})
+      );
+    }
+    if (needOverview) {
+      tasks.push(
+        fetch(
+          `/api/github/overview?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}`
+        )
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => {
+            if (d && !d.offlineError) state.prOverviewCache[cacheKey] = d;
+          })
+          .catch(() => {})
+      );
+    }
+    await Promise.all(tasks);
+  } finally {
+    state._prefetchInFlight.delete(cacheKey);
+  }
+}
+
+let clientPrefetchRunning = false;
+
+async function scheduleClientPrPrefetch() {
+  if (clientPrefetchRunning) return;
+  const candidates = getFilteredPrs()
+    .filter((p) => !p.isArchived)
+    .slice(0, 12);
+  if (candidates.length === 0) return;
+
+  clientPrefetchRunning = true;
+  try {
+    for (const pr of candidates) {
+      await prefetchPrData(pr);
+    }
+  } finally {
+    clientPrefetchRunning = false;
+  }
 }
 
 function updateFilterCounts() {
   const openPrs = state.prs.filter((p) => !p.isArchived);
-  document.getElementById('count-open').textContent = openPrs.length;
-  document.getElementById('count-actionable').textContent = openPrs.filter(isActionablePr).length;
-  document.getElementById('count-peer').textContent = openPrs.filter((p) => p.reviewMode === 'Peer-Review').length;
-  document.getElementById('count-self').textContent = openPrs.filter((p) => p.reviewMode === 'Self-Review').length;
-  document.getElementById('count-archived').textContent = state.prs.filter((p) => p.isArchived).length;
+  const nonDraftOpenPrs = openPrs.filter((p) => !p.isDraft);
+  document.getElementById('count-open').textContent = nonDraftOpenPrs.length;
+  document.getElementById('count-actionable').textContent = nonDraftOpenPrs.filter(isActionablePr).length;
+  document.getElementById('count-peer').textContent = nonDraftOpenPrs.filter((p) => p.reviewMode === 'Peer-Review').length;
+  document.getElementById('count-self').textContent = nonDraftOpenPrs.filter((p) => p.reviewMode === 'Self-Review').length;
+  const draftCountEl = document.getElementById('count-draft');
+  if (draftCountEl) {
+    draftCountEl.textContent = openPrs.filter((p) => Boolean(p.isDraft)).length;
+  }
+  document.getElementById('count-archived').textContent = state.prs.filter((p) => p.isArchived && !p.isDraft).length;
 }
 
 function renderRepoPills() {
   const container = document.getElementById('repoFilterPills');
   const repos = [...new Set(state.prs.map((p) => p.repo).filter(Boolean))];
   const pillsHtml = [
-    `<button class="repo-pill ${state.activeRepo === 'all' ? 'active' : ''}" data-repo="all">Tous les dépôts</button>`,
+    `<button class="repo-pill ${state.activeRepo === 'all' ? 'active' : ''}" data-repo="all">All repositories</button>`,
     ...repos.map(
       (r) =>
         `<button class="repo-pill ${state.activeRepo === r ? 'active' : ''}" data-repo="${escapeHtml(r)}">${escapeHtml(r)}</button>`
@@ -325,20 +711,25 @@ function renderRepoPills() {
   });
 }
 
-function formatRelativeAgeFr(isoDate) {
+function formatRelativeAgeFr(isoDate, prefix = 'Updated') {
   if (!isoDate) return '';
   const ts = Date.parse(isoDate);
   if (Number.isNaN(ts)) return '';
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (diffSec < 60) return "Mis à jour à l'instant";
+  const p = prefix ? `${prefix} ` : '';
+  if (diffSec < 60) return `${p}just now`;
   const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `Mis à jour il y a ${diffMin} ${diffMin > 1 ? 'minutes' : 'minute'}`;
+  if (diffMin < 60) return `${p}${diffMin} ${diffMin > 1 ? 'minutes' : 'minute'} ago`;
   const diffHours = Math.floor(diffMin / 60);
-  if (diffHours < 24) return `Mis à jour il y a ${diffHours} ${diffHours > 1 ? 'heures' : 'heure'}`;
+  if (diffHours < 24) return `${p}${diffHours} ${diffHours > 1 ? 'hours' : 'hour'} ago`;
   const diffDays = Math.floor(diffHours / 24);
-  if (diffDays < 30) return `Mis à jour il y a ${diffDays} ${diffDays > 1 ? 'jours' : 'jour'}`;
+  if (diffDays < 30) return `${p}${diffDays} ${diffDays > 1 ? 'days' : 'day'} ago`;
   const diffMonths = Math.floor(diffDays / 30);
-  return `Mis à jour il y a ${diffMonths} mois`;
+  return `${p}${diffMonths} ${diffMonths > 1 ? 'months' : 'month'} ago`;
+}
+
+function formatRelativeTime(isoDate) {
+  return formatRelativeAgeFr(isoDate, '');
 }
 
 function renderAuthorFilterBar() {
@@ -352,16 +743,31 @@ function renderAuthorFilterBar() {
   bar.classList.remove('hidden');
   const matchPr = state.prs.find((p) => p.author === state.activeAuthor);
   const displayName = matchPr?.authorDisplayName || `@${state.activeAuthor}`;
-  label.textContent = `Filtre auteur : ${displayName}`;
+  label.textContent = `Author filter: ${displayName}`;
+}
+
+function syncPrSortOrderButton() {
+  const btn = document.getElementById('prSortOrderBtn');
+  if (!btn) return;
+  if (state.prSortOrder === 'asc') {
+    btn.innerHTML = `Opened Date &uarr; (Oldest / FIFO)`;
+  } else {
+    btn.innerHTML = `Opened Date &darr; (Newest)`;
+  }
 }
 
 function getFilteredPrs() {
-  return state.prs.filter((pr) => {
-    if (state.activeFilter === 'open' && pr.isArchived) return false;
-    if (state.activeFilter === 'actionable' && !isActionablePr(pr)) return false;
-    if (state.activeFilter === 'peer' && (pr.isArchived || pr.reviewMode !== 'Peer-Review')) return false;
-    if (state.activeFilter === 'self' && (pr.isArchived || pr.reviewMode !== 'Self-Review')) return false;
-    if (state.activeFilter === 'archived' && !pr.isArchived) return false;
+  const filtered = state.prs.filter((pr) => {
+    if (state.activeFilter === 'draft') {
+      if (pr.isArchived || !pr.isDraft) return false;
+    } else {
+      if (pr.isDraft) return false;
+      if (state.activeFilter === 'open' && pr.isArchived) return false;
+      if (state.activeFilter === 'actionable' && !isActionablePr(pr)) return false;
+      if (state.activeFilter === 'peer' && (pr.isArchived || pr.reviewMode !== 'Peer-Review')) return false;
+      if (state.activeFilter === 'self' && (pr.isArchived || pr.reviewMode !== 'Self-Review')) return false;
+      if (state.activeFilter === 'archived' && !pr.isArchived) return false;
+    }
 
     if (state.activeRepo !== 'all' && pr.repo !== state.activeRepo) return false;
     if (state.activeAuthor && pr.author !== state.activeAuthor) return false;
@@ -371,19 +777,65 @@ function getFilteredPrs() {
       const approvers = (pr.approvedBy || []).join(' ');
       const pending = (pr.pendingReviewers || []).join(' ');
       const labels = (pr.labels || []).map((l) => l.name).join(' ');
-      const hay = `${pr.key} ${pr.title} ${pr.author} ${pr.authorDisplayName || ''} ${pr.jiraKey || ''} ${pr.headRefName || ''} ${approvers} ${pending} ${labels}`.toLowerCase();
+      const owners = (pr.requiredOwnerTeams || []).map((t) => t.teamSlug).join(' ');
+      const draftToken = pr.isDraft ? 'draft brouillon' : '';
+      const mergeableToken = pr.mergeReadiness?.isMergeable ? 'mergeable prete' : '';
+      const hay = `${pr.key} ${pr.title} ${pr.author} ${pr.authorDisplayName || ''} ${pr.jiraKey || ''} ${pr.headRefName || ''} ${approvers} ${pending} ${labels} ${owners} ${draftToken} ${mergeableToken}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
   });
+
+  filtered.sort((a, b) => {
+    if (a.isArchived !== b.isArchived) return a.isArchived ? 1 : -1;
+    const dateA = String(a.createdAt || a.updatedAt || '');
+    const dateB = String(b.createdAt || b.updatedAt || '');
+    return state.prSortOrder === 'asc'
+      ? dateA.localeCompare(dateB)
+      : dateB.localeCompare(dateA);
+  });
+
+  return filtered;
+}
+
+function renderCodeOwnerTagsHtml(pr) {
+  const teams = Array.isArray(pr.requiredOwnerTeams) ? pr.requiredOwnerTeams : [];
+  if (teams.length === 0) return '';
+  return teams
+    .map((t) => {
+      if (t.approved) {
+        const who = Array.isArray(t.approvedBy) && t.approvedBy.length > 0 ? ` (${t.approvedBy.join(', ')})` : '';
+        return `<span class="pr-owner-tag owner-approved" title="Responsible owner team (${escapeHtml(t.teamSlug)}) — Approved by ${escapeHtml((t.approvedBy || []).join(', '))}">Owner: ${escapeHtml(t.teamSlug)} &check;${escapeHtml(who)}</span>`;
+      }
+      return `<span class="pr-owner-tag owner-pending" title="Waiting for at least 1 approval from a member of responsible team ${escapeHtml(t.teamSlug)} (CODEOWNERS)">Owner: ${escapeHtml(t.teamSlug)} (pending)</span>`;
+    })
+    .join('');
+}
+
+function renderMergeableTagHtml(pr, asBadge = false) {
+  const mr = pr.mergeReadiness;
+  if (!mr) {
+    if (pr.mergeable === 'CONFLICTING') {
+      return `<span class="${asBadge ? 'badge badge-severity-blocker' : 'pr-tag pr-tag-conflict'}">Git conflict</span>`;
+    }
+    return '';
+  }
+  if (mr.isMergeable) {
+    return `<span class="${asBadge ? 'badge badge-mergeable-ok' : 'pr-tag pr-tag-mergeable-ok'}" title="Ready to merge: Non-Draft, no Git conflict, CODEOWNERS team(s) approved, and CI passing">Mergeable &check;</span>`;
+  }
+  const reasons = Array.isArray(mr.blockingReasons) && mr.blockingReasons.length > 0
+    ? mr.blockingReasons.join(' · ')
+    : 'Requirements not met';
+  return `<span class="${asBadge ? 'badge badge-mergeable-blocked' : 'pr-tag pr-tag-mergeable-blocked'}" title="Not mergeable: ${escapeHtml(reasons)}">Not mergeable: ${escapeHtml(reasons)}</span>`;
 }
 
 function renderPrList() {
+  syncPrSortOrderButton();
   const listEl = document.getElementById('prList');
   const filtered = getFilteredPrs();
 
   if (filtered.length === 0) {
-    listEl.innerHTML = `<div class="empty-state meta-text" style="padding:20px;text-align:center;">Aucune PR pour ce filtre.</div>`;
+    listEl.innerHTML = `<div class="empty-state meta-text" style="padding:20px;text-align:center;">No PRs match this filter.</div>`;
     return;
   }
 
@@ -391,38 +843,41 @@ function renderPrList() {
     .map((pr) => {
       const isSelected = pr.key === state.selectedPrKey;
       const statusClass = getCardStatusClass(pr);
-      const authorFullLabel = pr.authorDisplayName || `@${pr.author || 'inconnu'}`;
+      const authorFullLabel = pr.authorDisplayName || `@${pr.author || 'unknown'}`;
       const isAuthorActive = state.activeAuthor === pr.author;
 
+      const draftBadge = pr.isDraft
+        ? `<span class="badge badge-draft" title="Draft Pull Request — Automatic AI review paused">Draft</span>`
+        : '';
       const modeBadge = `<span class="badge">${escapeHtml(pr.reviewMode === 'Self-Review' ? 'Self-Review' : 'Peer-Review')}</span>`;
       const jiraBadge =
         pr.jiraKey && pr.jiraKey !== '—'
           ? `<span class="badge">Ticket ${escapeHtml(pr.jiraKey)}</span>`
           : '';
       const stackBadge = pr.isStacked
-        ? `<span class="badge badge-severity-major" title="Branche cible : ${escapeHtml(pr.baseRefName)}">Branche empilée → ${escapeHtml(pr.baseRefName)}</span>`
+        ? `<span class="badge badge-severity-major" title="Target branch: ${escapeHtml(pr.baseRefName)}">Stacked branch → ${escapeHtml(pr.baseRefName)}</span>`
         : '';
       const ciBadge =
         pr.ciStatus === 'PASS'
-          ? `<span class="badge badge-severity-ok">CI : Succès</span>`
+          ? `<span class="badge badge-severity-ok">CI: Success</span>`
           : pr.ciStatus === 'FAIL'
-          ? `<span class="badge badge-severity-blocker">CI : Échec</span>`
+          ? `<span class="badge badge-severity-blocker">CI: Failure</span>`
           : pr.ciStatus === 'PENDING'
-          ? `<span class="badge">CI : En attente</span>`
+          ? `<span class="badge">CI: Pending</span>`
           : '';
-      const wtBadge = pr.worktreeMounted ? `<span class="badge badge-severity-ok" title="Worktree monté localement">Worktree monté</span>` : '';
+      const wtBadge = pr.worktreeMounted ? `<span class="badge badge-severity-ok" title="Worktree mounted locally">Worktree mounted</span>` : '';
 
       const postedInfo =
         pr.findingsCount > 0
-          ? `<span class="badge" title="Commentaires publiés sur GitHub">${pr.postedCount}/${pr.findingsCount} commentaires postés</span>`
+          ? `<span class="badge" title="Comments posted on GitHub">${pr.postedCount}/${pr.findingsCount} comments posted</span>`
           : '';
 
-      const needsRun = pr.syncStatus === 'NEEDS_REVIEW' || pr.syncStatus === 'NEEDS_UPDATE';
+      const needsRun = pr.syncStatus === 'NEEDS_REVIEW' || pr.syncStatus === 'NEEDS_UPDATE' || pr.syncStatus === 'DRAFT';
       const quickRunBtn = pr.runningJob
-        ? `<span class="badge"><span class="spinner"></span> Audit IA en cours…</span>`
+        ? `<span class="badge"><span class="spinner"></span> AI Review running…</span>`
         : needsRun
-        ? `<button class="btn btn-secondary btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Lancer l'audit IA maintenant">Lancer l'audit IA</button>`
-        : `<button class="btn btn-secondary btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Relancer l'audit IA">Relancer l'audit</button>`;
+        ? `<button class="btn btn-secondary btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Run AI review now">Run AI Review</button>`
+        : `<button class="btn btn-secondary btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Re-run AI review">Re-run Review</button>`;
 
       const cleanStatus = formatCleanStatus(pr.reviewStatus);
       const cleanSummary = formatCleanSummary(pr.findingsSummary);
@@ -433,45 +888,55 @@ function renderPrList() {
 
       // Detailed PR metadata & review tags
       const detailTags = [];
+      const mergeableTag = renderMergeableTagHtml(pr, false);
+      if (mergeableTag) {
+        detailTags.push(mergeableTag);
+      }
+      const codeOwnerTags = renderCodeOwnerTagsHtml(pr);
+      if (codeOwnerTags) {
+        detailTags.push(codeOwnerTags);
+      }
+      if (pr.mergeable === 'CONFLICTING') {
+        detailTags.push(`<span class="pr-tag pr-tag-conflict">Git conflict</span>`);
+      }
       if (Array.isArray(pr.approvedBy) && pr.approvedBy.length > 0) {
         detailTags.push(
-          `<span class="pr-tag pr-tag-approved">Approuvé par : ${escapeHtml(pr.approvedBy.join(', '))}</span>`
+          `<span class="pr-tag pr-tag-approved">Approved by: ${escapeHtml(pr.approvedBy.join(', '))}</span>`
         );
       }
       if (Array.isArray(pr.changesRequestedBy) && pr.changesRequestedBy.length > 0) {
         detailTags.push(
-          `<span class="pr-tag pr-tag-changes">Changements demandés par : ${escapeHtml(pr.changesRequestedBy.join(', '))}</span>`
+          `<span class="pr-tag pr-tag-changes">Changes requested by: ${escapeHtml(pr.changesRequestedBy.join(', '))}</span>`
         );
       }
       if (Array.isArray(pr.commentedBy) && pr.commentedBy.length > 0) {
         detailTags.push(
-          `<span class="pr-tag">Commenté par : ${escapeHtml(pr.commentedBy.join(', '))}</span>`
+          `<span class="pr-tag">Commented by: ${escapeHtml(pr.commentedBy.join(', '))}</span>`
         );
       }
       if (Array.isArray(pr.pendingReviewers) && pr.pendingReviewers.length > 0) {
         detailTags.push(
-          `<span class="pr-tag pr-tag-pending">En attente de : ${escapeHtml(pr.pendingReviewers.join(', '))}</span>`
+          `<span class="pr-tag pr-tag-pending">Waiting for: ${escapeHtml(pr.pendingReviewers.join(', '))}</span>`
         );
       }
       if (typeof pr.changedFiles === 'number') {
-        const fileWord = pr.changedFiles > 1 ? 'fichiers' : 'fichier';
+        const fileWord = pr.changedFiles > 1 ? 'files' : 'file';
         detailTags.push(
           `<span class="pr-tag pr-tag-diffstat">${pr.changedFiles} ${fileWord} · <span class="add-stat">+${pr.additions ?? 0}</span> / <span class="del-stat">-${pr.deletions ?? 0}</span></span>`
         );
       }
-      if (pr.mergeable === 'CONFLICTING') {
-        detailTags.push(`<span class="pr-tag pr-tag-conflict">Conflit Git</span>`);
-      } else if (pr.mergeable === 'MERGEABLE') {
-        detailTags.push(`<span class="pr-tag pr-tag-mergeable">Fusionnable</span>`);
-      }
       if (Array.isArray(pr.labels) && pr.labels.length > 0) {
         for (const lbl of pr.labels) {
           if (lbl?.name) {
-            detailTags.push(`<span class="pr-tag">Label : ${escapeHtml(lbl.name)}</span>`);
+            detailTags.push(`<span class="pr-tag">Label: ${escapeHtml(lbl.name)}</span>`);
           }
         }
       }
-      const relativeAge = formatRelativeAgeFr(pr.updatedAt);
+      const openedAge = formatRelativeAgeFr(pr.createdAt, 'Opened');
+      if (openedAge) {
+        detailTags.push(`<span class="pr-tag" title="Opened at: ${escapeHtml(pr.createdAt || '')}">${escapeHtml(openedAge)}</span>`);
+      }
+      const relativeAge = formatRelativeAgeFr(pr.updatedAt, 'Updated');
       if (relativeAge) {
         detailTags.push(`<span class="pr-tag">${escapeHtml(relativeAge)}</span>`);
       }
@@ -486,7 +951,8 @@ function renderPrList() {
           <div class="pr-card-top">
             <div class="pr-card-identity">
               <span class="pr-card-key">${escapeHtml(pr.repo)} #${pr.number}</span>
-              <span class="pr-author-pill author-badge ${isAuthorActive ? 'active' : ''}" data-author="${escapeHtml(pr.author)}" title="Cliquer pour filtrer par auteur (@${escapeHtml(pr.author)})">
+              ${draftBadge}
+              <span class="pr-author-pill author-badge ${isAuthorActive ? 'active' : ''}" data-author="${escapeHtml(pr.author)}" title="Click to filter by author (@${escapeHtml(pr.author)})">
                 <span class="author-full-name">${escapeHtml(authorFullLabel)}</span>
               </span>
               ${modeBadge}
@@ -510,8 +976,8 @@ function renderPrList() {
               ${postedInfo}
             </div>
             <div class="pr-card-actions">
-              <button class="btn btn-secondary btn-xs card-open-report-btn" data-key="${escapeHtml(pr.key)}" title="Ouvrir le rapport d'audit complet">Lire Audit</button>
-              <button class="btn btn-primary btn-xs card-open-diff-btn" data-key="${escapeHtml(pr.key)}" title="Se lancer dans la review du code avec uniquement la liste des fichiers modifiés à gauche">Ouvrir Diff</button>
+              <button class="btn btn-primary btn-xs card-open-report-btn" data-key="${escapeHtml(pr.key)}" title="Open full audit report (default click action)">Read Audit</button>
+              <button class="btn btn-secondary btn-xs card-open-diff-btn" data-key="${escapeHtml(pr.key)}" title="Open 3. Git Diff tab">Open Diff</button>
               ${quickRunBtn}
             </div>
           </div>
@@ -521,6 +987,12 @@ function renderPrList() {
     .join('');
 
   listEl.querySelectorAll('.pr-card').forEach((card) => {
+    card.addEventListener('mouseenter', () => {
+      const hoverPr = state.prs.find((p) => p.key === card.dataset.key);
+      if (hoverPr) {
+        prefetchPrData(hoverPr);
+      }
+    });
     card.addEventListener('click', (e) => {
       if (
         e.target.closest('.author-badge') ||
@@ -530,7 +1002,7 @@ function renderPrList() {
       ) {
         return;
       }
-      enterPrReviewWorkspace(card.dataset.key, null);
+      enterPrReviewWorkspace(card.dataset.key, 'report');
     });
   });
 
@@ -564,6 +1036,9 @@ function renderPrList() {
       await triggerManualReviewForKey(btn.dataset.key);
     });
   });
+
+  const activeCard = listEl.querySelector('.pr-card.active');
+  activeCard?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
 function renderTopbar(pr) {
@@ -571,6 +1046,10 @@ function renderTopbar(pr) {
   document.getElementById('prContentArea').classList.remove('hidden');
 
   document.getElementById('prRepoBadge').textContent = `${pr.repo} #${pr.number}`;
+  const draftBadgeEl = document.getElementById('prDraftBadge');
+  if (draftBadgeEl) {
+    draftBadgeEl.classList.toggle('hidden', !pr.isDraft);
+  }
   const authorBadgeEl = document.getElementById('prAuthorBadge');
   if (authorBadgeEl) {
     authorBadgeEl.textContent = pr.authorDisplayName || (pr.author ? `@${pr.author}` : '');
@@ -579,6 +1058,20 @@ function renderTopbar(pr) {
   const modeBadge = document.getElementById('prModeBadge');
   modeBadge.textContent = pr.reviewMode === 'Self-Review' ? 'Self-Review' : 'Peer-Review';
   modeBadge.className = 'badge';
+
+  const mergeableBadgeEl = document.getElementById('prMergeableBadge');
+  if (mergeableBadgeEl) {
+    if (pr.mergeReadiness) {
+      mergeableBadgeEl.outerHTML = `<span id="prMergeableBadge">${renderMergeableTagHtml(pr, true)}</span>`;
+    } else {
+      mergeableBadgeEl.classList.add('hidden');
+    }
+  }
+
+  const codeOwnersEl = document.getElementById('prCodeOwnersBadges');
+  if (codeOwnersEl) {
+    codeOwnersEl.innerHTML = renderCodeOwnerTagsHtml(pr);
+  }
 
   const verdictEl = document.getElementById('prVerdictBadge');
   const cleanVerdict = formatCleanStatus(pr.reviewStatus || pr.state || 'OPEN');
@@ -598,10 +1091,10 @@ function renderTopbar(pr) {
     if (pr.ciStatus && pr.ciStatus !== 'NONE') {
       ciEl.textContent =
         pr.ciStatus === 'PASS'
-          ? 'CI : Succès'
+          ? 'CI: Success'
           : pr.ciStatus === 'FAIL'
-          ? 'CI : Échec'
-          : 'CI : En attente';
+          ? 'CI: Failure'
+          : 'CI: Pending';
       ciEl.className = `badge badge-mono ${
         pr.ciStatus === 'PASS'
           ? 'badge-severity-ok'
@@ -618,7 +1111,7 @@ function renderTopbar(pr) {
   const stackEl = document.getElementById('prStackBadge');
   if (stackEl) {
     if (pr.isStacked) {
-      stackEl.textContent = `Branche empilée → ${pr.baseRefName}`;
+      stackEl.textContent = `Stacked branch → ${pr.baseRefName}`;
       stackEl.classList.remove('hidden');
     } else {
       stackEl.classList.add('hidden');
@@ -646,12 +1139,15 @@ function renderTopbar(pr) {
   // Review trigger button state
   const reviewSpinner = document.getElementById('reviewJobSpinner');
   const reviewLabel = document.getElementById('triggerReviewLabel');
+  const rLbl = formatKeybindLabel(getKeybind('rerunReview'));
   if (pr.runningJob) {
     reviewSpinner?.classList.remove('hidden');
-    if (reviewLabel) reviewLabel.textContent = 'Audit IA en cours…';
+    if (reviewLabel) reviewLabel.textContent = 'AI Review running…';
   } else {
     reviewSpinner?.classList.add('hidden');
-    if (reviewLabel) reviewLabel.textContent = pr.hasReviewFile ? "Relancer l'audit" : "Lancer l'audit";
+    if (reviewLabel) {
+      reviewLabel.textContent = `${pr.hasReviewFile ? 'Re-run Review' : 'Run Review'} (${rLbl})`;
+    }
   }
 
   renderWorktreeStatusBar(pr);
@@ -665,35 +1161,36 @@ function renderWorktreeStatusBar(pr) {
 
   const isMounted = Boolean(state.worktreeStatus?.mounted || pr?.worktreeMounted);
   if (isMounted) {
-    badge.textContent = 'Worktree : Monté';
+    badge.textContent = 'Worktree: Mounted';
     badge.className = 'badge badge-mono badge-severity-ok';
     badge.title = state.worktreeStatus?.worktreePath || pr?.worktreePath || '';
-    mountBtn.textContent = 'Synchroniser Worktree';
+    mountBtn.textContent = 'Sync Worktree';
     unmountBtn.classList.remove('hidden');
   } else {
-    badge.textContent = 'Worktree : Git direct';
+    badge.textContent = 'Worktree: Direct Git';
     badge.className = 'badge badge-mono';
-    badge.title = 'Exploration directe via Git (cliquer sur Monter Worktree pour créer un dossier worktree isolé)';
-    mountBtn.textContent = 'Monter Worktree';
+    badge.title = 'Direct Git exploration (click Mount Worktree to create an isolated worktree folder)';
+    mountBtn.textContent = 'Mount Worktree';
     unmountBtn.classList.add('hidden');
   }
 }
 
 async function selectPr(prKey, broadcast = true) {
   state.selectedPrKey = prKey;
-  state.currentReview = null;
-  state.currentDiff = null;
+  state.overviewFilter = 'all';
   state.selectedDiffFile = null;
   state.highlightedLine = null;
-  state.treeDir = '';
-  state.treeEntries = [];
-  state.allRepoFiles = null;
-  state.selectedTreeFile = null;
+  state.diffFolderFilter = '';
   state.chatFindingContext = null;
   renderPrList();
 
   const pr = state.prs.find((p) => p.key === prKey);
   if (!pr) return;
+
+  const cacheKey = getPrClientCacheKey(pr);
+  state.currentReview = state.prReviewCache[cacheKey] || null;
+  state.currentOverview = state.prOverviewCache[cacheKey] || null;
+  state.currentDiff = state.prDiffCache[cacheKey] || null;
 
   state.worktreeStatus = {
     mounted: Boolean(pr.worktreeMounted),
@@ -701,10 +1198,37 @@ async function selectPr(prKey, broadcast = true) {
   };
 
   renderTopbar(pr);
-  document.getElementById('tabFilesCount').textContent = '…';
+  document.getElementById('tabFilesCount').textContent = state.currentDiff
+    ? (state.currentDiff.files || []).length
+    : (pr.changedFiles ?? '…');
+  const commitsBadge = document.getElementById('tabOverviewCommitsCount');
+  const commentsBadge = document.getElementById('tabOverviewCommentsCount');
+  if (commitsBadge) {
+    const cCount = state.currentOverview?.commitsCount ?? pr.commitsCount ?? '…';
+    commitsBadge.textContent = `${cCount} commit${cCount === 1 ? '' : 's'}`;
+  }
+  if (commentsBadge) {
+    const gCount = state.currentOverview?.commentsCount ?? pr.githubCommentsCount ?? '…';
+    commentsBadge.textContent = `${gCount} comment${gCount === 1 ? '' : 's'}`;
+  }
 
   if (broadcast && syncChannel) {
     syncChannel.postMessage({ type: 'SELECT_PR', prKey });
+  }
+
+  loadDiffForCurrentPr(pr);
+  loadPrOverview(pr, false);
+  if (state.chatOpen) {
+    loadChatForCurrentPr(pr);
+  }
+
+  if (state.currentReview) {
+    state.selectedCommentCids = new Set(
+      (state.currentReview.findings || []).filter((f) => !f.posted && !f.dismissed).map((f) => f.cid)
+    );
+    renderReportFindingsQuickBar();
+    renderMarkdownReport(state.currentReview.markdown);
+    renderFindingsTab();
   }
 
   if (pr.reviewFile) {
@@ -712,17 +1236,22 @@ async function selectPr(prKey, broadcast = true) {
       `/api/review?file=${encodeURIComponent(pr.reviewFile)}&key=${encodeURIComponent(pr.key)}`
     );
     if (res.ok) {
-      state.currentReview = await res.json();
+      const reviewData = await res.json();
+      state.prReviewCache[cacheKey] = reviewData;
+      if (state.selectedPrKey !== pr.key) return;
+      state.currentReview = reviewData;
       state.selectedCommentCids = new Set(
         state.currentReview.findings.filter((f) => !f.posted && !f.dismissed).map((f) => f.cid)
       );
       renderReportFindingsQuickBar();
       renderMarkdownReport(state.currentReview.markdown);
       renderFindingsTab();
-    } else {
+    } else if (state.selectedPrKey !== pr.key) {
+      return;
+    } else if (!state.currentReview) {
       document.getElementById('reportExecutiveHeader')?.classList.add('hidden');
       document.getElementById('reportFindingsQuickBar')?.classList.add('hidden');
-      document.getElementById('markdownContainer').innerHTML = `<div class="empty-state meta-text">Fichier de review introuvable (${escapeHtml(pr.reviewFile)}).</div>`;
+      document.getElementById('markdownContainer').innerHTML = `<div class="empty-state meta-text">Review file not found (${escapeHtml(pr.reviewFile)}).</div>`;
       document.getElementById('findingsList').innerHTML = '';
       document.getElementById('tabFindingsCount').textContent = '0';
     }
@@ -731,25 +1260,39 @@ async function selectPr(prKey, broadcast = true) {
     document.getElementById('reportFindingsQuickBar')?.classList.add('hidden');
     document.getElementById('markdownContainer').innerHTML = `
       <div class="empty-card" style="margin:40px auto;">
-        <h3>Aucun fichier de review local</h3>
-        <p class="meta-text" style="margin-bottom:14px;">Statut : ${escapeHtml(formatCleanStatus(pr.reviewStatus || pr.syncStatus || 'En attente'))}</p>
+        <h3>No local review file</h3>
+        <p class="meta-text" style="margin-bottom:14px;">Status: ${escapeHtml(formatCleanStatus(pr.reviewStatus || pr.syncStatus || 'Pending'))}</p>
         <div style="display:flex;gap:8px;justify-content:center;">
-          <button id="emptyCardRunReviewBtn" class="btn btn-primary btn-sm">Lancer l'audit IA maintenant</button>
-          <a href="${escapeHtml(pr.url)}" target="_blank" class="btn btn-secondary btn-sm">Ouvrir sur GitHub ↗</a>
+          <button id="emptyCardRunReviewBtn" class="btn btn-primary btn-sm">Run AI Review Now</button>
+          <a href="${escapeHtml(pr.url)}" target="_blank" class="btn btn-secondary btn-sm">Open on GitHub ↗</a>
         </div>
       </div>
     `;
     document.getElementById('emptyCardRunReviewBtn')?.addEventListener('click', () => {
       triggerManualReviewForKey(pr.key);
     });
-    document.getElementById('findingsList').innerHTML = '';
-    document.getElementById('tabFindingsCount').textContent = '0';
-  }
-
-  loadDiffForCurrentPr(pr);
-  loadTreeDirectory(pr, '');
-  if (state.chatOpen) {
-    loadChatForCurrentPr(pr);
+    // Still load any manual inline comments created on this PR
+    try {
+      const res = await fetch(`/api/review?key=${encodeURIComponent(pr.key)}`);
+      if (state.selectedPrKey !== pr.key) return;
+      if (res.ok) {
+        state.currentReview = await res.json();
+        if (state.selectedPrKey !== pr.key) return;
+        state.selectedCommentCids = new Set(
+          (state.currentReview.findings || [])
+            .filter((f) => !f.posted && !f.dismissed)
+            .map((f) => f.cid)
+        );
+        renderFindingsTab();
+      } else {
+        document.getElementById('findingsList').innerHTML = '';
+        document.getElementById('tabFindingsCount').textContent = '0';
+      }
+    } catch {
+      if (state.selectedPrKey !== pr.key) return;
+      document.getElementById('findingsList').innerHTML = '';
+      document.getElementById('tabFindingsCount').textContent = '0';
+    }
   }
 }
 
@@ -782,10 +1325,10 @@ function renderReportFindingsQuickBar() {
   barEl.innerHTML = `
     <div class="report-qbar-header">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-        <strong style="font-size:12.5px;color:var(--text-primary);">Synthèse des Findings (${findings.length})</strong>
+        <strong style="font-size:12.5px;color:var(--text-primary);">Findings Summary (${findings.length})</strong>
         ${summaryPills}
       </div>
-      <span class="meta-text">Cliquer sur #ID pour aller au détail &middot; Cliquer sur un fichier l'ouvre dans le Diff</span>
+      <span class="meta-text">Click #ID to jump to details &middot; Click a file to open it in Diff</span>
     </div>
     <div class="report-qbar-list">
       ${findings
@@ -797,7 +1340,7 @@ function renderReportFindingsQuickBar() {
             <div class="report-finding-row ${sev.cardClass} ${f.dismissed ? 'dismissed' : ''}">
               <div class="report-finding-main">
                 <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
-                <a href="#report-finding-${idx}" class="finding-id-link qbar-jump-btn" data-idx="${idx}" title="Aller à la section détaillée ${escapeHtml(f.id)}">${escapeHtml(f.id)}</a>
+                <a href="#report-finding-${idx}" class="finding-id-link qbar-jump-btn" data-idx="${idx}" title="Jump to detailed section ${escapeHtml(f.id)}">${escapeHtml(f.id)}</a>
                 ${f.category ? `<span class="finding-cat-pill">${formatInlineCodeHtml(f.category)}</span>` : ''}
                 <span class="report-finding-title">${formatInlineCodeHtml(f.title)}</span>
               </div>
@@ -805,19 +1348,14 @@ function renderReportFindingsQuickBar() {
                 <div class="report-finding-loc">
                   ${
                     fullLoc
-                      ? `<button class="finding-file-btn qbar-file-btn" data-path="${escapeHtml(f.filePath)}" data-line="${f.startLine || ''}" title="Ouvrir dans le Diff Git : ${escapeHtml(fullLoc)}">${escapeHtml(shortLoc)}</button>`
-                      : `<span class="meta-text">Portée générale PR</span>`
+                      ? renderClickableBreadcrumbsHtml(f.filePath, f.startLine, 'finding')
+                      : `<span class="meta-text">General PR scope</span>`
                   }
                 </div>
                 <div class="report-finding-actions">
-                  ${
-                    f.filePath
-                      ? `<button class="btn btn-ghost btn-xs qbar-tree-btn" data-path="${escapeHtml(f.filePath)}" data-line="${f.startLine || ''}" title="Voir le fichier entier dans l'arbre de travail">Tree</button>`
-                      : ''
-                  }
-                  <button class="btn btn-ghost btn-xs qbar-ask-btn" data-idx="${idx}" title="Poser une question à l'agent sur ce finding">Ask Agent</button>
-                  <button class="btn btn-ghost btn-xs qbar-add-rule-btn" data-idx="${idx}" title="Extraire une règle permanente dans reviewer-dna.md">+ Rule</button>
-                  <button class="btn btn-ghost btn-xs qbar-dismiss-btn" data-idx="${idx}" title="Marquer comme faux positif (met à jour false-positives.md)">${f.dismissed ? 'Dismissed' : 'False Positive'}</button>
+                  <button class="btn btn-ghost btn-xs qbar-ask-btn" data-idx="${idx}" title="Ask agent about this finding">Ask Agent</button>
+                  <button class="btn btn-ghost btn-xs qbar-add-rule-btn" data-idx="${idx}" title="Extract a permanent rule into reviewer-dna.md">+ Rule</button>
+                  <button class="btn btn-ghost btn-xs qbar-dismiss-btn" data-idx="${idx}" title="Mark as false positive (updates false-positives.md)">${f.dismissed ? 'Dismissed' : 'False Positive'}</button>
                   <button class="btn btn-secondary btn-xs qbar-copy-btn" data-idx="${idx}">Copy MD</button>
                 </div>
               </div>
@@ -827,6 +1365,8 @@ function renderReportFindingsQuickBar() {
         .join('')}
     </div>
   `;
+
+  bindClickableBreadcrumbs(barEl);
 
   barEl.querySelectorAll('.qbar-jump-btn').forEach((link) => {
     link.addEventListener('click', (e) => {
@@ -876,7 +1416,7 @@ function renderReportFindingsQuickBar() {
       const f = findings[Number(btn.dataset.idx)];
       if (f) {
         await navigator.clipboard.writeText(f.customComment);
-        showToast(`Commentaire ${f.id} copié.`);
+        showToast(`Comment ${f.id} copied.`);
       }
     });
   });
@@ -1153,8 +1693,7 @@ function upgradeReportFindingsInDom(container, findings) {
       <div class="report-detail-header-right">
         ${
           fullLoc
-            ? `<button class="finding-file-btn rcard-file-btn" data-path="${escapeHtml(finding.filePath)}" data-line="${finding.startLine || ''}" title="Voir dans le Diff Git : ${escapeHtml(fullLoc)}">${escapeHtml(shortLoc)}</button>
-               <button class="btn btn-ghost btn-xs rcard-tree-btn" data-path="${escapeHtml(finding.filePath)}" data-line="${finding.startLine || ''}" title="Voir dans l'Arbre de Travail">Tree</button>`
+            ? `<button class="finding-file-btn rcard-file-btn" data-path="${escapeHtml(finding.filePath)}" data-line="${finding.startLine || ''}" title="View in Git Diff: ${escapeHtml(fullLoc)}">${renderFindingFileButtonInnerHtml(finding.filePath, finding.startLine)}</button>`
             : ''
         }
         <button class="btn btn-ghost btn-xs rcard-ask-btn" data-idx="${fIdx}">Ask Agent</button>
@@ -1207,7 +1746,7 @@ function upgradeReportFindingsInDom(container, findings) {
       const details = document.createElement('details');
       details.className = 'report-comment-details';
       const summary = document.createElement('summary');
-      summary.innerHTML = `<span>Aperçu du commentaire GitHub prêt à poster</span><span class="meta-text">Cliquer pour déplier / masquer</span>`;
+      summary.innerHTML = `<span>Ready-to-paste GitHub comment preview</span><span class="meta-text">Click to expand / collapse</span>`;
       details.appendChild(summary);
       lastPre.replaceWith(details);
       details.appendChild(lastPre);
@@ -1232,9 +1771,605 @@ function upgradeReportFindingsInDom(container, findings) {
     });
     header.querySelector('.rcard-copy-btn')?.addEventListener('click', async () => {
       await navigator.clipboard.writeText(finding.customComment);
-      showToast(`Commentaire ${finding.id} copié.`);
+      showToast(`Comment ${finding.id} copied.`);
     });
   });
+}
+
+function renderClickableBreadcrumbsHtml(filePath, lineNum = null, context = 'diff', endLineNum = null) {
+  if (!filePath) return '';
+  const pr = state.prs.find((p) => p.key === state.selectedPrKey);
+  const repoLabel = pr?.repo || 'repo';
+  const clean = String(filePath).replace(/^\/+/, '');
+  const parts = clean.split('/').filter(Boolean);
+  if (parts.length === 0) return '';
+
+  const fileName = parts[parts.length - 1];
+  const folders = parts.slice(0, -1);
+  const segments = [
+    `<button type="button" class="crumb-segment" data-crumb-dir="" data-crumb-context="${escapeHtml(context)}" title="Repository root (${escapeHtml(repoLabel)})">${escapeHtml(repoLabel)}</button>`,
+  ];
+
+  let acc = '';
+  for (const folder of folders) {
+    acc = acc ? `${acc}/${folder}` : folder;
+    segments.push(
+      `<span class="crumb-sep">/</span><button type="button" class="crumb-segment" data-crumb-dir="${escapeHtml(acc)}" data-crumb-context="${escapeHtml(context)}" title="Filter by folder: ${escapeHtml(acc)}">${escapeHtml(folder)}</button>`
+    );
+  }
+
+  const lineSuffix =
+    lineNum && endLineNum && Number(endLineNum) > Number(lineNum)
+      ? `:${lineNum}-${endLineNum}`
+      : lineNum
+      ? `:${lineNum}`
+      : '';
+  const fileDisplay = `${fileName}${lineSuffix}`;
+  segments.push(
+    `<span class="crumb-sep">/</span><button type="button" class="crumb-segment crumb-file" data-crumb-file="${escapeHtml(clean)}" data-crumb-line="${lineNum || ''}" data-crumb-context="${escapeHtml(context)}" title="${escapeHtml(clean)}${lineSuffix}">${escapeHtml(fileDisplay)}</button>`
+  );
+
+  return `<div class="clickable-breadcrumb-bar">${segments.join('')}</div>`;
+}
+
+function bindClickableBreadcrumbs(rootEl) {
+  if (!rootEl) return;
+  rootEl.querySelectorAll('.crumb-segment[data-crumb-dir]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const dirPath = btn.dataset.crumbDir || '';
+      const ctx = btn.dataset.crumbContext || 'diff';
+      const pr = state.prs.find((p) => p.key === state.selectedPrKey);
+      if (!pr) return;
+
+      const diffFiles = state.currentDiff?.files || [];
+      const matchingDiffFiles = dirPath
+        ? diffFiles.filter((f) => f.filename === dirPath || f.filename.startsWith(dirPath + '/'))
+        : diffFiles;
+
+      if (matchingDiffFiles.length > 0) {
+        state.diffFolderFilter = state.diffFolderFilter === dirPath ? '' : dirPath;
+        if (state.fileTreeCollapsed) {
+          state.fileTreeCollapsed = false;
+          renderCollapsibleLayoutState();
+        }
+        if (ctx === 'finding' && state.activeTab !== 'diff' && !state.splitMode) {
+          switchTab('diff');
+        }
+        renderDiffTree();
+        if (
+          state.diffFolderFilter &&
+          (!state.selectedDiffFile || !state.selectedDiffFile.startsWith(dirPath + '/'))
+        ) {
+          selectDiffFile(matchingDiffFiles[0].filename, null);
+        }
+        showToast(
+          state.diffFolderFilter
+            ? `Tree filtered on ${dirPath} (${matchingDiffFiles.length} file${matchingDiffFiles.length > 1 ? 's' : ''})`
+            : 'Folder filter cleared',
+          2000
+        );
+      } else {
+        showToast(`No modified files under: ${dirPath || pr.repo}`, 1800);
+      }
+    });
+  });
+
+  rootEl.querySelectorAll('.crumb-segment[data-crumb-file]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const filePath = btn.dataset.crumbFile || '';
+      const lineNum = Number(btn.dataset.crumbLine) || null;
+      const ctx = btn.dataset.crumbContext || 'diff';
+      if (!filePath) return;
+
+      if (ctx === 'finding' || ctx === 'overview') {
+        navigateToCodeLocation(filePath, lineNum, 'diff');
+      } else {
+        await navigator.clipboard.writeText(filePath);
+        showToast(`Path copied: ${filePath}`, 1800);
+      }
+    });
+  });
+}
+
+async function saveManualInlineComment({
+  cid = null,
+  filePath,
+  line,
+  startLine = null,
+  endLine = null,
+  title,
+  severity,
+  comment,
+}) {
+  const prKey = state.selectedPrKey;
+  if (!prKey || !comment) return null;
+  const rawStart = Number(startLine ?? line) || 1;
+  const rawEnd = Number(endLine ?? line ?? rawStart) || rawStart;
+  const startLineNum = Math.max(1, Math.min(rawStart, rawEnd));
+  const endLineNum = Math.max(startLineNum, Math.max(rawStart, rawEnd));
+
+  const res = await fetch('/api/manual-comments', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prKey,
+      cid,
+      filePath,
+      line: endLineNum,
+      startLine: startLineNum,
+      endLine: endLineNum,
+      title,
+      severity,
+      comment,
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to save comment');
+
+  const saved = data.comment;
+  if (!state.currentReview) {
+    state.currentReview = { file: null, archived: false, markdown: '', findings: [] };
+  }
+  const findings = state.currentReview.findings || [];
+  const existingIdx = findings.findIndex((f) => f.cid === saved.cid);
+  if (existingIdx >= 0) {
+    findings[existingIdx] = saved;
+  } else {
+    findings.push(saved);
+  }
+  state.currentReview.findings = findings;
+  state.selectedCommentCids.add(saved.cid);
+
+  if (state.currentDiff) {
+    const resolvedList = state.currentDiff.resolvedFindings || [];
+    const resolvedEntry = {
+      ...saved,
+      resolvedPath: saved.filePath,
+      resolvedStartLine:
+        saved.startLine && saved.endLine && saved.startLine < saved.endLine
+          ? saved.startLine
+          : null,
+      resolvedLine: saved.endLine || saved.startLine || 1,
+      inDiff: true,
+    };
+    const rIdx = resolvedList.findIndex((f) => f.cid === saved.cid);
+    if (rIdx >= 0) {
+      resolvedList[rIdx] = resolvedEntry;
+    } else {
+      resolvedList.push(resolvedEntry);
+    }
+    state.currentDiff.resolvedFindings = resolvedList;
+  }
+
+  renderFindingsTab();
+  renderReportFindingsQuickBar();
+  loadState(true);
+  return saved;
+}
+
+async function deleteManualInlineComment(cid) {
+  const prKey = state.selectedPrKey;
+  if (!prKey || !cid) return;
+  const res = await fetch('/api/manual-comments', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prKey, cid }),
+  });
+  if (!res.ok) {
+    showToast('Unable to delete manual comment');
+    return;
+  }
+
+  if (state.currentReview?.findings) {
+    state.currentReview.findings = state.currentReview.findings.filter((f) => f.cid !== cid);
+  }
+  if (state.currentDiff?.resolvedFindings) {
+    state.currentDiff.resolvedFindings = state.currentDiff.resolvedFindings.filter(
+      (f) => f.cid !== cid
+    );
+  }
+  state.selectedCommentCids.delete(cid);
+  renderFindingsTab();
+  renderReportFindingsQuickBar();
+  if (state.selectedDiffFile) {
+    selectDiffFile(state.selectedDiffFile, state.highlightedLine);
+  }
+  loadState(true);
+  showToast('Manual comment deleted.');
+}
+
+function highlightSelectedLineRange(tableEl, startLine, endLine) {
+  if (!tableEl) return;
+  const s = Math.min(Number(startLine) || 0, Number(endLine) || 0);
+  const e = Math.max(Number(startLine) || 0, Number(endLine) || 0);
+  tableEl.querySelectorAll('tr').forEach((tr) => {
+    const rLine = Number(tr.dataset.rightLine || tr.dataset.blobLine || 0);
+    if (rLine && s > 0 && rLine >= s && rLine <= e) {
+      tr.classList.add('comment-range-selected');
+    } else {
+      tr.classList.remove('comment-range-selected');
+    }
+  });
+}
+
+function collectRangeCodeSnippet(tableEl, startLine, endLine) {
+  if (!tableEl) return '';
+  const s = Math.min(Number(startLine) || 1, Number(endLine) || 1);
+  const e = Math.max(Number(startLine) || 1, Number(endLine) || 1);
+  const lines = [];
+  tableEl.querySelectorAll('tr').forEach((tr) => {
+    const rLine = Number(tr.dataset.rightLine || tr.dataset.blobLine || 0);
+    if (rLine >= s && rLine <= e) {
+      const codeCell = tr.querySelector('.diff-line-code, .blob-line-code');
+      if (codeCell) lines.push(codeCell.textContent || '');
+    }
+  });
+  return lines.join('\n');
+}
+
+function openInlineCommentComposer({
+  tableEl,
+  anchorRow,
+  filePath,
+  lineNum,
+  startLine = null,
+  endLine = null,
+  codeSnippet = '',
+  existingFinding = null,
+  colSpan = 3,
+}) {
+  if (!tableEl || !anchorRow || !filePath || !lineNum) return;
+
+  // Remove any open composer in this table
+  tableEl.querySelectorAll('tr.inline-comment-composer-row').forEach((r) => r.remove());
+
+  const initStart = Math.max(
+    1,
+    Math.min(
+      Number(startLine ?? existingFinding?.startLine ?? lineNum) || 1,
+      Number(endLine ?? existingFinding?.endLine ?? lineNum) || 1
+    )
+  );
+  const initEnd = Math.max(
+    initStart,
+    Math.max(
+      Number(startLine ?? existingFinding?.startLine ?? lineNum) || 1,
+      Number(endLine ?? existingFinding?.endLine ?? lineNum) || 1
+    )
+  );
+
+  highlightSelectedLineRange(tableEl, initStart, initEnd);
+
+  const baseName = filePath.split('/').pop() || filePath;
+  const initRangeStr = initStart !== initEnd ? `${initStart}-${initEnd}` : `${initEnd}`;
+  const defaultTitle =
+    existingFinding?.title || `Comment on \`${baseName}:${initRangeStr}\``;
+  const defaultSeverity = existingFinding?.severity || '🟡 Minor';
+  const defaultBody = existingFinding?.customComment || '';
+
+  const composerRow = document.createElement('tr');
+  composerRow.className = 'inline-comment-composer-row';
+  composerRow.innerHTML = `
+    <td colspan="${colSpan}" class="inline-comment-composer-cell">
+      <div class="inline-comment-composer">
+        <div class="inline-comment-composer-header">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <span id="inlineComposerHeaderLabel">${
+              existingFinding
+                ? `Edit ${escapeHtml(existingFinding.id)}`
+                : `New comment on ${escapeHtml(baseName)}:${initRangeStr}`
+            }</span>
+            <span class="line-range-inputs" title="Select multiple lines with the mouse (drag or Shift+Click on line numbers) or adjust the line range here">
+              <label>Start line <input id="inlineComposerStartLine" type="number" min="1" class="line-range-input" value="${initStart}" /></label>
+              <span>&rarr;</span>
+              <label>End line <input id="inlineComposerEndLine" type="number" min="1" class="line-range-input" value="${initEnd}" /></label>
+            </span>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+            <select id="inlineComposerSeverity" class="diff-file-jump-select" style="min-width:120px;max-width:160px;">
+              <option value="🟡 Minor" ${/minor/i.test(defaultSeverity) ? 'selected' : ''}>MINOR (Suggestion)</option>
+              <option value="🟠 Major" ${/major/i.test(defaultSeverity) ? 'selected' : ''}>MAJOR (Important)</option>
+              <option value="🔴 Blocker" ${/blocker/i.test(defaultSeverity) ? 'selected' : ''}>BLOCKER (Blocking)</option>
+              <option value="🟢 Nit" ${/nit/i.test(defaultSeverity) ? 'selected' : ''}>NIT (Nitpick)</option>
+              <option value="🔵 Question" ${/question/i.test(defaultSeverity) ? 'selected' : ''}>QUESTION</option>
+            </select>
+            <input id="inlineComposerTitle" type="text" class="search-input" style="width:280px;padding:4px 8px;font-size:11.5px;" value="${escapeHtml(defaultTitle)}" placeholder="Short comment title..." />
+          </div>
+        </div>
+        <textarea id="inlineComposerTextarea" class="finding-textarea" rows="4" placeholder="Write your Markdown comment (or your question for the AI Agent)... Cmd+Enter to save to review.">${escapeHtml(defaultBody)}</textarea>
+        <div class="inline-comment-composer-actions">
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+            <button type="button" id="inlineComposerSaveBtn" class="btn btn-primary btn-sm">
+              ${existingFinding ? 'Save changes' : 'Add to review (4. AI Proposals)'}
+            </button>
+            <button type="button" id="inlineComposerPostNowBtn" class="btn btn-secondary btn-sm" title="Publish this inline comment directly to GitHub">
+              Post directly to GitHub
+            </button>
+            <button type="button" id="inlineComposerAskAiBtn" class="btn btn-ghost btn-sm" title="Open Agent Q&A targeted at this line range">
+              Ask AI Agent (${escapeHtml(formatKeybindLabel(getKeybind('agentChat')))})
+            </button>
+          </div>
+          <button type="button" id="inlineComposerCancelBtn" class="btn btn-ghost btn-sm">Cancel (Esc)</button>
+        </div>
+      </div>
+    </td>
+  `;
+
+  anchorRow.insertAdjacentElement('afterend', composerRow);
+
+  const textarea = composerRow.querySelector('#inlineComposerTextarea');
+  const titleInput = composerRow.querySelector('#inlineComposerTitle');
+  const sevSelect = composerRow.querySelector('#inlineComposerSeverity');
+  const startInput = composerRow.querySelector('#inlineComposerStartLine');
+  const endInput = composerRow.querySelector('#inlineComposerEndLine');
+  const headerLabel = composerRow.querySelector('#inlineComposerHeaderLabel');
+  textarea?.focus();
+
+  const readCurrentRange = () => {
+    const rawS = Number(startInput?.value) || initStart;
+    const rawE = Number(endInput?.value) || rawS;
+    const s = Math.max(1, Math.min(rawS, rawE));
+    const e = Math.max(s, Math.max(rawS, rawE));
+    return { startLine: s, endLine: e, rangeStr: s !== e ? `${s}-${e}` : `${e}` };
+  };
+
+  const syncRangeUi = () => {
+    const { startLine: s, endLine: e, rangeStr } = readCurrentRange();
+    highlightSelectedLineRange(tableEl, s, e);
+    if (!existingFinding && headerLabel) {
+      headerLabel.textContent = `New comment on ${baseName}:${rangeStr}`;
+    }
+    if (
+      !existingFinding &&
+      titleInput &&
+      /^(?:Comment on|Commentaire sur) `[^`]+:\d+(?:-\d+)?`$/.test(titleInput.value.trim())
+    ) {
+      titleInput.value = `Comment on \`${baseName}:${rangeStr}\``;
+    }
+  };
+
+  startInput?.addEventListener('input', syncRangeUi);
+  endInput?.addEventListener('input', syncRangeUi);
+
+  const closeComposer = () => {
+    highlightSelectedLineRange(tableEl, 0, 0);
+    composerRow.remove();
+  };
+
+  const handleSaveToReview = async () => {
+    const body = textarea?.value.trim() || '';
+    if (!body) {
+      showToast('Please enter a comment before saving.');
+      textarea?.focus();
+      return;
+    }
+    const { startLine: s, endLine: e, rangeStr } = readCurrentRange();
+    try {
+      const saved = await saveManualInlineComment({
+        cid: existingFinding?.cid || null,
+        filePath,
+        line: e,
+        startLine: s,
+        endLine: e,
+        title: titleInput?.value.trim() || `Comment on \`${baseName}:${rangeStr}\``,
+        severity: sevSelect?.value || '🟡 Minor',
+        comment: body,
+      });
+      closeComposer();
+      if (state.selectedDiffFile === filePath) {
+        selectDiffFile(filePath, e);
+      }
+      showToast(`Comment ${saved.id} added to review (${baseName}:${rangeStr}).`);
+    } catch (err) {
+      showToast(`Error: ${err.message}`, 4000);
+    }
+  };
+
+  composerRow.querySelector('#inlineComposerSaveBtn')?.addEventListener('click', handleSaveToReview);
+
+  composerRow.querySelector('#inlineComposerPostNowBtn')?.addEventListener('click', async () => {
+    const body = textarea?.value.trim() || '';
+    if (!body) {
+      showToast('Please enter a comment before publishing to GitHub.');
+      textarea?.focus();
+      return;
+    }
+    const { startLine: s, endLine: e, rangeStr } = readCurrentRange();
+    try {
+      const saved = await saveManualInlineComment({
+        cid: existingFinding?.cid || null,
+        filePath,
+        line: e,
+        startLine: s,
+        endLine: e,
+        title: titleInput?.value.trim() || `Comment on \`${baseName}:${rangeStr}\``,
+        severity: sevSelect?.value || '🟡 Minor',
+        comment: body,
+      });
+      closeComposer();
+      openSingleCommentModal(saved, 'inline');
+    } catch (err) {
+      showToast(`Error: ${err.message}`, 4000);
+    }
+  });
+
+  composerRow.querySelector('#inlineComposerAskAiBtn')?.addEventListener('click', () => {
+    const typedQuestion = textarea?.value.trim() || '';
+    const { startLine: s, endLine: e, rangeStr } = readCurrentRange();
+    const snippet = collectRangeCodeSnippet(tableEl, s, e) || codeSnippet;
+    closeComposer();
+    openChatWithFindingContext({
+      id: `L${rangeStr}`,
+      severity: '🔵 Question',
+      title: `${s !== e ? `Lines ${rangeStr}` : `Line ${e}`} in ${baseName}`,
+      filePath,
+      startLine: s,
+      endLine: e,
+      customComment: snippet ? `Lines ${rangeStr}:\n\`\`\`\n${snippet}\n\`\`\`` : '',
+    });
+    if (typedQuestion) {
+      const chatInput = document.getElementById('agentChatInput');
+      if (chatInput) {
+        chatInput.value = typedQuestion;
+        chatInput.focus();
+      }
+    }
+  });
+
+  composerRow.querySelector('#inlineComposerCancelBtn')?.addEventListener('click', () => {
+    closeComposer();
+  });
+
+  textarea?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) {
+      ev.preventDefault();
+      handleSaveToReview();
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeComposer();
+    }
+  });
+}
+
+let _activeLineDragMouseUpHandler = null;
+
+function getSelectedTextLineRange(tableEl) {
+  if (!tableEl || typeof window.getSelection !== 'function') return null;
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  const text = sel.toString().trim();
+  if (!text) return null;
+
+  const findRowNum = (node) => {
+    const el = node?.nodeType === 1 ? node : node?.parentElement;
+    if (!el || !tableEl.contains(el)) return 0;
+    const tr = el.closest('tr[data-right-line], tr[data-blob-line]');
+    return Number(tr?.dataset?.rightLine || tr?.dataset?.blobLine || 0);
+  };
+
+  const range = sel.getRangeAt(0);
+  const startLine = findRowNum(range.startContainer);
+  const endLine = findRowNum(range.endContainer);
+  if (startLine > 0 && endLine > 0) {
+    return {
+      startLine: Math.min(startLine, endLine),
+      endLine: Math.max(startLine, endLine),
+    };
+  }
+  return null;
+}
+
+function bindMultiLineCommentSelection(tableEl, filePath, colSpan = 3) {
+  if (!tableEl || !filePath) return;
+  let dragStartLine = null;
+  let dragCurrentLine = null;
+
+  const findRowByLine = (lineNum) =>
+    tableEl.querySelector(`tr[data-right-line="${lineNum}"], tr[data-blob-line="${lineNum}"]`);
+
+  const openForRange = (lineA, lineB) => {
+    const startLine = Math.min(lineA, lineB);
+    const endLine = Math.max(lineA, lineB);
+    const endRow = findRowByLine(endLine) || findRowByLine(startLine);
+    if (!endRow) return;
+    const snippet = collectRangeCodeSnippet(tableEl, startLine, endLine);
+    openInlineCommentComposer({
+      tableEl,
+      anchorRow: endRow,
+      filePath,
+      lineNum: endLine,
+      startLine,
+      endLine,
+      codeSnippet: snippet,
+      colSpan,
+    });
+  };
+
+  tableEl.querySelectorAll('.commentable-line').forEach((cell) => {
+    cell.addEventListener('mousedown', (ev) => {
+      if (ev.button !== 0) return;
+      const lineNum = Number(cell.dataset.commentLine);
+      if (!lineNum) return;
+
+      // Prevent native browser text selection so dragging across line numbers or '+' buttons always tracks smoothly
+      ev.preventDefault();
+      ev.stopPropagation();
+
+      if (
+        ev.shiftKey &&
+        state.lineRangeAnchor &&
+        state.lineRangeAnchor.filePath === filePath &&
+        state.lineRangeAnchor.line
+      ) {
+        dragStartLine = state.lineRangeAnchor.line;
+        dragCurrentLine = lineNum;
+        state.isDraggingLineRange = true;
+        highlightSelectedLineRange(tableEl, dragStartLine, dragCurrentLine);
+        return;
+      }
+
+      const textSelRange = getSelectedTextLineRange(tableEl);
+      if (
+        textSelRange &&
+        textSelRange.endLine > textSelRange.startLine &&
+        lineNum >= textSelRange.startLine &&
+        lineNum <= textSelRange.endLine
+      ) {
+        dragStartLine = textSelRange.startLine;
+        dragCurrentLine = textSelRange.endLine;
+        state.isDraggingLineRange = true;
+        highlightSelectedLineRange(tableEl, dragStartLine, dragCurrentLine);
+        return;
+      }
+
+      dragStartLine = lineNum;
+      dragCurrentLine = lineNum;
+      state.isDraggingLineRange = true;
+      highlightSelectedLineRange(tableEl, lineNum, lineNum);
+    });
+  });
+
+  // Track mouse movement across ANY part of the table rows while dragging
+  tableEl.addEventListener('mouseover', (ev) => {
+    if (!state.isDraggingLineRange || !dragStartLine) return;
+    const row = ev.target?.closest?.('tr[data-right-line], tr[data-blob-line]');
+    const lineNum = Number(row?.dataset?.rightLine || row?.dataset?.blobLine || 0);
+    if (!lineNum || lineNum === dragCurrentLine) return;
+    dragCurrentLine = lineNum;
+    highlightSelectedLineRange(tableEl, dragStartLine, dragCurrentLine);
+  });
+
+  // Also support selecting multiple lines directly in the code column: on mouseup, open composer for the selected lines
+  tableEl.addEventListener('mouseup', () => {
+    if (state.isDraggingLineRange) return;
+    setTimeout(() => {
+      const selRange = getSelectedTextLineRange(tableEl);
+      if (selRange && selRange.endLine > selRange.startLine) {
+        state.lineRangeAnchor = { filePath, line: selRange.startLine };
+        openForRange(selRange.startLine, selRange.endLine);
+      }
+    }, 10);
+  });
+
+  if (_activeLineDragMouseUpHandler) {
+    window.removeEventListener('mouseup', _activeLineDragMouseUpHandler);
+  }
+
+  _activeLineDragMouseUpHandler = () => {
+    if (!state.isDraggingLineRange || !dragStartLine) return;
+    const s = dragStartLine;
+    const e = dragCurrentLine || dragStartLine;
+    state.isDraggingLineRange = false;
+    dragStartLine = null;
+    dragCurrentLine = null;
+    state.lineRangeAnchor = { filePath, line: Math.min(s, e) };
+    openForRange(s, e);
+  };
+
+  window.addEventListener('mouseup', _activeLineDragMouseUpHandler);
 }
 
 function navigateToCodeLocation(filePath, line = null, preferredView = 'diff') {
@@ -1244,25 +2379,18 @@ function navigateToCodeLocation(filePath, line = null, preferredView = 'diff') {
       prKey: state.selectedPrKey,
       filePath,
       line,
-      view: preferredView,
+      view: 'diff',
     });
   }
 
-  if (preferredView === 'tree') {
-    if (state.splitMode) {
-      setSplitRightPanel('tree');
-    } else {
-      switchTab('tree');
-    }
-    openFileInWorkingTree(filePath, line);
-  } else {
-    if (state.splitMode) {
+  if (state.splitMode) {
+    if (state.splitLeftTab !== 'diff' && state.splitRightTab !== 'diff') {
       setSplitRightPanel('diff');
-    } else {
-      switchTab('diff');
     }
-    openFileInDiffViewer(filePath, line);
+  } else {
+    switchTab('diff');
   }
+  openFileInDiffViewer(filePath, line);
 }
 
 function renderFindingsTab() {
@@ -1273,11 +2401,11 @@ function renderFindingsTab() {
   const postedCount = findings.filter((f) => f.posted).length;
   const dismissedCount = findings.filter((f) => f.dismissed).length;
   document.getElementById('commentsSummaryStats').textContent =
-    `${postedCount}/${findings.length} posté(s)` +
-    (dismissedCount > 0 ? ` · ${dismissedCount} faux positif(s)` : '');
+    `${postedCount}/${findings.length} posted` +
+    (dismissedCount > 0 ? ` · ${dismissedCount} false positive(s)` : '');
 
   if (findings.length === 0) {
-    listEl.innerHTML = `<div class="empty-card" style="margin:32px auto;"><p>Aucun commentaire à afficher pour cette PR.</p></div>`;
+    listEl.innerHTML = `<div class="empty-card" style="margin:32px auto;"><p>No AI comment proposals or manual drafts for this PR. Click or drag on line numbers in <strong>3. Git Diff</strong> to write a comment on one or more lines.</p></div>`;
     return;
   }
 
@@ -1285,10 +2413,15 @@ function renderFindingsTab() {
     .map((f, idx) => {
       const isSelected = state.selectedCommentCids.has(f.cid);
       const sev = getSeverityMeta(f.severity);
+      const lineRangeLabel =
+        f.startLine && f.endLine && Number(f.endLine) > Number(f.startLine)
+          ? `:${f.startLine}-${f.endLine}`
+          : f.startLine
+          ? `:${f.startLine}`
+          : '';
       const fullLocation = f.filePath
-        ? `${f.filePath}${f.startLine ? `:${f.startLine}` : ''}`
-        : 'Commentaire général PR';
-      const shortLocation = f.filePath ? formatShortFilePath(f.filePath, f.startLine) : fullLocation;
+        ? `${f.filePath}${lineRangeLabel}`
+        : 'General PR comment';
 
       return `
         <div class="finding-card ${sev.cardClass} ${f.posted ? 'posted' : ''}" data-cid="${escapeHtml(f.cid)}" data-idx="${idx}" style="${f.dismissed ? 'opacity:0.5;' : ''}">
@@ -1299,7 +2432,7 @@ function renderFindingsTab() {
                 class="finding-select-cb"
                 data-cid="${escapeHtml(f.cid)}"
                 ${isSelected ? 'checked' : ''}
-                title="Inclure dans l'envoi groupé"
+                title="Include in batch review submission"
               />
               <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
               <span class="finding-id">${escapeHtml(f.id)}</span>
@@ -1307,20 +2440,15 @@ function renderFindingsTab() {
               <span class="finding-title">${formatInlineCodeHtml(f.title)}</span>
               ${f.dismissed ? `<span class="badge">FALSE POSITIVE</span>` : ''}
             </div>
-            <div style="display:flex;align-items:center;gap:8px;">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
               ${
                 f.filePath
-                  ? `<button class="finding-file-btn" data-path="${escapeHtml(f.filePath)}" data-line="${f.startLine || ''}" title="Voir dans le diff : ${escapeHtml(fullLocation)}">
-                      ${escapeHtml(shortLocation)}
-                    </button>
-                    <button class="btn btn-ghost btn-xs finding-tree-btn" data-path="${escapeHtml(f.filePath)}" data-line="${f.startLine || ''}" title="Voir dans l'arbre de travail">
-                      Tree
-                    </button>`
+                  ? `${renderClickableBreadcrumbsHtml(f.filePath, f.startLine, 'finding', f.endLine)}`
                   : `<span class="meta-text">${escapeHtml(fullLocation)}</span>`
               }
               <label class="checkbox-label">
                 <input type="checkbox" class="finding-posted-cb" data-cid="${escapeHtml(f.cid)}" ${f.posted ? 'checked' : ''} />
-                <span>Posté</span>
+                <span>Posted</span>
               </label>
             </div>
           </div>
@@ -1331,31 +2459,37 @@ function renderFindingsTab() {
             <div class="finding-actions">
               <div class="finding-actions-left">
                 <button class="btn btn-secondary btn-sm copy-comment-btn" data-idx="${idx}">
-                  Copier Markdown
+                  Copy Markdown
                 </button>
                 <button class="btn btn-ghost btn-sm ask-agent-finding-btn" data-idx="${idx}">
                   Ask Agent
                 </button>
-                <button class="btn btn-ghost btn-sm add-rule-finding-btn" data-idx="${idx}" title="Ajouter ce pattern comme règle permanente de l'agent">
+                <button class="btn btn-ghost btn-sm add-rule-finding-btn" data-idx="${idx}" title="Add this pattern as a permanent agent rule">
                   + Rule
                 </button>
-                <button class="btn btn-ghost btn-sm dismiss-finding-btn" data-idx="${idx}">
-                  False Positive
-                </button>
-                <button class="btn btn-ghost btn-sm reset-comment-btn" data-idx="${idx}">
-                  Réinitialiser
-                </button>
+                ${
+                  f.isManual
+                    ? `<button class="btn btn-ghost btn-sm delete-manual-finding-btn" data-cid="${escapeHtml(f.cid)}" title="Delete this manual comment">
+                        Delete
+                      </button>`
+                    : `<button class="btn btn-ghost btn-sm dismiss-finding-btn" data-idx="${idx}">
+                        False Positive
+                      </button>
+                      <button class="btn btn-ghost btn-sm reset-comment-btn" data-idx="${idx}">
+                        Reset
+                      </button>`
+                }
               </div>
               <div class="finding-actions-right">
                 ${
                   f.filePath
                     ? `<button class="btn btn-primary btn-sm post-inline-btn" data-idx="${idx}">
-                        Poster en inline
+                        Post inline
                       </button>`
                     : ''
                 }
                 <button class="btn btn-secondary btn-sm post-general-btn" data-idx="${idx}">
-                  Poster en général
+                  Post general
                 </button>
               </div>
             </div>
@@ -1364,6 +2498,14 @@ function renderFindingsTab() {
       `;
     })
     .join('');
+
+  bindClickableBreadcrumbs(listEl);
+
+  listEl.querySelectorAll('.delete-manual-finding-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      deleteManualInlineComment(btn.dataset.cid);
+    });
+  });
 
   listEl.querySelectorAll('.finding-select-cb').forEach((cb) => {
     cb.addEventListener('change', () => {
@@ -1420,7 +2562,7 @@ function renderFindingsTab() {
     btn.addEventListener('click', async () => {
       const f = findings[Number(btn.dataset.idx)];
       await navigator.clipboard.writeText(f.customComment);
-      showToast(`Commentaire ${f.id} copié.`);
+      showToast(`Comment ${f.id} copied.`);
     });
   });
 
@@ -1455,7 +2597,7 @@ function renderFindingsTab() {
         body: JSON.stringify({ cid: f.cid, customComment: f.comment }),
       });
       renderFindingsTab();
-      showToast(`Texte de ${f.id} réinitialisé.`);
+      showToast(`Text for ${f.id} reset.`);
     });
   });
 
@@ -1474,63 +2616,293 @@ function renderFindingsTab() {
   });
 }
 
-async function loadDiffForCurrentPr(pr) {
+async function loadDiffForCurrentPr(pr, forceRefresh = false) {
+  if (!pr || state.selectedPrKey !== pr.key) return;
   const treeEl = document.getElementById('diffFileTree');
   const viewerEl = document.getElementById('diffViewerContainer');
-  treeEl.innerHTML = `<div class="empty-state meta-text" style="padding:16px;">Chargement des fichiers...</div>`;
+  const cacheKey = getPrClientCacheKey(pr);
+
+  const applyDiffData = (data) => {
+    if (state.selectedPrKey !== pr.key) return;
+    state.currentDiff = data;
+    const files = data.files || [];
+    document.getElementById('tabFilesCount').textContent = files.length;
+    renderDiffTree();
+
+    const hasValidSelected =
+      Boolean(state.selectedDiffFile) &&
+      files.some((f) => f.filename === state.selectedDiffFile);
+
+    if (files.length > 0 && !hasValidSelected) {
+      const fileWithFinding = data.resolvedFindings?.find(
+        (f) => f.inDiff && f.resolvedPath && files.some((df) => df.filename === f.resolvedPath)
+      )?.resolvedPath;
+      selectDiffFile(fileWithFinding || files[0].filename, null);
+    } else if (hasValidSelected) {
+      selectDiffFile(state.selectedDiffFile, state.highlightedLine);
+    } else {
+      viewerEl.innerHTML = `<div class="empty-state meta-text">No files in diff.</div>`;
+    }
+  };
+
+  if (!forceRefresh && state.prDiffCache[cacheKey]) {
+    applyDiffData(state.prDiffCache[cacheKey]);
+    return;
+  }
+
+  if (!state.currentDiff) {
+    treeEl.innerHTML = `<div class="empty-state meta-text" style="padding:16px;">Loading files...</div>`;
+    viewerEl.innerHTML = `<div class="empty-state meta-text">Loading diff...</div>`;
+  }
 
   try {
     const res = await fetch(
       `/api/diff?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&reviewFile=${encodeURIComponent(pr.reviewFile || '')}`
     );
-    if (!res.ok) throw new Error('Erreur lors de la récupération du diff GitHub');
+    if (!res.ok) throw new Error('Error fetching GitHub diff');
     const data = await res.json();
+    state.prDiffCache[cacheKey] = data;
     if (state.selectedPrKey !== pr.key) return;
-
-    state.currentDiff = data;
-    document.getElementById('tabFilesCount').textContent = (data.files || []).length;
-    renderDiffTree();
-
-    if (data.files && data.files.length > 0 && !state.selectedDiffFile) {
-      const fileWithFinding = data.resolvedFindings?.find((f) => f.inDiff && f.resolvedPath)?.resolvedPath;
-      selectDiffFile(fileWithFinding || data.files[0].filename);
-    } else if (state.selectedDiffFile) {
-      selectDiffFile(state.selectedDiffFile, state.highlightedLine);
-    } else {
-      viewerEl.innerHTML = `<div class="empty-state meta-text">Aucun fichier dans le diff.</div>`;
-    }
+    applyDiffData(data);
   } catch (err) {
-    treeEl.innerHTML = `<div class="empty-state meta-text" style="padding:16px;">${escapeHtml(err.message)}</div>`;
+    if (state.selectedPrKey === pr.key && !state.currentDiff) {
+      treeEl.innerHTML = `<div class="empty-state meta-text" style="padding:16px;">${escapeHtml(err.message)}</div>`;
+    }
   }
+}
+
+function getFileStatusMeta(status) {
+  const s = String(status || 'modified').toLowerCase();
+  if (s === 'added') {
+    return { code: 'A', cls: 'status-added', title: 'Added file' };
+  }
+  if (s === 'removed' || s === 'deleted') {
+    return { code: 'D', cls: 'status-removed', title: 'Deleted file' };
+  }
+  if (s === 'renamed') {
+    return { code: 'R', cls: 'status-renamed', title: 'Renamed file' };
+  }
+  return { code: 'M', cls: 'status-modified', title: 'Modified file' };
+}
+
+function getFileExtMeta(filename) {
+  const clean = String(filename || '').toLowerCase();
+  const base = clean.split('/').pop() || '';
+  const dotIdx = base.lastIndexOf('.');
+  const ext = dotIdx >= 0 ? base.slice(dotIdx + 1) : '';
+  if (ext === 'php') return { label: 'PHP', cls: 'ext-php', hljsLang: 'php' };
+  if (ext === 'feature') return { label: 'FEATURE', cls: 'ext-feature', hljsLang: 'gherkin' };
+  if (ext === 'ts' || ext === 'tsx') return { label: 'TS', cls: 'ext-ts', hljsLang: 'typescript' };
+  if (ext === 'vue') return { label: 'VUE', cls: 'ext-vue', hljsLang: 'xml' };
+  if (ext === 'js' || ext === 'mjs' || ext === 'cjs') return { label: 'JS', cls: 'ext-js', hljsLang: 'javascript' };
+  if (ext === 'json') return { label: 'JSON', cls: 'ext-json', hljsLang: 'json' };
+  if (ext === 'yaml' || ext === 'yml') return { label: 'YAML', cls: 'ext-yaml', hljsLang: 'yaml' };
+  if (ext === 'sql') return { label: 'SQL', cls: 'ext-sql', hljsLang: 'sql' };
+  if (ext === 'sh' || ext === 'bash' || ext === 'zsh') return { label: 'SH', cls: 'ext-sh', hljsLang: 'bash' };
+  if (ext === 'css' || ext === 'scss') return { label: 'CSS', cls: 'ext-css', hljsLang: 'css' };
+  if (ext === 'xml' || ext === 'html' || ext === 'twig') return { label: ext.toUpperCase() || 'XML', cls: 'ext-xml', hljsLang: 'xml' };
+  if (ext === 'md' || ext === 'markdown') return { label: 'MD', cls: 'ext-md', hljsLang: 'markdown' };
+  return { label: ext ? ext.slice(0, 6).toUpperCase() : 'FILE', cls: '', hljsLang: null };
+}
+
+function renderFindingFileButtonInnerHtml(filePath, startLine = null) {
+  const short = formatShortFilePath(filePath, null);
+  const parts = short.split('/');
+  const base = parts.pop() || short;
+  const dir = parts.length > 0 ? `${parts.join('/')}/` : '';
+  const lineStr = startLine ? `:${startLine}` : '';
+  return `${dir ? `<span class="finding-file-dir">${escapeHtml(dir)}</span>` : ''}<span class="finding-file-basename">${escapeHtml(base + lineStr)}</span>`;
+}
+
+function highlightDiffCodeLine(codeText, filename = state.selectedDiffFile) {
+  const raw = String(codeText ?? '');
+  if (!raw) return '<span class="diff-line-prefix"> </span><span class="diff-line-syntax"></span>';
+  const firstChar = raw.charAt(0);
+  const hasDiffPrefix = firstChar === '+' || firstChar === '-' || firstChar === ' ';
+  const prefix = hasDiffPrefix ? firstChar : ' ';
+  const body = hasDiffPrefix ? raw.slice(1) : raw;
+
+  let highlighted = escapeHtml(body);
+  const extMeta = getFileExtMeta(filename);
+  const lang = extMeta.hljsLang;
+  if (
+    body.trim().length > 0 &&
+    lang &&
+    typeof window !== 'undefined' &&
+    window.hljs &&
+    typeof window.hljs.highlight === 'function'
+  ) {
+    try {
+      if (!window.hljs.getLanguage || window.hljs.getLanguage(lang)) {
+        highlighted = window.hljs.highlight(body, { language: lang, ignoreIllegals: true }).value;
+      }
+    } catch {
+      highlighted = escapeHtml(body);
+    }
+  }
+  return `<span class="diff-line-prefix">${escapeHtml(prefix)}</span><span class="diff-line-syntax">${highlighted}</span>`;
+}
+
+function renderDiffFileItemHtml(file, resolvedFindings, showSubPath = true) {
+  const isSelected = file.filename === state.selectedDiffFile;
+  const fileFindings = resolvedFindings.filter(
+    (f) => f.resolvedPath === file.filename && !f.dismissed
+  );
+  const findingBadge =
+    fileFindings.length > 0
+      ? `<span class="badge badge-severity-major">${fileFindings.length}</span>`
+      : '';
+  const shortPath = file.filename.replace(/^projects\/services\//, '');
+  const parts = shortPath.split('/');
+  const baseName = parts.pop() || shortPath;
+  const dirSub = parts.join('/');
+  const statusMeta = getFileStatusMeta(file.status);
+
+  return `
+    <div class="diff-file-item ${isSelected ? 'active' : ''}" data-filename="${escapeHtml(file.filename)}" title="${escapeHtml(file.filename)} (${escapeHtml(statusMeta.title)})">
+      <div class="diff-file-item-info">
+        <div class="diff-file-name-row">
+          <span class="file-status-badge ${statusMeta.cls}" title="${escapeHtml(statusMeta.title)}">${escapeHtml(statusMeta.code)}</span>
+          <span class="diff-file-name">${escapeHtml(baseName)}</span>
+        </div>
+        ${showSubPath && dirSub ? `<span class="diff-file-path-sub">${escapeHtml(dirSub)}</span>` : ''}
+      </div>
+      <div class="diff-stats">
+        ${findingBadge}
+        <span class="stat-add">+${file.additions}</span>
+        <span class="stat-del">-${file.deletions}</span>
+      </div>
+    </div>
+  `;
 }
 
 function renderDiffTree() {
   const treeEl = document.getElementById('diffFileTree');
-  const files = state.currentDiff?.files || [];
+  if (!treeEl) return;
+  const allFiles = state.currentDiff?.files || [];
   const resolvedFindings = state.currentDiff?.resolvedFindings || [];
 
-  treeEl.innerHTML = files
-    .map((file) => {
-      const isSelected = file.filename === state.selectedDiffFile;
-      const fileFindings = resolvedFindings.filter((f) => f.resolvedPath === file.filename && !f.dismissed);
-      const findingBadge =
-        fileFindings.length > 0
-          ? `<span class="badge badge-severity-major">${fileFindings.length}</span>`
-          : '';
-      const shortName = file.filename.replace(/^projects\/services\//, '');
+  const activeFilter = state.diffFolderFilter || '';
+  const files = activeFilter
+    ? allFiles.filter(
+        (f) => f.filename === activeFilter || f.filename.startsWith(activeFilter + '/')
+      )
+    : allFiles;
 
-      return `
-        <div class="diff-file-item ${isSelected ? 'active' : ''}" data-filename="${escapeHtml(file.filename)}" title="${escapeHtml(file.filename)}">
-          <span class="diff-file-name">${escapeHtml(shortName)}</span>
-          <div class="diff-stats">
-            ${findingBadge}
-            <span class="stat-add">+${file.additions}</span>
-            <span class="stat-del">-${file.deletions}</span>
+  const isTreeMode = state.diffTreeMode !== 'list';
+
+  const toolbarHtml = `
+    <div class="diff-tree-toolbar">
+      <span class="meta-text" style="font-weight:600;">${files.length}/${allFiles.length} file${files.length > 1 ? 's' : ''}</span>
+      <div style="display:flex;align-items:center;gap:4px;">
+        <button type="button" id="diffTreeToggleModeBtn" class="btn btn-ghost btn-xs" title="Toggle between collapsible folder view and flat list">
+          ${isTreeMode ? 'Folder View' : 'List View'}
+        </button>
+        ${
+          isTreeMode
+            ? `<button type="button" id="diffTreeExpandCollapseAllBtn" class="btn btn-ghost btn-xs" title="Collapse all / Expand all">
+                ${state.diffCollapsedFolders.size > 0 ? 'Expand' : 'Collapse'}
+              </button>`
+            : ''
+        }
+      </div>
+    </div>
+    ${
+      activeFilter
+        ? `<div class="diff-folder-filter-banner">
+            <span style="word-break:break-all;">Folder: <strong>${escapeHtml(activeFilter.replace(/^projects\/services\//, ''))}</strong></span>
+            <div style="display:flex;gap:4px;flex-shrink:0;">
+              <button type="button" id="diffClearFolderFilterBtn" class="btn btn-secondary btn-xs" title="Show all modified files">&times;</button>
+            </div>
+          </div>`
+        : ''
+    }
+  `;
+
+  let bodyHtml = '';
+  if (!isTreeMode) {
+    bodyHtml = files.map((file) => renderDiffFileItemHtml(file, resolvedFindings, true)).join('');
+  } else {
+    // Group files by directory path so every folder can be collapsed/expanded and full names are visible
+    const groups = new Map();
+    for (const file of files) {
+      const shortPath = file.filename.replace(/^projects\/services\//, '');
+      const lastSlash = shortPath.lastIndexOf('/');
+      const folderKey = lastSlash >= 0 ? shortPath.slice(0, lastSlash) : '(root)';
+      const fullFolder =
+         file.filename.lastIndexOf('/') >= 0
+          ? file.filename.slice(0, file.filename.lastIndexOf('/'))
+          : '';
+      if (!groups.has(folderKey)) {
+        groups.set(folderKey, { folderKey, fullFolder, files: [] });
+      }
+      groups.get(folderKey).files.push(file);
+    }
+
+    bodyHtml = Array.from(groups.values())
+      .map((grp) => {
+        const isCollapsed = state.diffCollapsedFolders.has(grp.folderKey);
+        const itemsHtml = grp.files
+          .map((file) => renderDiffFileItemHtml(file, resolvedFindings, false))
+          .join('');
+        return `
+          <div class="diff-folder-group ${isCollapsed ? 'collapsed' : ''}" data-folder-key="${escapeHtml(grp.folderKey)}">
+            <div class="diff-folder-header" data-folder-key="${escapeHtml(grp.folderKey)}" title="Click to collapse / expand folder ${escapeHtml(grp.folderKey)}">
+              <span class="diff-folder-header-title">
+                <span>${isCollapsed ? '▸' : '▾'}</span>
+                <span>${escapeHtml(grp.folderKey)}</span>
+              </span>
+              <span class="meta-text" style="flex-shrink:0;">${grp.files.length}</span>
+            </div>
+            <div class="diff-folder-children">
+              ${itemsHtml}
+            </div>
           </div>
-        </div>
-      `;
-    })
-    .join('');
+        `;
+      })
+      .join('');
+  }
+
+  treeEl.innerHTML = toolbarHtml + bodyHtml;
+
+  document.getElementById('diffTreeToggleModeBtn')?.addEventListener('click', () => {
+    state.diffTreeMode = state.diffTreeMode === 'list' ? 'tree' : 'list';
+    try {
+      localStorage.setItem('prHub.diffTreeMode', state.diffTreeMode);
+    } catch {
+      // Ignore storage errors
+    }
+    renderDiffTree();
+  });
+
+  document.getElementById('diffTreeExpandCollapseAllBtn')?.addEventListener('click', () => {
+    if (state.diffCollapsedFolders.size > 0) {
+      state.diffCollapsedFolders.clear();
+    } else {
+      treeEl.querySelectorAll('.diff-folder-group').forEach((el) => {
+        if (el.dataset.folderKey) state.diffCollapsedFolders.add(el.dataset.folderKey);
+      });
+    }
+    renderDiffTree();
+  });
+
+  document.getElementById('diffClearFolderFilterBtn')?.addEventListener('click', () => {
+    state.diffFolderFilter = '';
+    renderDiffTree();
+  });
+
+  treeEl.querySelectorAll('.diff-folder-header').forEach((hdr) => {
+    hdr.addEventListener('click', () => {
+      const key = hdr.dataset.folderKey;
+      if (!key) return;
+      if (state.diffCollapsedFolders.has(key)) {
+        state.diffCollapsedFolders.delete(key);
+      } else {
+        state.diffCollapsedFolders.add(key);
+      }
+      renderDiffTree();
+    });
+  });
 
   treeEl.querySelectorAll('.diff-file-item').forEach((item) => {
     item.addEventListener('click', () => {
@@ -1540,6 +2912,20 @@ function renderDiffTree() {
 }
 
 function selectDiffFile(filename, highlightLine = null) {
+  const viewerEl = document.getElementById('diffViewerContainer');
+  const files = state.currentDiff?.files || [];
+  let fileObj = files.find((f) => f.filename === filename);
+
+  // If the requested file is not in the current PR's diff (e.g. stale selection), fall back to the first valid file
+  if (!fileObj && files.length > 0) {
+    const fileWithFinding = (state.currentDiff?.resolvedFindings || []).find(
+      (f) => f.inDiff && f.resolvedPath && files.some((df) => df.filename === f.resolvedPath)
+    )?.resolvedPath;
+    fileObj = files.find((f) => f.filename === fileWithFinding) || files[0];
+    filename = fileObj.filename;
+    highlightLine = null;
+  }
+
   state.selectedDiffFile = filename;
   state.highlightedLine = highlightLine;
   state.activeHunkIndex = -1;
@@ -1549,17 +2935,19 @@ function selectDiffFile(filename, highlightLine = null) {
   const activeTreeItem = document.querySelector('#diffFileTree .diff-file-item.active');
   activeTreeItem?.scrollIntoView({ block: 'nearest' });
 
-  const viewerEl = document.getElementById('diffViewerContainer');
-  const files = state.currentDiff?.files || [];
-  const fileObj = files.find((f) => f.filename === filename);
-
   if (!fileObj) {
-    viewerEl.innerHTML = `<div class="empty-state meta-text">Fichier "${escapeHtml(filename)}" non trouvé dans le diff.</div>`;
+    viewerEl.innerHTML = `<div class="empty-state meta-text">No files in diff.</div>`;
     return;
   }
 
   const fileFindings = (state.currentDiff?.resolvedFindings || []).filter(
     (f) => f.resolvedPath === filename && !f.dismissed
+  );
+  const fileThreads = (state.currentOverview?.reviewThreads || []).filter(
+    (t) =>
+      t.path === filename ||
+      filename.endsWith('/' + t.path) ||
+      t.path.endsWith('/' + filename)
   );
 
   const cacheKey = `${state.selectedPrKey || ''}::${filename}`;
@@ -1573,59 +2961,60 @@ function selectDiffFile(filename, highlightLine = null) {
     fileObj.patch || '',
     fileFindings,
     highlightLine,
-    filename
+    filename,
+    fileThreads
   );
   const fileIdx = files.findIndex((f) => f.filename === filename);
   const prevFile = fileIdx > 0 ? files[fileIdx - 1] : null;
   const nextFile = fileIdx >= 0 && fileIdx < files.length - 1 ? files[fileIdx + 1] : null;
 
-  const fileOptionsHtml = files
-    .map((f, idx) => {
-      const fFindingsCount = (state.currentDiff?.resolvedFindings || []).filter(
-        (rf) => rf.resolvedPath === f.filename && !rf.dismissed
-      ).length;
-      const shortPath = f.filename.replace(/^projects\/services\//, '');
-      const fTag = fFindingsCount > 0 ? ` [${fFindingsCount} finding${fFindingsCount > 1 ? 's' : ''}]` : '';
-      return `<option value="${escapeHtml(f.filename)}" ${f.filename === filename ? 'selected' : ''}>${idx + 1}/${files.length} · ${escapeHtml(shortPath)} (+${f.additions} -${f.deletions})${escapeHtml(fTag)}</option>`;
-    })
-    .join('');
+  const bLbl = formatKeybindLabel(getKeybind('toggleFiles'));
+  const zLbl = formatKeybindLabel(getKeybind('focusDiff'));
+  const cLbl = formatKeybindLabel(getKeybind('agentChat'));
+  const statusMeta = getFileStatusMeta(fileObj.status);
 
   viewerEl.innerHTML = `
     <div class="diff-file-header">
-      <div style="display:flex;gap:6px;align-items:center;min-width:0;flex:1;">
-        <button id="diffBackToQueueInlineBtn" class="btn btn-secondary btn-xs" title="Revenir à la sélection des PRs en pleine page (raccourci : q)">&larr; PRs (q)</button>
-        <button id="diffToggleFilesInlineBtn" class="btn ${state.fileTreeCollapsed ? 'btn-primary' : 'btn-secondary'} btn-xs" title="Afficher / Masquer l'arbre des fichiers modifiés (raccourci : b)">
-          ${state.fileTreeCollapsed ? `Fichiers (${files.length}) (b)` : 'Masquer Fichiers (b)'}
-        </button>
-        <button id="diffPrevFileBtn" class="btn btn-secondary btn-xs" ${prevFile ? '' : 'disabled'} title="Fichier précédent (Flèche Gauche ←)">&larr;</button>
-        <span class="meta-text" style="white-space:nowrap;font-weight:600;">${fileIdx + 1}/${files.length}</span>
-        <button id="diffNextFileBtn" class="btn btn-secondary btn-xs" ${nextFile ? '' : 'disabled'} title="Fichier suivant (Flèche Droite →)">&rarr;</button>
-        <select id="diffFileJumpSelect" class="diff-file-jump-select" title="Changer rapidement de fichier (raccourci : g)">
-          ${fileOptionsHtml}
-        </select>
-        <button id="diffCopyPathBtn" class="btn btn-ghost btn-xs" title="Copier le chemin complet : ${escapeHtml(fileObj.filename)}">Copier chemin</button>
-        <div class="diff-stats" style="margin-left:2px;">
+      <div class="diff-file-header-identity">
+        <div class="diff-file-identity-left">
+          <span class="file-status-badge ${statusMeta.cls}" title="${escapeHtml(statusMeta.title)}">${escapeHtml(statusMeta.code)}</span>
+          ${renderClickableBreadcrumbsHtml(fileObj.filename, null, 'diff')}
+          <button id="diffCopyPathBtn" class="btn btn-ghost btn-xs" style="flex-shrink:0;" title="Copy full path: ${escapeHtml(fileObj.filename)}">Copy path</button>
+        </div>
+        <div class="diff-stats" style="flex-shrink:0;">
           <span class="stat-add">+${fileObj.additions}</span>
           <span class="stat-del">-${fileObj.deletions}</span>
         </div>
       </div>
-      <div style="display:flex;gap:6px;align-items:center;flex-shrink:0;">
-        <div class="diff-zoom-group" title="Zoomer / Dézoomer dans le diff (raccourcis : - / + / 0)">
-          <button id="diffZoomOutBtn" class="btn btn-xs" title="Dézoomer (-)">&minus;</button>
-          <button id="diffZoomResetBtn" class="btn btn-xs diff-zoom-label" title="Réinitialiser le zoom à 100% (0)">${state.diffZoom}%</button>
-          <button id="diffZoomInBtn" class="btn btn-xs" title="Zoomer (+)">+</button>
+      <div class="diff-file-header-toolbar">
+        <div class="diff-file-header-main">
+          <button id="diffToggleFilesInlineBtn" class="btn ${state.fileTreeCollapsed ? 'btn-primary' : 'btn-secondary'} btn-xs" title="Show / Hide modified files tree (shortcut: ${escapeHtml(bLbl)})">
+            ${state.fileTreeCollapsed ? `Files (${files.length}) (${escapeHtml(bLbl)})` : `Hide Files (${escapeHtml(bLbl)})`}
+          </button>
+          <div class="diff-nav-group">
+            <button id="diffPrevFileBtn" class="btn btn-xs" ${prevFile ? '' : 'disabled'} title="Previous file">&larr;</button>
+            <span class="diff-nav-counter">${fileIdx + 1}/${files.length}</span>
+            <button id="diffNextFileBtn" class="btn btn-xs" ${nextFile ? '' : 'disabled'} title="Next file">&rarr;</button>
+          </div>
         </div>
-        <button id="diffExpandAllContextBtn" class="btn ${expandedRanges.length > 0 ? 'btn-primary' : 'btn-ghost'} btn-xs" title="Afficher ou replier toutes les lignes non modifiées de ce fichier directement dans le diff">
-          ${hasFullFileExpanded ? 'Replier contexte' : '&uarr;&darr; Tout le fichier'}
-        </button>
-        <button id="diffPrevHunkBtn" class="btn btn-ghost btn-xs" title="Hunk / Finding précédent dans ce fichier (raccourci : p)">&uarr; Hunk</button>
-        <button id="diffNextHunkBtn" class="btn btn-ghost btn-xs" title="Hunk / Finding suivant dans ce fichier (raccourci : n)">&darr; Hunk</button>
-        <button id="diffOpenFullFileBtn" class="btn btn-ghost btn-xs" title="Ouvrir le fichier complet dans l'arbre de travail (raccourci : t)">Tree</button>
-        <button id="diffOpenIdeBtn" class="btn btn-ghost btn-xs" title="Ouvrir ce fichier dans PhpStorm (raccourci : i)">PhpStorm</button>
-        <button id="diffOpenChatInlineBtn" class="btn ${state.chatOpen ? 'btn-primary' : 'btn-ghost'} btn-xs" title="Poser une question à l'IA sur ce fichier (raccourci : c)">Agent Q&amp;A (c)</button>
-        <button id="diffToggleFocusInlineBtn" class="btn ${state.focusDiffMode ? 'btn-primary' : 'btn-secondary'} btn-xs" title="Afficher / Masquer l'en-tête de la PR et les onglets (raccourci : z, f ou Esc)">
-          ${state.focusDiffMode ? 'Afficher En-tête (Esc)' : 'Focus Diff (z)'}
-        </button>
+        <div class="diff-file-header-actions">
+          <div class="diff-zoom-group" title="Zoom in / out in diff">
+            <button id="diffZoomOutBtn" class="btn btn-xs" title="Zoom out (-)">&minus;</button>
+            <button id="diffZoomResetBtn" class="btn btn-xs diff-zoom-label" title="Reset zoom to 100% (0)">${state.diffZoom}%</button>
+            <button id="diffZoomInBtn" class="btn btn-xs" title="Zoom in (+)">+</button>
+          </div>
+          <button id="diffExpandAllContextBtn" class="btn ${expandedRanges.length > 0 ? 'btn-primary' : 'btn-ghost'} btn-xs" title="Expand or collapse all unchanged lines of this file directly in the diff">
+            ${hasFullFileExpanded ? 'Collapse context' : '&uarr;&darr; All'}
+          </button>
+          <div class="diff-hunk-nav-group" title="Navigate between changes (hunks / findings)">
+            <button id="diffPrevHunkBtn" class="btn btn-xs" title="Previous Hunk / Finding in this file">&uarr;</button>
+            <button id="diffNextHunkBtn" class="btn btn-xs" title="Next Hunk / Finding in this file">&darr;</button>
+          </div>
+          <button id="diffOpenChatInlineBtn" class="btn ${state.chatOpen ? 'btn-primary' : 'btn-ghost'} btn-xs" title="Ask AI about this file">Q&amp;A (${escapeHtml(cLbl)})</button>
+          <button id="diffToggleFocusInlineBtn" class="btn ${state.focusDiffMode ? 'btn-primary' : 'btn-secondary'} btn-xs" title="Show / Hide PR header and tabs">
+            ${state.focusDiffMode ? `Exit Focus (${escapeHtml(zLbl)})` : `Focus (${escapeHtml(zLbl)})`}
+          </button>
+        </div>
       </div>
     </div>
     <div id="diffScrollArea" class="diff-scroll-area" tabindex="0">
@@ -1637,9 +3026,8 @@ function selectDiffFile(filename, highlightLine = null) {
     </div>
   `;
 
-  document.getElementById('diffBackToQueueInlineBtn')?.addEventListener('click', () => {
-    showFullPagePrQueue();
-  });
+  bindClickableBreadcrumbs(viewerEl);
+  syncKeybindingLegends();
 
   document.getElementById('diffZoomOutBtn')?.addEventListener('click', () => {
     adjustDiffZoom(-1);
@@ -1651,13 +3039,9 @@ function selectDiffFile(filename, highlightLine = null) {
     adjustDiffZoom(1);
   });
 
-  document.getElementById('diffFileJumpSelect')?.addEventListener('change', (e) => {
-    selectDiffFile(e.target.value, null);
-  });
-
   document.getElementById('diffCopyPathBtn')?.addEventListener('click', async () => {
     await navigator.clipboard.writeText(fileObj.filename);
-    showToast(`Chemin copié : ${fileObj.filename}`);
+    showToast(`Path copied: ${fileObj.filename}`);
   });
 
   document.getElementById('diffExpandAllContextBtn')?.addEventListener('click', () => {
@@ -1688,15 +3072,6 @@ function selectDiffFile(filename, highlightLine = null) {
     if (nextFile) selectDiffFile(nextFile.filename, null);
   });
 
-  document.getElementById('diffOpenFullFileBtn')?.addEventListener('click', () => {
-    if (state.focusDiffMode) setFocusDiffMode(false);
-    navigateToCodeLocation(fileObj.filename, highlightLine, 'tree');
-  });
-
-  document.getElementById('diffOpenIdeBtn')?.addEventListener('click', () => {
-    openCurrentPrInIde('phpstorm', fileObj.filename, highlightLine || 1);
-  });
-
   document.getElementById('diffOpenChatInlineBtn')?.addEventListener('click', () => {
     toggleChatDrawer();
   });
@@ -1705,13 +3080,44 @@ function selectDiffFile(filename, highlightLine = null) {
     renderAgentContextBanner();
   }
 
+  // Bind multi-line selection (drag, Shift+Click, or single click) on line numbers / '+' buttons
+  const diffTable = viewerEl.querySelector('.diff-table');
+  bindMultiLineCommentSelection(diffTable, fileObj.filename, 3);
+  bindGitHubThreadActionListeners(viewerEl);
+
+  viewerEl.querySelectorAll('.diff-edit-manual-finding-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const cid = btn.dataset.cid;
+      const f = fileFindings.find((x) => x.cid === cid);
+      const row = btn.closest('tr');
+      if (f && row && diffTable) {
+        openInlineCommentComposer({
+          tableEl: diffTable,
+          anchorRow: row,
+          filePath: fileObj.filename,
+          lineNum: Number(f.resolvedLine || f.endLine || f.startLine || 1),
+          startLine: Number(f.startLine || f.resolvedLine || 1),
+          endLine: Number(f.endLine || f.resolvedLine || f.startLine || 1),
+          existingFinding: f,
+          colSpan: 3,
+        });
+      }
+    });
+  });
+
+  viewerEl.querySelectorAll('.diff-delete-manual-finding-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      deleteManualInlineComment(btn.dataset.cid);
+    });
+  });
+
   viewerEl.querySelectorAll('.diff-copy-finding-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const cid = btn.dataset.cid;
       const f = fileFindings.find((x) => x.cid === cid);
       if (f) {
         await navigator.clipboard.writeText(f.customComment);
-        showToast(`Commentaire ${f.id} copié.`);
+        showToast(`Comment ${f.id} copied.`);
       }
     });
   });
@@ -1782,14 +3188,11 @@ function selectRelativeDiffFile(delta) {
   const currentIdx = idx >= 0 ? idx : 0;
   const targetIdx = currentIdx + delta;
   if (targetIdx < 0 || targetIdx >= files.length) {
-    showToast(delta < 0 ? 'Premier fichier du diff.' : 'Dernier fichier du diff.', 1400);
+    showToast(delta < 0 ? 'First file in diff.' : 'Last file in diff.', 1400);
     return false;
   }
   const targetFile = files[targetIdx];
   selectDiffFile(targetFile.filename, null);
-  if (state.activeTab === 'tree') {
-    openFileInWorkingTree(targetFile.filename, null);
-  }
   return true;
 }
 
@@ -1797,7 +3200,7 @@ function jumpToRelativeHunk(delta) {
   const viewerEl = document.getElementById('diffViewerContainer');
   if (!viewerEl) return;
   const targets = Array.from(
-    viewerEl.querySelectorAll('tr.diff-row-hunk, td.diff-inline-finding')
+    viewerEl.querySelectorAll('tr.diff-row-hunk, td.diff-inline-finding, td.diff-github-thread')
   );
   if (targets.length === 0) return;
 
@@ -1827,7 +3230,7 @@ async function ensureDiffFileBlobLoaded(filename) {
     const res = await fetch(
       `/api/blob?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&path=${encodeURIComponent(filename)}`
     );
-    if (!res.ok) throw new Error('Impossible de charger le contenu complet du fichier');
+    if (!res.ok) throw new Error('Unable to load full file content');
     const data = await res.json();
     const rawLines = String(data.content ?? '').split('\n');
     if (rawLines.length > 1 && rawLines[rawLines.length - 1] === '') {
@@ -1836,7 +3239,7 @@ async function ensureDiffFileBlobLoaded(filename) {
     state.diffBlobCache[cacheKey] = rawLines;
     return rawLines;
   } catch (err) {
-    showToast(err.message || 'Impossible de charger les lignes non modifiées');
+    showToast(err.message || 'Unable to load unchanged lines');
     return null;
   }
 }
@@ -1901,7 +3304,7 @@ async function expandDiffContextToEof(filename, startRight, startLeft, step = 0)
 
   const totalRight = blobLines.length;
   if (startRight > totalRight) {
-    showToast('Fin du fichier déjà atteinte.', 1500);
+    showToast('End of file already reached.', 1500);
     return;
   }
 
@@ -2017,38 +3420,61 @@ function renderDiffLineAndFindingsHtml({
   rNum,
   codeText,
   fileFindings,
+  fileThreads = [],
   highlightLine,
+  filename = state.selectedDiffFile,
 }) {
   const isHighlighted = highlightLine && rNum && Number(rNum) === Number(highlightLine);
   const finalClass = `${rowClass}${isHighlighted ? ' diff-row-highlight' : ''}`.trim();
+  const rightCellHtml = rNum
+    ? `<td class="diff-line-num commentable-line" data-comment-line="${rNum}" title="Click or drag to write a comment on line ${rNum}"><button type="button" class="diff-line-add-btn" tabindex="-1">+</button>${rNum}</td>`
+    : `<td class="diff-line-num"></td>`;
   const out = [
-    `
-      <tr class="${finalClass}" ${rNum ? `data-right-line="${rNum}"` : ''}>
-        <td class="diff-line-num">${lNum}</td>
-        <td class="diff-line-num">${rNum}</td>
-        <td class="diff-line-code">${escapeHtml(codeText)}</td>
-      </tr>
-    `,
+    `<tr class="${finalClass}" ${rNum ? `data-right-line="${rNum}"` : ''}><td class="diff-line-num">${lNum}</td>${rightCellHtml}<td class="diff-line-code">${highlightDiffCodeLine(codeText, filename)}</td></tr>`,
   ];
 
   if (rNum) {
     const matchingFindings = fileFindings.filter((f) => Number(f.resolvedLine) === Number(rNum));
     for (const mf of matchingFindings) {
       const sev = getSeverityMeta(mf.severity);
+      const rangeBadgeHtml =
+        mf.startLine && mf.endLine && Number(mf.endLine) > Number(mf.startLine)
+          ? `<span class="badge" title="Multi-line comment (L${mf.startLine} to L${mf.endLine})">L${mf.startLine}&ndash;L${mf.endLine}</span>`
+          : `<span class="badge">L${rNum}</span>`;
       out.push(`
         <tr>
           <td colspan="3" class="diff-inline-finding">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
               <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                 <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
+                ${rangeBadgeHtml}
                 <strong style="font-size:12.5px;">${escapeHtml(mf.id)} — ${formatInlineCodeHtml(mf.title)}</strong>
               </div>
-              <div style="display:flex;gap:6px;">
-                <button class="btn btn-secondary btn-sm diff-copy-finding-btn" data-cid="${escapeHtml(mf.cid)}">Copier</button>
-                <button class="btn btn-primary btn-sm diff-post-finding-btn" data-cid="${escapeHtml(mf.cid)}">Poster ici</button>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                ${
+                  mf.isManual
+                    ? `<button class="btn btn-ghost btn-sm diff-edit-manual-finding-btn" data-cid="${escapeHtml(mf.cid)}">Edit</button>
+                       <button class="btn btn-ghost btn-sm diff-delete-manual-finding-btn" data-cid="${escapeHtml(mf.cid)}">Delete</button>`
+                    : ''
+                }
+                <button class="btn btn-secondary btn-sm diff-copy-finding-btn" data-cid="${escapeHtml(mf.cid)}">Copy</button>
+                <button class="btn btn-primary btn-sm diff-post-finding-btn" data-cid="${escapeHtml(mf.cid)}">Post here</button>
               </div>
             </div>
             <pre style="margin:0;white-space:pre-wrap;background:var(--bg-app);padding:10px;border-radius:4px;border:1px solid var(--border-color);font-size:11.5px;">${escapeHtml(mf.customComment)}</pre>
+          </td>
+        </tr>
+      `);
+    }
+
+    const matchingThreads = (fileThreads || []).filter(
+      (t) => Number(t.line || t.startLine || 0) === Number(rNum)
+    );
+    for (const thread of matchingThreads) {
+      out.push(`
+        <tr>
+          <td colspan="3" class="diff-github-thread">
+            ${renderGitHubThreadCardHtml(thread, { inDiff: true })}
           </td>
         </tr>
       `);
@@ -2067,8 +3493,10 @@ function renderGapWithExpanderHtml({
   blobLines,
   expandedRanges,
   fileFindings,
+  fileThreads = [],
   highlightLine,
   isTopOfFile = false,
+  filename = state.selectedDiffFile,
 }) {
   const rows = [];
   const step = 20;
@@ -2076,13 +3504,9 @@ function renderGapWithExpanderHtml({
   if (gapEndRight < gapStartRight) {
     // Zero hidden lines above this hunk, just render the standard hunk header row if provided
     if (hunkHeaderText) {
-      rows.push(`
-        <tr class="diff-row-hunk">
-          <td class="diff-line-num">…</td>
-          <td class="diff-line-num">…</td>
-          <td class="diff-line-code">${escapeHtml(hunkHeaderText)}</td>
-        </tr>
-      `);
+      rows.push(
+        `<tr class="diff-row-hunk"><td class="diff-line-num">…</td><td class="diff-line-num">…</td><td class="diff-line-code"><div class="diff-hunk-header-bar"><span>${escapeHtml(hunkHeaderText)}</span></div></td></tr>`
+      );
     }
     return rows.join('');
   }
@@ -2127,21 +3551,19 @@ function renderGapWithExpanderHtml({
             rNum: rLine,
             codeText: ` ${lineContent}`,
             fileFindings,
+            fileThreads,
             highlightLine,
+            filename,
           })
         );
       }
       if (isLastSegment && hunkHeaderText) {
-        rows.push(`
-          <tr class="diff-row-hunk">
-            <td class="diff-line-num">…</td>
-            <td class="diff-line-num">…</td>
-            <td class="diff-line-code">${escapeHtml(hunkHeaderText)}</td>
-          </tr>
-        `);
+        rows.push(
+          `<tr class="diff-row-hunk"><td class="diff-line-num">…</td><td class="diff-line-num">…</td><td class="diff-line-code"><div class="diff-hunk-header-bar"><span>${escapeHtml(hunkHeaderText)}</span></div></td></tr>`
+        );
       }
     } else {
-      // Hidden segment -> render interactive expander row with ↑ / ↓ arrow buttons
+      // Hidden segment -> render ultra-thin single-line expander row with ↑ / ↓ arrow buttons
       const upStartRight = Math.max(seg.startRight, seg.endRight - step + 1);
       const upEndRight = seg.endRight;
       const upStartLeft = segStartLeft + (upStartRight - seg.startRight);
@@ -2154,44 +3576,33 @@ function renderGapWithExpanderHtml({
 
       const headerLabel =
         isLastSegment && hunkHeaderText
-          ? `${hunkHeaderText}   ·   ${segCount} ${segCount > 1 ? 'lignes non modifiées masquées' : 'ligne non modifiée masquée'} (lignes ${seg.startRight}–${seg.endRight})`
-          : `@@ ${segCount} ${segCount > 1 ? 'lignes non modifiées masquées' : 'ligne non modifiée masquée'} (lignes ${seg.startRight}–${seg.endRight}) @@`;
+          ? `${hunkHeaderText}   ·   ${segCount} unchanged ${segCount > 1 ? 'lines' : 'line'} hidden (lines ${seg.startRight}–${seg.endRight})`
+          : `@@ ${segCount} unchanged ${segCount > 1 ? 'lines' : 'line'} hidden (lines ${seg.startRight}–${seg.endRight}) @@`;
 
       const canExpandDown = !isTopOfFile && segCount > step;
       const expandAllBtnHtml =
         segCount > step
-          ? `<button type="button" class="diff-expand-btn diff-expand-range-btn" data-start-right="${seg.startRight}" data-end-right="${seg.endRight}" data-start-left="${segStartLeft}" data-end-left="${segEndLeft}" title="Afficher les ${segCount} lignes masquées (lignes ${seg.startRight} à ${seg.endRight})">&uarr;&darr; Tout (${segCount})</button>`
+          ? `<button type="button" class="diff-expand-btn diff-expand-range-btn" data-start-right="${seg.startRight}" data-end-right="${seg.endRight}" data-start-left="${segStartLeft}" data-end-left="${segEndLeft}" title="Show all ${segCount} hidden lines (lines ${seg.startRight} to ${seg.endRight})">&uarr;&darr; All (${segCount})</button>`
           : '';
 
-      rows.push(`
-        <tr class="diff-row-hunk">
-          <td colspan="2" class="diff-hunk-expand-cell">
-            <div class="diff-hunk-actions">
-              <button type="button" class="diff-expand-btn diff-expand-range-btn" data-start-right="${upStartRight}" data-end-right="${upEndRight}" data-start-left="${upStartLeft}" data-end-left="${upEndLeft}" title="Déplier vers le haut (lignes ${upStartRight} à ${upEndRight})">&uarr; ${upEndRight - upStartRight + 1}</button>
-              ${
-                canExpandDown
-                  ? `<button type="button" class="diff-expand-btn diff-expand-range-btn" data-start-right="${downStartRight}" data-end-right="${downEndRight}" data-start-left="${downStartLeft}" data-end-left="${downEndLeft}" title="Déplier vers le bas (lignes ${downStartRight} à ${downEndRight})">&darr; ${downEndRight - downStartRight + 1}</button>`
-                  : ''
-              }
-            </div>
-          </td>
-          <td class="diff-line-code">
-            <div class="diff-hunk-header-bar">
-              <span>${escapeHtml(headerLabel)}</span>
-              ${expandAllBtnHtml}
-            </div>
-          </td>
-        </tr>
-      `);
+      rows.push(
+        `<tr class="diff-row-hunk"><td colspan="2" class="diff-hunk-expand-cell"><div class="diff-hunk-actions"><button type="button" class="diff-expand-btn diff-expand-range-btn" data-start-right="${upStartRight}" data-end-right="${upEndRight}" data-start-left="${upStartLeft}" data-end-left="${upEndLeft}" title="Expand upwards (lines ${upStartRight} to ${upEndRight})">&uarr; ${upEndRight - upStartRight + 1}</button>${canExpandDown ? `<button type="button" class="diff-expand-btn diff-expand-range-btn" data-start-right="${downStartRight}" data-end-right="${downEndRight}" data-start-left="${downStartLeft}" data-end-left="${downEndLeft}" title="Expand downwards (lines ${downStartRight} to ${downEndRight})">&darr; ${downEndRight - downStartRight + 1}</button>` : ''}</div></td><td class="diff-line-code"><div class="diff-hunk-header-bar"><span>${escapeHtml(headerLabel)}</span>${expandAllBtnHtml}</div></td></tr>`
+      );
     }
   });
 
   return rows.join('');
 }
 
-function renderPatchTableRows(patch, fileFindings, highlightLine, filename = state.selectedDiffFile) {
+function renderPatchTableRows(
+  patch,
+  fileFindings,
+  highlightLine,
+  filename = state.selectedDiffFile,
+  fileThreads = []
+) {
   if (!patch) {
-    return `<tr><td colspan="3" class="diff-line-code meta-text">Aucun diff textuel disponible pour ce fichier.</td></tr>`;
+    return `<tr><td colspan="3" class="diff-line-code meta-text">No text diff available for this file.</td></tr>`;
   }
 
   const cacheKey = `${state.selectedPrKey || ''}::${filename || ''}`;
@@ -2200,7 +3611,7 @@ function renderPatchTableRows(patch, fileFindings, highlightLine, filename = sta
   const hunks = parsePatchIntoHunks(patch);
 
   if (hunks.length === 0) {
-    return `<tr><td colspan="3" class="diff-line-code meta-text">Aucun diff textuel disponible pour ce fichier.</td></tr>`;
+    return `<tr><td colspan="3" class="diff-line-code meta-text">No text diff available for this file.</td></tr>`;
   }
 
   const rows = [];
@@ -2223,8 +3634,10 @@ function renderPatchTableRows(patch, fileFindings, highlightLine, filename = sta
         blobLines,
         expandedRanges,
         fileFindings,
+        fileThreads,
         highlightLine,
         isTopOfFile: idx === 0,
+        filename,
       })
     );
 
@@ -2238,7 +3651,9 @@ function renderPatchTableRows(patch, fileFindings, highlightLine, filename = sta
           rNum: r.rightNum,
           codeText: r.rawLine,
           fileFindings,
+          fileThreads,
           highlightLine,
+          filename,
         })
       );
     }
@@ -2265,28 +3680,18 @@ function renderPatchTableRows(patch, fileFindings, highlightLine, filename = sta
           blobLines,
           expandedRanges,
           fileFindings,
+          fileThreads,
           highlightLine,
           isTopOfFile: false,
+          filename,
         })
       );
     }
   } else {
-    // Blob not loaded yet -> show interactive ↓ +20 / ↓ Fin du fichier bar at bottom
-    rows.push(`
-      <tr class="diff-row-hunk">
-        <td colspan="2" class="diff-hunk-expand-cell">
-          <div class="diff-hunk-actions">
-            <button type="button" class="diff-expand-btn diff-expand-eof-btn" data-start-right="${eofStartRight}" data-start-left="${eofStartLeft}" data-step="20" title="Déplier les 20 lignes suivantes vers le bas (à partir de la ligne ${eofStartRight})">&darr; 20</button>
-          </div>
-        </td>
-        <td class="diff-line-code">
-          <div class="diff-hunk-header-bar">
-            <span>@@ Afficher la suite du fichier après la ligne ${lastRight} @@</span>
-            <button type="button" class="diff-expand-btn diff-expand-eof-btn" data-start-right="${eofStartRight}" data-start-left="${eofStartLeft}" data-step="0" title="Afficher tout le reste du fichier jusqu'à la fin">&darr; Jusqu'à la fin du fichier</button>
-          </div>
-        </td>
-      </tr>
-    `);
+    // Blob not loaded yet -> show interactive ↓ +20 / ↓ End of file bar at bottom
+    rows.push(
+      `<tr class="diff-row-hunk"><td colspan="2" class="diff-hunk-expand-cell"><div class="diff-hunk-actions"><button type="button" class="diff-expand-btn diff-expand-eof-btn" data-start-right="${eofStartRight}" data-start-left="${eofStartLeft}" data-step="20" title="Expand next 20 lines downwards (starting from line ${eofStartRight})">&darr; 20</button></div></td><td class="diff-line-code"><div class="diff-hunk-header-bar"><span>@@ Show remaining file after line ${lastRight} @@</span><button type="button" class="diff-expand-btn diff-expand-eof-btn" data-start-right="${eofStartRight}" data-start-left="${eofStartLeft}" data-step="0" title="Show all remaining lines until end of file">&darr; Until end of file</button></div></td></tr>`
+    );
   }
 
   return rows.join('');
@@ -2310,337 +3715,570 @@ function openFileInDiffViewer(rawFilePath, line = null) {
   if (match) {
     selectDiffFile(match.filename, line);
   } else {
-    // Automatically fallback to opening the file in the Working Tree explorer!
-    showToast(`Fichier hors diff : ouverture dans l'Arbre de Travail.`);
-    if (state.splitMode) setSplitRightPanel('tree');
-    else switchTab('tree');
-    openFileInWorkingTree(cleanTarget, line);
+    showToast(`File not modified in this PR (${cleanTarget}). Opening in PhpStorm...`);
+    openCurrentPrInIde('phpstorm', cleanTarget, line || 1);
   }
 }
 
 // =============================================================================
-// Working Tree Explorer (Zero-Disk Git Tree + Grep + Physical Worktree)
+// PR Overview Tab (2. Description, Commits & GitHub Conversation / Review Threads)
 // =============================================================================
-async function loadTreeDirectory(pr, dirPath = '') {
-  const listEl = document.getElementById('treeEntriesList');
-  if (!listEl || !pr) return;
-
-  try {
-    const res = await fetch(
-      `/api/tree?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&path=${encodeURIComponent(dirPath)}`
-    );
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Impossible de lire git ls-tree');
-    if (state.selectedPrKey !== pr.key) return;
-
-    state.treeDir = data.dirPath || '';
-    state.treeEntries = data.entries || [];
-    if (data.worktree) {
-      state.worktreeStatus = data.worktree;
-      renderWorktreeStatusBar(pr);
+function renderMarkdownSafe(mdText) {
+  const raw = String(mdText || '').trim();
+  if (!raw) return '<span class="meta-text"><em>(No description provided)</em></span>';
+  if (window.marked && typeof window.marked.parse === 'function') {
+    try {
+      return window.marked.parse(raw);
+    } catch {
+      // Fallback to escaped pre-wrap
     }
-
-    renderTreeBreadcrumbs(pr);
-    renderTreeEntries(pr);
-  } catch (err) {
-    listEl.innerHTML = `<div class="empty-state meta-text" style="padding:12px;">${escapeHtml(err.message)}</div>`;
   }
+  return `<div style="white-space:pre-wrap;">${escapeHtml(raw)}</div>`;
 }
 
-function renderTreeBreadcrumbs(pr) {
-  const bcEl = document.getElementById('treeBreadcrumbs');
-  if (!bcEl) return;
-  const parts = state.treeDir ? state.treeDir.split('/').filter(Boolean) : [];
-  const crumbs = [`<span class="tree-crumb" data-path="">${escapeHtml(pr.repo)}</span>`];
-  let acc = '';
-  for (const part of parts) {
-    acc = acc ? `${acc}/${part}` : part;
-    crumbs.push(`<span>/</span><span class="tree-crumb" data-path="${escapeHtml(acc)}">${escapeHtml(part)}</span>`);
-  }
-  bcEl.innerHTML = crumbs.join(' ');
-  bcEl.querySelectorAll('.tree-crumb').forEach((el) => {
-    el.addEventListener('click', () => {
-      loadTreeDirectory(pr, el.dataset.path);
-    });
-  });
-}
-
-function renderTreeEntries(pr) {
-  const listEl = document.getElementById('treeEntriesList');
-  if (!listEl) return;
-
-  const items = [];
-  if (state.treeDir) {
-    const parentDir = state.treeDir.includes('/')
-      ? state.treeDir.slice(0, state.treeDir.lastIndexOf('/'))
+function renderGitHubThreadCardHtml(thread, { inDiff = false } = {}) {
+  const comments = thread.comments || [];
+  const firstComment = comments[0] || {};
+  const shortPath = String(thread.path || '').replace(/^projects\/services\//, '');
+  const lineLabel =
+    thread.startLine && thread.line && Number(thread.line) > Number(thread.startLine)
+      ? `L${thread.startLine}–L${thread.line}`
+      : thread.line
+      ? `L${thread.line}`
       : '';
-    items.push(`
-      <div class="tree-entry-item" data-type="tree" data-path="${escapeHtml(parentDir)}">
-        <span>..</span>
-        <span class="tree-entry-type">dir</span>
-      </div>
-    `);
+
+  const statusBadges = [];
+  if (thread.isResolved) {
+    statusBadges.push('<span class="badge badge-pass">Resolved</span>');
+  } else {
+    statusBadges.push('<span class="badge badge-warning">Open</span>');
+  }
+  if (thread.isOutdated) {
+    statusBadges.push('<span class="badge">Outdated</span>');
   }
 
-  for (const entry of state.treeEntries) {
-    const isSelected = entry.path === state.selectedTreeFile;
-    const label = entry.type === 'tree' ? `${entry.name}/` : entry.name;
-    items.push(`
-      <div class="tree-entry-item ${isSelected ? 'active' : ''}" data-type="${escapeHtml(entry.type)}" data-path="${escapeHtml(entry.path)}" title="${escapeHtml(entry.path)}">
-        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(label)}</span>
-        <span class="tree-entry-type">${entry.type === 'tree' ? 'dir' : 'file'}</span>
-      </div>
-    `);
-  }
+  const jumpBtnHtml =
+    !inDiff && thread.path
+      ? `<button type="button" class="btn btn-secondary btn-xs gh-thread-jump-diff-btn" data-path="${escapeHtml(thread.path)}" data-line="${thread.line || thread.startLine || 1}" title="View this thread directly below the line in 3. Git Diff">View in Diff &rarr;</button>`
+      : '';
 
-  listEl.innerHTML = items.join('') || `<div class="empty-state meta-text">Dossier vide.</div>`;
+  const resolveBtnHtml = thread.id
+    ? `<button type="button" class="btn btn-ghost btn-xs gh-thread-resolve-btn" data-thread-id="${escapeHtml(thread.id)}" data-resolved="${thread.isResolved ? '1' : '0'}">${thread.isResolved ? 'Reopen' : 'Resolve'}</button>`
+    : '';
 
-  listEl.querySelectorAll('.tree-entry-item').forEach((el) => {
-    el.addEventListener('click', () => {
-      const t = el.dataset.type;
-      const p = el.dataset.path;
-      if (t === 'tree') {
-        loadTreeDirectory(pr, p);
-      } else {
-        openFileInWorkingTree(p, null);
-      }
-    });
-  });
-}
-
-async function openFileInWorkingTree(filePath, highlightLine = null) {
-  const pr = state.prs.find((p) => p.key === state.selectedPrKey);
-  if (!pr || !filePath) return;
-
-  let cleanPath = String(filePath).replace(/^\/+/, '');
-  const viewerEl = document.getElementById('treeViewerContainer');
-  if (viewerEl) {
-    viewerEl.innerHTML = `<div class="empty-state meta-text">Chargement de ${escapeHtml(cleanPath)}...</div>`;
-  }
-
-  try {
-    let res = await fetch(
-      `/api/blob?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&path=${encodeURIComponent(cleanPath)}`
-    );
-
-    if (!res.ok) {
-      // Try resolving suffix via recursive file list
-      if (!state.allRepoFiles) {
-        const treeRes = await fetch(
-          `/api/tree?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&recursive=1`
-        );
-        if (treeRes.ok) {
-          const treeData = await treeRes.json();
-          state.allRepoFiles = treeData.files || [];
-        }
-      }
-      const match = (state.allRepoFiles || []).find(
-        (f) => f === cleanPath || f.endsWith('/' + cleanPath) || f.endsWith(cleanPath)
-      );
-      if (match) {
-        cleanPath = match;
-        res = await fetch(
-          `/api/blob?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&path=${encodeURIComponent(cleanPath)}`
-        );
-      }
-    }
-
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Fichier introuvable dans cet arbre');
-
-    state.selectedTreeFile = cleanPath;
-    state.selectedTreeLine = highlightLine;
-
-    // Sync directory sidebar to the file's parent folder
-    const parentDir = cleanPath.includes('/') ? cleanPath.slice(0, cleanPath.lastIndexOf('/')) : '';
-    if (parentDir !== state.treeDir) {
-      loadTreeDirectory(pr, parentDir);
-    } else {
-      renderTreeEntries(pr);
-    }
-
-    const lines = String(data.content || '').split('\n');
-    const rowsHtml = lines
-      .map((lineText, idx) => {
-        const lineNum = idx + 1;
-        const isHl = highlightLine && Number(highlightLine) === lineNum;
+  const commentsHtml = comments
+    .map(
+      (c) => {
+        const cAuthor = c.authorName || c.authorLogin || c.author || 'unknown';
         return `
-          <tr class="${isHl ? 'diff-row-highlight' : ''}" data-blob-line="${lineNum}">
-            <td class="blob-line-num">${lineNum}</td>
-            <td class="blob-line-code">${escapeHtml(lineText)}</td>
-          </tr>
-        `;
-      })
-      .join('');
-
-    viewerEl.innerHTML = `
-      <div class="diff-file-header">
-        <div style="display:flex;gap:8px;align-items:center;min-width:0;">
-          <button id="blobBackToDiffBtn" class="btn btn-secondary btn-xs" title="Retourner au Diff Git (raccourci : t)">&larr; Diff</button>
-          <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(cleanPath)} <span class="meta-text">(${lines.length} lignes)</span></span>
-        </div>
-        <div style="display:flex;gap:6px;align-items:center;">
-          <div class="diff-zoom-group" title="Zoomer / Dézoomer dans le code (raccourcis : - / + / 0)">
-            <button id="blobZoomOutBtn" class="btn btn-xs" title="Dézoomer (-)">&minus;</button>
-            <button id="blobZoomResetBtn" class="btn btn-xs diff-zoom-label" title="Réinitialiser le zoom à 100% (0)">${state.diffZoom}%</button>
-            <button id="blobZoomInBtn" class="btn btn-xs" title="Zoomer (+)">+</button>
+      <div class="pr-thread-comment">
+        <div class="pr-thread-comment-meta">
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+            <strong style="color:var(--text-primary);">${escapeHtml(cAuthor)}</strong>
+            ${c.authorAssociation === 'MEMBER' || c.authorAssociation === 'OWNER' ? '<span class="badge">Member</span>' : ''}
+            <span>${escapeHtml(formatRelativeTime(c.createdAt))}</span>
           </div>
-          <button id="blobOpenPhpstormBtn" class="btn btn-ghost btn-xs" title="Ouvrir dans PhpStorm (raccourci : i)">PhpStorm</button>
-          <button id="blobOpenVscodeBtn" class="btn btn-ghost btn-xs">VS Code</button>
+          ${c.url ? `<a href="${escapeHtml(c.url)}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs">GitHub &nearr;</a>` : ''}
         </div>
-      </div>
-      <div id="treeScrollArea" class="diff-scroll-area" tabindex="0">
-        <div class="diff-table-wrapper">
-          <table class="blob-table">
-            <tbody>${rowsHtml}</tbody>
-          </table>
-        </div>
+        <div class="pr-thread-comment-body markdown-body">${renderMarkdownSafe(c.body)}</div>
       </div>
     `;
-
-    document.getElementById('blobZoomOutBtn')?.addEventListener('click', () => {
-      adjustDiffZoom(-1);
-    });
-    document.getElementById('blobZoomResetBtn')?.addEventListener('click', () => {
-      applyDiffZoomVariables(100);
-    });
-    document.getElementById('blobZoomInBtn')?.addEventListener('click', () => {
-      adjustDiffZoom(1);
-    });
-
-    document.getElementById('blobBackToDiffBtn')?.addEventListener('click', () => {
-      navigateToCodeLocation(cleanPath, highlightLine, 'diff');
-    });
-    document.getElementById('blobOpenPhpstormBtn')?.addEventListener('click', () => {
-      openCurrentPrInIde('phpstorm', cleanPath, highlightLine || 1);
-    });
-    document.getElementById('blobOpenVscodeBtn')?.addEventListener('click', () => {
-      openCurrentPrInIde('code', cleanPath, highlightLine || 1);
-    });
-
-    const treeScroll = document.getElementById('treeScrollArea');
-    if (highlightLine) {
-      const targetRow = viewerEl.querySelector(`[data-blob-line="${highlightLine}"]`);
-      if (targetRow) {
-        targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
-    } else if (treeScroll) {
-      treeScroll.scrollTop = 0;
-    }
-    if (treeScroll && state.activeTab === 'tree') {
-      treeScroll.focus({ preventScroll: true });
-    }
+    )
+    .join('');
+
+  const firstAuthor = firstComment.authorName || firstComment.authorLogin || firstComment.author || 'this thread';
+  const replyFormHtml = thread.id
+    ? `
+      <form class="pr-thread-reply-box gh-thread-reply-form" data-thread-id="${escapeHtml(thread.id)}">
+        <textarea class="finding-textarea gh-thread-reply-input" rows="2" placeholder="Reply to ${escapeHtml(firstAuthor)} on GitHub..." required></textarea>
+        <div style="display:flex;flex-direction:column;gap:4px;justify-content:flex-end;">
+          <button type="submit" class="btn btn-primary btn-xs">Reply</button>
+        </div>
+      </form>
+    `
+    : '';
+
+  const cardInnerHtml = `
+    <div class="pr-thread-header">
+      <div class="pr-thread-header-left">
+        <span class="badge badge-peer">GitHub Review Thread</span>
+        ${statusBadges.join(' ')}
+        ${
+          shortPath
+            ? `<code style="font-size:11.5px;color:var(--accent);word-break:break-all;">${escapeHtml(shortPath)}${lineLabel ? `:${escapeHtml(lineLabel)}` : ''}</code>`
+            : ''
+        }
+      </div>
+      <div class="pr-thread-header-right">
+        ${jumpBtnHtml}
+        ${resolveBtnHtml}
+      </div>
+    </div>
+    <div class="pr-thread-comments">${commentsHtml}</div>
+    ${replyFormHtml}
+  `;
+
+  if (inDiff && thread.isResolved) {
+    return `
+      <details class="pr-thread-card resolved" style="padding:6px 10px;">
+        <summary style="cursor:pointer;font-size:11.5px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;">
+          <span class="badge badge-pass">Resolved GitHub Thread</span>
+          <strong>${escapeHtml(firstAuthor)}</strong>
+          <span>(${comments.length} message${comments.length > 1 ? 's' : ''}) — Click to expand</span>
+        </summary>
+        <div style="margin-top:8px;">${cardInnerHtml}</div>
+      </details>
+    `;
+  }
+
+  return `<div class="pr-thread-card ${thread.isResolved ? 'resolved' : ''}">${cardInnerHtml}</div>`;
+}
+
+function bindGitHubThreadActionListeners(containerEl) {
+  if (!containerEl) return;
+
+  containerEl.querySelectorAll('.gh-thread-jump-diff-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const path = btn.dataset.path;
+      const line = Number(btn.dataset.line) || null;
+      if (!path) return;
+      navigateToCodeLocation(path, line, 'diff');
+    });
+  });
+
+  containerEl.querySelectorAll('.gh-thread-resolve-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const threadId = btn.dataset.threadId;
+      const currentlyResolved = btn.dataset.resolved === '1';
+      if (!threadId) return;
+      btn.disabled = true;
+      await toggleGitHubThreadResolution(threadId, !currentlyResolved);
+      btn.disabled = false;
+    });
+  });
+
+  containerEl.querySelectorAll('.gh-thread-reply-form').forEach((form) => {
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const threadId = form.dataset.threadId;
+      const textarea = form.querySelector('.gh-thread-reply-input');
+      const body = textarea?.value?.trim();
+      if (!threadId || !body) return;
+      const submitBtn = form.querySelector('button[type="submit"]');
+      if (submitBtn) submitBtn.disabled = true;
+      const ok = await submitGitHubThreadReply(threadId, body);
+      if (ok && textarea) textarea.value = '';
+      if (submitBtn) submitBtn.disabled = false;
+    });
+  });
+}
+
+async function submitGitHubThreadReply(threadId, body) {
+  const pr = state.prs.find((p) => p.key === state.selectedPrKey);
+  if (!pr) return false;
+  try {
+    const res = await fetch('/api/github/thread-reply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        repo: pr.repo,
+        number: pr.number,
+        threadId,
+        body,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'GitHub reply error');
+    showToast('Reply published to GitHub thread.');
+    await loadPrOverview(pr, true);
+    return true;
   } catch (err) {
-    if (viewerEl) {
-      viewerEl.innerHTML = `<div class="empty-state meta-text">${escapeHtml(err.message)}</div>`;
-    }
+    showToast(`Error: ${err.message}`, 4500);
+    return false;
   }
 }
 
-// Fuzzy file search in Working Tree
-document.getElementById('treeFileFilterInput')?.addEventListener('input', async (e) => {
-  const q = e.target.value.trim().toLowerCase();
+async function toggleGitHubThreadResolution(threadId, resolve) {
   const pr = state.prs.find((p) => p.key === state.selectedPrKey);
-  if (!pr) return;
+  if (!pr) return false;
+  try {
+    const res = await fetch('/api/github/thread-resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        repo: pr.repo,
+        number: pr.number,
+        threadId,
+        resolve,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'GitHub thread resolution error');
+    showToast(resolve ? 'Thread marked as resolved on GitHub.' : 'Thread reopened on GitHub.');
+    await loadPrOverview(pr, true);
+    return true;
+  } catch (err) {
+    showToast(`Error: ${err.message}`, 4500);
+    return false;
+  }
+}
 
-  if (!q) {
-    renderTreeEntries(pr);
+async function submitGeneralPrCommentFromOverview(body) {
+  const pr = state.prs.find((p) => p.key === state.selectedPrKey);
+  if (!pr || !body) return false;
+  try {
+    const res = await fetch('/api/github/comment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        repo: pr.repo,
+        number: pr.number,
+        mode: 'general',
+        body,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'GitHub comment publish error');
+    showToast('General comment published on PR.');
+    await loadPrOverview(pr, true);
+    return true;
+  } catch (err) {
+    showToast(`Error: ${err.message}`, 4500);
+    return false;
+  }
+}
+
+async function loadPrOverview(pr, forceRefresh = false) {
+  const containerEl = document.getElementById('prOverviewContainer');
+  if (!pr || state.selectedPrKey !== pr.key) return;
+  const cacheKey = getPrClientCacheKey(pr);
+
+  const applyOverviewData = (data) => {
+    if (state.selectedPrKey !== pr.key) return;
+    state.currentOverview = data;
+
+    // Update tab badges
+    const commitsBadge = document.getElementById('tabOverviewCommitsCount');
+    const commentsBadge = document.getElementById('tabOverviewCommentsCount');
+    if (commitsBadge) {
+      const cCount = data.commitsCount ?? (data.commits || []).length ?? 0;
+      commitsBadge.textContent = `${cCount} commit${cCount === 1 ? '' : 's'}`;
+    }
+    if (commentsBadge) {
+      const gCount = data.commentsCount ?? data.totalCommentsCount ?? 0;
+      commentsBadge.textContent = `${gCount} comment${gCount === 1 ? '' : 's'}`;
+    }
+
+    renderPrOverviewTab();
+
+    // If a diff file is currently selected, re-render it so inline GitHub threads appear under the lines
+    const diffFiles = state.currentDiff?.files || [];
+    if (state.selectedDiffFile && diffFiles.some((f) => f.filename === state.selectedDiffFile)) {
+      const scrollArea = document.getElementById('diffScrollArea');
+      const prevScroll = scrollArea ? scrollArea.scrollTop : 0;
+      selectDiffFile(state.selectedDiffFile, state.highlightedLine);
+      const nextScrollArea = document.getElementById('diffScrollArea');
+      if (nextScrollArea) nextScrollArea.scrollTop = prevScroll;
+    }
+  };
+
+  if (!forceRefresh && state.prOverviewCache[cacheKey]) {
+    applyOverviewData(state.prOverviewCache[cacheKey]);
     return;
   }
 
-  if (!state.allRepoFiles) {
-    const res = await fetch(
-      `/api/tree?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&recursive=1`
-    );
-    if (res.ok) {
-      const data = await res.json();
-      state.allRepoFiles = data.files || [];
-    }
+  if (containerEl && !state.currentOverview) {
+    containerEl.innerHTML = `<div class="empty-state meta-text">Loading PR description, commits and GitHub comments for ${escapeHtml(pr.key)}...</div>`;
   }
-
-  const matches = (state.allRepoFiles || []).filter((f) => f.toLowerCase().includes(q)).slice(0, 80);
-  const listEl = document.getElementById('treeEntriesList');
-  listEl.innerHTML =
-    matches
-      .map(
-        (m) => `
-      <div class="tree-entry-item" data-path="${escapeHtml(m)}" title="${escapeHtml(m)}">
-        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(m.replace(/^projects\/services\//, ''))}</span>
-        <span class="tree-entry-type">match</span>
-      </div>
-    `
-      )
-      .join('') || `<div class="empty-state meta-text">Aucun fichier correspondant.</div>`;
-
-  listEl.querySelectorAll('.tree-entry-item').forEach((el) => {
-    el.addEventListener('click', () => {
-      openFileInWorkingTree(el.dataset.path, null);
-    });
-  });
-});
-
-// Git Grep in Working Tree
-document.getElementById('treeGrepForm')?.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const q = document.getElementById('treeGrepInput')?.value.trim();
-  const pr = state.prs.find((p) => p.key === state.selectedPrKey);
-  if (!pr || !q) return;
-
-  const viewerEl = document.getElementById('treeViewerContainer');
-  viewerEl.innerHTML = `<div class="empty-state meta-text">Recherche git grep "${escapeHtml(q)}"...</div>`;
 
   try {
     const res = await fetch(
-      `/api/grep?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&sha=${encodeURIComponent(pr.headRefOid || '')}&q=${encodeURIComponent(q)}`
+      `/api/github/overview?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}${forceRefresh ? '&refresh=1' : ''}`
     );
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erreur git grep');
-
-    const matches = data.matches || [];
-    if (matches.length === 0) {
-      viewerEl.innerHTML = `<div class="empty-state meta-text">Aucun résultat pour "${escapeHtml(q)}".</div>`;
-      return;
+    if (!res.ok) throw new Error(data.error || 'Unable to load Description & Conversation view');
+    if (!data.offlineError) {
+      state.prOverviewCache[cacheKey] = data;
     }
+    if (state.selectedPrKey !== pr.key) return;
+    applyOverviewData(data);
+  } catch (err) {
+    if (containerEl && !state.currentOverview) {
+      containerEl.innerHTML = `<div class="empty-state meta-text">${escapeHtml(err.message)}</div>`;
+    }
+  }
+}
 
-    viewerEl.innerHTML = `
-      <div class="diff-file-header">
-        <span>Résultats git grep pour "${escapeHtml(q)}" (${matches.length})</span>
+function renderPrOverviewTab() {
+  const containerEl = document.getElementById('prOverviewContainer');
+  if (!containerEl) return;
+  const pr = state.prs.find((p) => p.key === state.selectedPrKey);
+  const ov = state.currentOverview;
+  if (!pr || !ov) {
+    containerEl.innerHTML = `<div class="empty-state meta-text">Select a PR to view its description, commits, and GitHub comments.</div>`;
+    return;
+  }
+
+  const commits = ov.commits || [];
+  const generalComments = ov.generalComments || [];
+  const reviews = (ov.reviews || []).filter(
+    (r) => String(r.body || '').trim().length > 0 || r.state === 'APPROVED' || r.state === 'CHANGES_REQUESTED'
+  );
+  const reviewThreads = ov.reviewThreads || [];
+  const unresolvedThreadsCount = reviewThreads.filter((t) => !t.isResolved).length;
+  const totalDiscussionItems = generalComments.length + reviews.length + reviewThreads.length;
+  const filter = state.overviewFilter || 'all';
+
+  // Build chronological timeline of general comments, formal reviews, and inline review threads
+  const timelineEntries = [];
+  for (const c of generalComments) {
+    timelineEntries.push({
+      kind: 'general-comment',
+      createdAt: c.createdAt || '',
+      item: c,
+    });
+  }
+  for (const r of reviews) {
+    timelineEntries.push({
+      kind: 'review',
+      createdAt: r.submittedAt || '',
+      item: r,
+    });
+  }
+  for (const t of reviewThreads) {
+    const firstDate = t.comments?.[0]?.createdAt || t.updatedAt || '';
+    timelineEntries.push({
+      kind: 'thread',
+      createdAt: firstDate,
+      item: t,
+    });
+  }
+  timelineEntries.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
+
+  const showDescription = filter === 'all';
+  const showCommits = filter === 'all' || filter === 'commits';
+  const showComments = filter === 'all' || filter === 'comments' || filter === 'unresolved';
+
+  const filteredTimeline =
+    filter === 'unresolved'
+      ? timelineEntries.filter((e) => e.kind === 'thread' && !e.item.isResolved)
+      : timelineEntries;
+
+  const descriptionSectionHtml = showDescription
+    ? `
+      <div class="pr-overview-card">
+        <div class="pr-overview-card-header">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong>Pull Request Description</strong>
+            <span class="meta-text">opened by <strong>${escapeHtml(ov.authorName || ov.authorLogin || ov.author || pr.authorName || pr.author || '')}</strong> · ${escapeHtml(formatRelativeTime(ov.createdAt || pr.createdAt))}</span>
+          </div>
+          ${ov.url ? `<a href="${escapeHtml(ov.url)}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs">View on GitHub &nearr;</a>` : ''}
+        </div>
+        <div class="pr-overview-card-body markdown-body">${renderMarkdownSafe(ov.body)}</div>
       </div>
-      <div class="diff-scroll-area" tabindex="0">
-        <div class="diff-table-wrapper">
-          <table class="blob-table">
-            <tbody>
-              ${matches
-                .map(
-                  (m) => `
-                <tr class="grep-result-row" data-path="${escapeHtml(m.filePath)}" data-line="${m.line}" style="cursor:pointer;">
-                  <td class="blob-line-num" style="width:auto;text-align:left;color:var(--accent);">${escapeHtml(m.filePath.replace(/^projects\/services\//, ''))}:${m.line}</td>
-                  <td class="blob-line-code">${escapeHtml(m.text)}</td>
-                </tr>
-              `
-                )
-                .join('')}
-            </tbody>
-          </table>
+    `
+    : '';
+
+  const commitsSectionHtml = showCommits
+    ? `
+      <div class="pr-overview-card">
+        <div class="pr-overview-card-header">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <strong>Commits in chronological order</strong>
+            <span class="badge">${commits.length} commit${commits.length > 1 ? 's' : ''}</span>
+          </div>
+        </div>
+        <div class="pr-commits-list">
+          ${
+            commits.length === 0
+              ? `<div class="empty-state meta-text" style="padding:14px;">No commits found.</div>`
+              : commits
+                  .map(
+                    (c, idx) => `
+                  <div class="pr-commit-item">
+                    <div class="pr-commit-top-row">
+                      <div class="pr-commit-title-group">
+                        <span class="badge pr-commit-index-badge">#${idx + 1}</span>
+                        <span class="pr-commit-headline" title="${escapeHtml(c.messageHeadline)}">${escapeHtml(c.messageHeadline)}</span>
+                      </div>
+                      <div class="pr-commit-actions">
+                        <button type="button" class="pr-commit-sha copy-commit-sha-btn" data-sha="${escapeHtml(c.oid)}" title="Click to copy SHA (${escapeHtml(c.oid)})">${escapeHtml(c.shortOid)}</button>
+                        ${c.url ? `<a href="${escapeHtml(c.url)}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs" title="View commit on GitHub">&nearr;</a>` : ''}
+                      </div>
+                    </div>
+                    <div class="pr-commit-sub-row">
+                      <span class="pr-commit-author">${escapeHtml(c.authorName || c.authorLogin || c.author || '')}</span>
+                      <span>·</span>
+                      <span>${escapeHtml(formatRelativeTime(c.committedDate))}</span>
+                    </div>
+                  </div>
+                `
+                  )
+                  .join('')
+          }
         </div>
       </div>
-    `;
+    `
+    : '';
 
-    viewerEl.querySelectorAll('.grep-result-row').forEach((row) => {
-      row.addEventListener('click', () => {
-        openFileInWorkingTree(row.dataset.path, Number(row.dataset.line) || 1);
-      });
+  const timelineHtml = filteredTimeline
+    .map((entry) => {
+      if (entry.kind === 'thread') {
+        return renderGitHubThreadCardHtml(entry.item, { inDiff: false });
+      }
+      if (entry.kind === 'review') {
+        const r = entry.item;
+        const hasBody = Boolean(String(r.body || '').trim());
+        const badgeHtml =
+          r.state === 'APPROVED'
+            ? '<span class="badge badge-pass">Approved</span>'
+            : r.state === 'CHANGES_REQUESTED'
+            ? '<span class="badge badge-blocker">Changes Requested</span>'
+            : '<span class="badge badge-peer">Review Commented</span>';
+        return `
+          <div class="pr-thread-card ${hasBody ? '' : 'compact-review'}">
+            <div class="pr-thread-header">
+              <div class="pr-thread-header-left">
+                ${badgeHtml}
+                <strong>${escapeHtml(r.authorName || r.authorLogin || r.author || 'unknown')}</strong>
+                <span class="meta-text">${escapeHtml(formatRelativeTime(r.submittedAt))}</span>
+              </div>
+              <div class="pr-thread-header-right">
+                ${r.url ? `<a href="${escapeHtml(r.url)}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs">GitHub &nearr;</a>` : ''}
+              </div>
+            </div>
+            ${
+              hasBody
+                ? `<div class="pr-thread-comments"><div class="pr-thread-comment"><div class="pr-thread-comment-body markdown-body">${renderMarkdownSafe(r.body)}</div></div></div>`
+                : ''
+            }
+          </div>
+        `;
+      }
+      const c = entry.item;
+      return `
+        <div class="pr-thread-card">
+          <div class="pr-thread-header">
+            <div class="pr-thread-header-left">
+              <span class="badge">General Comment</span>
+              <strong>${escapeHtml(c.authorName || c.authorLogin || c.author || 'unknown')}</strong>
+              <span class="meta-text">${escapeHtml(formatRelativeTime(c.createdAt))}</span>
+            </div>
+            <div class="pr-thread-header-right">
+              ${c.url ? `<a href="${escapeHtml(c.url)}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs">GitHub &nearr;</a>` : ''}
+            </div>
+          </div>
+          <div class="pr-thread-comments">
+            <div class="pr-thread-comment">
+              <div class="pr-thread-comment-body markdown-body">${renderMarkdownSafe(c.body)}</div>
+            </div>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+
+  const commentsSectionHtml = showComments
+    ? `
+      <div class="pr-overview-card">
+        <div class="pr-overview-card-header">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong>Conversation &amp; GitHub Review Comments</strong>
+            <span class="badge">${totalDiscussionItems} item${totalDiscussionItems > 1 ? 's' : ''}</span>
+            ${
+              unresolvedThreadsCount > 0
+                ? `<span class="badge badge-warning">${unresolvedThreadsCount} unresolved thread${unresolvedThreadsCount > 1 ? 's' : ''}</span>`
+                : reviewThreads.length > 0
+                ? `<span class="badge badge-pass">All threads resolved</span>`
+                : ''
+            }
+          </div>
+        </div>
+        <div class="pr-overview-card-body" style="display:flex;flex-direction:column;gap:12px;">
+          ${
+            filteredTimeline.length === 0
+              ? `<div class="empty-state meta-text" style="padding:16px;">No GitHub comments in this view.</div>`
+              : `<div class="pr-timeline-list">${timelineHtml}</div>`
+          }
+          <form id="overviewGeneralCommentForm" style="display:flex;flex-direction:column;gap:8px;margin-top:6px;padding-top:12px;border-top:1px solid var(--border-color);">
+            <label style="font-size:12px;font-weight:600;color:var(--text-primary);">Write a new general comment on this PR:</label>
+            <textarea id="overviewGeneralCommentInput" class="finding-textarea" rows="3" placeholder="Your general comment on this PR (Markdown supported)..." required></textarea>
+            <div style="display:flex;justify-content:flex-end;">
+              <button type="submit" class="btn btn-primary btn-sm">Publish Comment on GitHub</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `
+    : '';
+
+  containerEl.innerHTML = `
+    <div class="pr-overview-toolbar">
+      <div class="pr-overview-badges">
+        <div class="filter-tabs" id="overviewSectionFilterTabs">
+          <button type="button" class="filter-tab ${filter === 'all' ? 'active' : ''}" data-ov-filter="all">All</button>
+          <button type="button" class="filter-tab ${filter === 'comments' ? 'active' : ''}" data-ov-filter="comments">Comments &amp; Reviews (${totalDiscussionItems})</button>
+          ${
+            unresolvedThreadsCount > 0
+              ? `<button type="button" class="filter-tab ${filter === 'unresolved' ? 'active' : ''}" data-ov-filter="unresolved">Open threads (${unresolvedThreadsCount})</button>`
+              : ''
+          }
+          <button type="button" class="filter-tab ${filter === 'commits' ? 'active' : ''}" data-ov-filter="commits">Commits (${commits.length})</button>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button type="button" id="refreshPrOverviewBtn" class="btn btn-secondary btn-xs" title="Refresh description, commits and comments from GitHub">&#8635; Refresh GitHub</button>
+      </div>
+    </div>
+    ${descriptionSectionHtml}
+    ${commitsSectionHtml}
+    ${commentsSectionHtml}
+  `;
+
+  containerEl.querySelectorAll('#overviewSectionFilterTabs .filter-tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.overviewFilter = btn.dataset.ovFilter || 'all';
+      renderPrOverviewTab();
     });
-  } catch (err) {
-    viewerEl.innerHTML = `<div class="empty-state meta-text">${escapeHtml(err.message)}</div>`;
-  }
-});
+  });
+
+  document.getElementById('refreshPrOverviewBtn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('refreshPrOverviewBtn');
+    if (btn) btn.disabled = true;
+    await loadPrOverview(pr, true);
+    showToast('GitHub description, commits and comments refreshed.');
+  });
+
+  containerEl.querySelectorAll('.copy-commit-sha-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const sha = btn.dataset.sha;
+      if (!sha) return;
+      await navigator.clipboard.writeText(sha);
+      showToast(`Commit SHA copied: ${sha.slice(0, 8)}`);
+    });
+  });
+
+  document.getElementById('overviewGeneralCommentForm')?.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const input = document.getElementById('overviewGeneralCommentInput');
+    const body = input?.value?.trim();
+    if (!body) return;
+    const submitBtn = ev.target.querySelector('button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
+    const ok = await submitGeneralPrCommentFromOverview(body);
+    if (ok && input) input.value = '';
+    if (submitBtn) submitBtn.disabled = false;
+  });
+
+  bindGitHubThreadActionListeners(containerEl);
+}
 
 // Mount / Unmount Worktree & Open IDE
 document.getElementById('mountWorktreeBtn')?.addEventListener('click', async () => {
   const pr = state.prs.find((p) => p.key === state.selectedPrKey);
   if (!pr) return;
-  showToast(`Montage du worktree pour ${pr.key}...`);
+  showToast(`Mounting worktree for ${pr.key}...`);
   try {
     const res = await fetch('/api/worktree/mount', {
       method: 'POST',
@@ -2648,15 +4286,15 @@ document.getElementById('mountWorktreeBtn')?.addEventListener('click', async () 
       body: JSON.stringify({ repo: pr.repo, number: pr.number, headSha: pr.headRefOid }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erreur montage worktree');
+    if (!res.ok) throw new Error(data.error || 'Worktree mount error');
     state.worktreeStatus = data;
     pr.worktreeMounted = true;
     pr.worktreePath = data.worktreePath;
     renderWorktreeStatusBar(pr);
     renderPrList();
-    showToast(`Worktree prêt : ${data.worktreePath}`);
+    showToast(`Worktree ready: ${data.worktreePath}`);
   } catch (err) {
-    showToast(`Erreur: ${err.message}`, 5000);
+    showToast(`Error: ${err.message}`, 5000);
   }
 });
 
@@ -2670,22 +4308,22 @@ document.getElementById('unmountWorktreeBtn')?.addEventListener('click', async (
       body: JSON.stringify({ repo: pr.repo, number: pr.number }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erreur suppression worktree');
+    if (!res.ok) throw new Error(data.error || 'Worktree unmount error');
     state.worktreeStatus = data;
     pr.worktreeMounted = false;
     pr.worktreePath = null;
     renderWorktreeStatusBar(pr);
     renderPrList();
-    showToast(`Worktree démonté.`);
+    showToast(`Worktree unmounted.`);
   } catch (err) {
-    showToast(`Erreur: ${err.message}`, 5000);
+    showToast(`Error: ${err.message}`, 5000);
   }
 });
 
 async function openCurrentPrInIde(ide, filePath = '', line = null) {
   const pr = state.prs.find((p) => p.key === state.selectedPrKey);
   if (!pr) return;
-  showToast(`Ouverture dans ${ide === 'code' ? 'VS Code' : 'PhpStorm'} (montage worktree)...`);
+  showToast(`Opening in ${ide === 'code' ? 'VS Code' : 'PhpStorm'} (mounting worktree)...`);
   try {
     const res = await fetch('/api/worktree/open-ide', {
       method: 'POST',
@@ -2700,14 +4338,14 @@ async function openCurrentPrInIde(ide, filePath = '', line = null) {
       }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erreur ouverture IDE');
+    if (!res.ok) throw new Error(data.error || 'IDE open error');
     state.worktreeStatus = { mounted: true, worktreePath: data.worktreePath };
     pr.worktreeMounted = true;
     renderWorktreeStatusBar(pr);
     renderPrList();
-    showToast(`Ouvert dans ${ide} : ${data.worktreePath}`);
+    showToast(`Opened in ${ide}: ${data.worktreePath}`);
   } catch (err) {
-    showToast(`Erreur: ${err.message}`, 5000);
+    showToast(`Error: ${err.message}`, 5000);
   }
 }
 
@@ -2733,55 +4371,172 @@ function switchTab(tabName, options = {}) {
   }
   state.activeTab = tabName;
   state.activeFindingIndex = -1;
-  document.querySelectorAll('.view-tab').forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.tab === tabName);
-  });
-  document.querySelectorAll('.tab-panel').forEach((panel) => {
-    panel.classList.toggle('active', panel.id === `tab-${tabName}`);
-  });
-  if (state.splitMode && (tabName === 'diff' || tabName === 'tree')) {
-    setSplitRightPanel(tabName);
+
+  if (state.splitMode) {
+    if (options.splitSide === 'right') {
+      setSplitRightPanel(tabName);
+    } else if (options.splitSide === 'left') {
+      setSplitLeftPanel(tabName);
+    } else if (tabName !== state.splitLeftTab && tabName !== state.splitRightTab) {
+      setSplitLeftPanel(tabName);
+    } else {
+      applySplitLayout();
+    }
+  } else {
+    document.querySelectorAll('.view-tab').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.tab === tabName);
+    });
+    document.querySelectorAll('.tab-panel').forEach((panel) => {
+      panel.classList.toggle('active', panel.id === `tab-${tabName}`);
+      panel.removeAttribute('data-split-pane');
+      panel.classList.remove('split-right-active');
+    });
   }
-  if (tabName === 'rules') {
+
+  if (tabName === 'rules' || (state.splitMode && (state.splitLeftTab === 'rules' || state.splitRightTab === 'rules'))) {
     loadRules();
   }
+  const isDiffVisible =
+    tabName === 'diff' ||
+    (state.splitMode && (state.splitLeftTab === 'diff' || state.splitRightTab === 'diff'));
+  if (isDiffVisible) {
+    const diffFiles = state.currentDiff?.files || [];
+    if (
+      diffFiles.length > 0 &&
+      (!state.selectedDiffFile || !diffFiles.some((f) => f.filename === state.selectedDiffFile))
+    ) {
+      const fileWithFinding = (state.currentDiff?.resolvedFindings || []).find(
+        (f) => f.inDiff && f.resolvedPath && diffFiles.some((df) => df.filename === f.resolvedPath)
+      )?.resolvedPath;
+      selectDiffFile(fileWithFinding || diffFiles[0].filename, null);
+    }
+  }
+  renderCollapsibleLayoutState();
   if (tabName === 'diff') {
     setTimeout(() => {
       document.getElementById('diffScrollArea')?.focus({ preventScroll: true });
     }, 0);
-  } else if (tabName === 'tree') {
-    setTimeout(() => {
-      document.getElementById('treeScrollArea')?.focus({ preventScroll: true });
-    }, 0);
+  }
+}
+
+function applySplitLayout() {
+  const container = document.getElementById('panelsContainer');
+  const btn = document.getElementById('toggleSplitViewBtn');
+  const selectorsWrap = document.getElementById('splitPaneSelectors');
+  const leftSelect = document.getElementById('splitLeftTabSelect');
+  const rightSelect = document.getElementById('splitRightTabSelect');
+
+  if (!state.splitMode) {
+    container?.classList.remove('split-mode');
+    btn?.classList.remove('btn-primary');
+    selectorsWrap?.classList.add('hidden');
+    document.querySelectorAll('.tab-panel').forEach((p) => {
+      p.removeAttribute('data-split-pane');
+      p.classList.remove('split-right-active');
+      p.classList.toggle('active', p.id === `tab-${state.activeTab}`);
+    });
+    document.querySelectorAll('.view-tab').forEach((tabBtn) => {
+      tabBtn.classList.toggle('active', tabBtn.dataset.tab === state.activeTab);
+    });
+    return;
+  }
+
+  if (state.splitLeftTab === state.splitRightTab) {
+    state.splitRightTab = state.splitLeftTab === 'diff' ? 'report' : 'diff';
+  }
+
+  try {
+    localStorage.setItem('prHub.splitLeftTab', state.splitLeftTab);
+    localStorage.setItem('prHub.splitRightTab', state.splitRightTab);
+  } catch {
+    // Ignore storage errors
+  }
+
+  container?.classList.add('split-mode');
+  btn?.classList.add('btn-primary');
+  selectorsWrap?.classList.remove('hidden');
+
+  if (leftSelect) leftSelect.value = state.splitLeftTab;
+  if (rightSelect) rightSelect.value = state.splitRightTab;
+
+  document.querySelectorAll('.tab-panel').forEach((panel) => {
+    const isLeft = panel.id === `tab-${state.splitLeftTab}`;
+    const isRight = panel.id === `tab-${state.splitRightTab}`;
+    panel.classList.toggle('active', isLeft);
+    panel.classList.toggle('split-right-active', isRight);
+    if (isLeft) {
+      panel.setAttribute('data-split-pane', 'left');
+    } else if (isRight) {
+      panel.setAttribute('data-split-pane', 'right');
+    } else {
+      panel.removeAttribute('data-split-pane');
+    }
+  });
+
+  document.querySelectorAll('.view-tab').forEach((tabBtn) => {
+    const t = tabBtn.dataset.tab;
+    tabBtn.classList.toggle('active', t === state.splitLeftTab || t === state.splitRightTab);
+  });
+
+  if (state.splitLeftTab === 'rules' || state.splitRightTab === 'rules') {
+    loadRules();
+  }
+  renderCollapsibleLayoutState();
+}
+
+function setSplitLeftPanel(leftTab = 'report') {
+  if (!leftTab) return;
+  if (leftTab === state.splitRightTab) {
+    state.splitRightTab = state.splitLeftTab;
+  }
+  state.splitLeftTab = leftTab;
+  state.activeTab = leftTab;
+  if (state.splitMode) {
+    applySplitLayout();
   }
 }
 
 function setSplitRightPanel(rightTab = 'diff') {
-  document.querySelectorAll('.tab-panel').forEach((panel) => {
-    panel.classList.toggle('split-right-active', panel.id === `tab-${rightTab}`);
-  });
+  if (!rightTab) return;
+  if (rightTab === state.splitLeftTab) {
+    state.splitLeftTab = state.splitRightTab;
+  }
+  state.splitRightTab = rightTab;
+  if (state.splitMode) {
+    applySplitLayout();
+  }
 }
 
 function toggleSplitMode() {
   state.splitMode = !state.splitMode;
-  const container = document.getElementById('panelsContainer');
-  const btn = document.getElementById('toggleSplitViewBtn');
   if (state.splitMode) {
-    container?.classList.add('split-mode');
-    btn?.classList.add('btn-primary');
-    setSplitRightPanel(state.activeTab === 'tree' ? 'tree' : 'diff');
-  } else {
-    container?.classList.remove('split-mode');
-    btn?.classList.remove('btn-primary');
-    document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('split-right-active'));
+    if (state.focusDiffMode) {
+      setFocusDiffMode(false);
+    }
+    state._prevSplitFileTree = state.fileTreeCollapsed;
+    state.fileTreeCollapsed = true;
+    if (!state.splitLeftTab) state.splitLeftTab = state.activeTab || 'report';
+    if (!state.splitRightTab || state.splitRightTab === state.splitLeftTab) {
+      state.splitRightTab = state.splitLeftTab === 'diff' ? 'report' : 'diff';
+    }
+  } else if (typeof state._prevSplitFileTree === 'boolean') {
+    state.fileTreeCollapsed = state._prevSplitFileTree;
   }
+  renderCollapsibleLayoutState();
+  applySplitLayout();
 }
 
 document.getElementById('toggleSplitViewBtn')?.addEventListener('click', toggleSplitMode);
+document.getElementById('splitLeftTabSelect')?.addEventListener('change', (e) => {
+  setSplitLeftPanel(e.target.value);
+});
+document.getElementById('splitRightTabSelect')?.addEventListener('change', (e) => {
+  setSplitRightPanel(e.target.value);
+});
 
 function openPopoutWorkspace() {
   if (!state.selectedPrKey) return;
-  const targetTab = state.activeTab === 'tree' ? 'tree' : 'diff';
+  const targetTab = state.activeTab || 'diff';
   const url = `/?pr=${encodeURIComponent(state.selectedPrKey)}&tab=${targetTab}&popout=1`;
   window.open(url, 'pr-review-hub-popout', 'width=1440,height=920,resizable=yes,scrollbars=yes');
 }
@@ -2798,13 +4553,8 @@ if (syncChannel) {
       if (msg.prKey && msg.prKey !== state.selectedPrKey) {
         await selectPr(msg.prKey, false);
       }
-      if (msg.view === 'tree') {
-        switchTab('tree');
-        openFileInWorkingTree(msg.filePath, msg.line);
-      } else {
-        switchTab('diff');
-        openFileInDiffViewer(msg.filePath, msg.line);
-      }
+      switchTab('diff');
+      openFileInDiffViewer(msg.filePath, msg.line);
     }
   });
 }
@@ -2821,11 +4571,11 @@ async function triggerManualReviewForKey(prKey) {
       body: JSON.stringify({ key: prKey }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Impossible de lancer la review');
-    showToast(`Audit IA lancé pour ${prKey}...`);
+    if (!res.ok) throw new Error(data.error || 'Unable to start review');
+    showToast(`AI review started for ${prKey}...`);
     await loadState(true);
   } catch (err) {
-    showToast(`Erreur: ${err.message}`, 4500);
+    showToast(`Error: ${err.message}`, 4500);
   }
 }
 
@@ -2837,11 +4587,11 @@ document.getElementById('reviewAllPendingBtn')?.addEventListener('click', async 
   try {
     const res = await fetch('/api/agent/review-all-pending', { method: 'POST' });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erreur lancement groupé');
-    showToast(`${data.count || 0} audit(s) IA lancé(s) en arrière-plan.`);
+    if (!res.ok) throw new Error(data.error || 'Batch launch error');
+    showToast(`${data.count || 0} AI review(s) started in background.`);
     await loadState(true);
   } catch (err) {
-    showToast(`Erreur: ${err.message}`, 4500);
+    showToast(`Error: ${err.message}`, 4500);
   }
 });
 
@@ -2853,7 +4603,7 @@ function renderAgentContextBanner() {
   if (!banner || !textEl) return;
 
   if (state.chatFindingContext) {
-    textEl.textContent = `Cible : ${state.chatFindingContext.id} — ${stripEmojis(state.chatFindingContext.title)}`;
+    textEl.textContent = `Target: ${state.chatFindingContext.id} — ${stripEmojis(state.chatFindingContext.title)}`;
     banner.classList.remove('hidden');
     return;
   }
@@ -2861,7 +4611,7 @@ function renderAgentContextBanner() {
   const currentFile = state.selectedDiffFile || state.selectedTreeFile;
   if (currentFile) {
     const shortPath = formatShortFilePath(currentFile, state.highlightedLine || state.selectedTreeLine);
-    textEl.textContent = `Fichier actif : ${shortPath}`;
+    textEl.textContent = `Active file: ${shortPath}`;
     banner.classList.remove('hidden');
   } else {
     banner.classList.add('hidden');
@@ -2959,7 +4709,7 @@ function renderChatMessages() {
   const stream = state.chatActiveStream;
 
   if (!hasMessages && !stream) {
-    container.innerHTML = `<div class="empty-state meta-text">Pose une question technique sur le fichier affiché ou la PR (Entrée pour envoyer).</div>`;
+    container.innerHTML = `<div class="empty-state meta-text">Ask a technical question about the displayed file or the PR (Enter to send).</div>`;
     return;
   }
 
@@ -2984,7 +4734,7 @@ function renderChatMessages() {
       0,
       Math.floor((Date.now() - Date.parse(stream.startedAt || new Date().toISOString())) / 1000)
     );
-    const phaseLabel = stream.phase || 'Réflexion en cours…';
+    const phaseLabel = stream.phase || 'Thinking…';
     const fileNote = stream.activeFile ? ` · ${formatShortFilePath(stream.activeFile)}` : '';
     const partialHtml = stream.partialText
       ? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border-subtle);">${formatChatMessageBodyHtml(stream.partialText)}</div>`
@@ -3048,7 +4798,7 @@ document.getElementById('agentChatForm')?.addEventListener('submit', async (e) =
 
   input.value = '';
   sendBtn.disabled = true;
-  sendBtn.textContent = 'En cours…';
+  sendBtn.textContent = 'Sending…';
 
   state.chatMessages.push({
     role: 'user',
@@ -3058,7 +4808,7 @@ document.getElementById('agentChatForm')?.addEventListener('submit', async (e) =
   });
   state.chatActiveStream = {
     startedAt: new Date().toISOString(),
-    phase: 'Démarrage de Gemini et envoi du diff actif…',
+    phase: 'Starting Gemini and sending active diff…',
     partialText: '',
     activeFile: currentFilePath,
   };
@@ -3079,21 +4829,21 @@ document.getElementById('agentChatForm')?.addEventListener('submit', async (e) =
       }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erreur communication agent');
+    if (!res.ok) throw new Error(data.error || 'Agent communication error');
     state.chatActiveStream = null;
     state.chatMessages = data.messages || [];
     renderChatMessages();
   } catch (err) {
     state.chatActiveStream = null;
     renderChatMessages();
-    showToast(`Erreur Agent: ${err.message}`, 5000);
+    showToast(`Agent Error: ${err.message}`, 5000);
   } finally {
     if (chatPollTimer) {
       clearInterval(chatPollTimer);
       chatPollTimer = null;
     }
     sendBtn.disabled = false;
-    sendBtn.textContent = 'Envoyer';
+    sendBtn.textContent = 'Send';
   }
 });
 
@@ -3106,16 +4856,16 @@ async function promptDismissFinding(finding) {
   const bodyEl = document.getElementById('modalBody');
   const confirmBtn = document.getElementById('confirmModalBtn');
 
-  titleEl.textContent = `Marquer ${finding.id} comme Faux Positif (Mode 2 Debrief)`;
-  confirmBtn.textContent = 'Enregistrer dans false-positives.md';
+  titleEl.textContent = `Mark ${finding.id} as False Positive (Mode 2 Debrief)`;
+  confirmBtn.textContent = 'Save to false-positives.md';
 
   bodyEl.innerHTML = `
     <div>
       <p style="margin:0 0 8px;">
-        Ce finding sera barré dans l'interface et la règle sera ajoutée à <code>references/false-positives.md</code> pour que l'agent ne le signale plus à l'avenir.
+        This finding will be struck through in the UI and added to <code>references/false-positives.md</code> so the agent will no longer flag it in future reviews.
       </p>
-      <label style="display:block;font-weight:500;margin-bottom:6px;">Raison / Règle métier (optionnel) :</label>
-      <textarea id="modalDismissReasonInput" class="finding-textarea" style="min-height:90px;" placeholder="Ex: Géré en amont par le voter / Convention habituelle sur ce micro-service..."></textarea>
+      <label style="display:block;font-weight:500;margin-bottom:6px;">Reason / Domain rule (optional):</label>
+      <textarea id="modalDismissReasonInput" class="finding-textarea" style="min-height:90px;" placeholder="E.g.: Handled upstream by voter / Standard convention in this microservice..."></textarea>
     </div>
   `;
 
@@ -3136,7 +4886,7 @@ async function promptDismissFinding(finding) {
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Erreur enregistrement faux positif');
+      if (!res.ok) throw new Error(data.error || 'Error saving false positive');
       finding.dismissed = true;
       state.selectedCommentCids.delete(finding.cid);
       modal.classList.add('hidden');
@@ -3144,12 +4894,12 @@ async function promptDismissFinding(finding) {
       renderFindingsTab();
       renderDiffTree();
       loadRules();
-      showToast(`${finding.id} ajouté aux faux positifs.`);
+      showToast(`${finding.id} added to false positives.`);
     } catch (err) {
-      showToast(`Erreur: ${err.message}`, 4500);
+      showToast(`Error: ${err.message}`, 4500);
     } finally {
       confirmBtn.disabled = false;
-      confirmBtn.textContent = 'Confirmer';
+      confirmBtn.textContent = 'Confirm';
     }
   };
 }
@@ -3180,26 +4930,26 @@ async function promptAddRuleFromFinding(finding) {
   const bodyEl = document.getElementById('modalBody');
   const confirmBtn = document.getElementById('confirmModalBtn');
 
-  titleEl.textContent = `Ajouter une Règle Agent depuis ${finding.id}`;
-  confirmBtn.textContent = 'Ajouter à reviewer-dna.md';
+  titleEl.textContent = `Add Agent Rule from ${finding.id}`;
+  confirmBtn.textContent = 'Add to reviewer-dna.md';
 
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:10px;">
       <p class="meta-text" style="margin:0;">
-        Extrait ce finding en règle permanente (en anglais) dans <code>references/reviewer-dna.md</code> pour les prochains audits.
+        Extracts this finding into a permanent rule (in English) in <code>references/reviewer-dna.md</code> for future reviews.
       </p>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Section DNA :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">DNA Section:</label>
         <select id="modalRuleSectionSelect" class="search-input">
           ${defaultSections.map((sec) => `<option value="${escapeHtml(sec)}">${escapeHtml(sec)}</option>`).join('')}
         </select>
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Titre de la règle (Anglais) :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Rule Title (English):</label>
         <input type="text" id="modalRuleTitleInput" class="search-input" value="${escapeHtml(cleanTitle)}" />
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Consigne pour l'agent (Anglais) :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Instruction for Agent (English):</label>
         <textarea id="modalRuleBodyInput" class="finding-textarea" style="min-height:110px;">${escapeHtml(suggestedBody)}</textarea>
       </div>
     </div>
@@ -3212,7 +4962,7 @@ async function promptAddRuleFromFinding(finding) {
     const title = document.getElementById('modalRuleTitleInput').value.trim();
     const body = document.getElementById('modalRuleBodyInput').value.trim();
     if (!title || !body) {
-      showToast('Titre et description requis.');
+      showToast('Title and description are required.');
       return;
     }
 
@@ -3230,15 +4980,15 @@ async function promptAddRuleFromFinding(finding) {
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Erreur ajout de règle');
+      if (!res.ok) throw new Error(data.error || 'Error adding rule');
       modal.classList.add('hidden');
       await loadRules();
-      showToast(`Règle "${title}" ajoutée à reviewer-dna.md.`);
+      showToast(`Rule "${title}" added to reviewer-dna.md.`);
     } catch (err) {
-      showToast(`Erreur: ${err.message}`, 4500);
+      showToast(`Error: ${err.message}`, 4500);
     } finally {
       confirmBtn.disabled = false;
-      confirmBtn.textContent = 'Confirmer';
+      confirmBtn.textContent = 'Confirm';
     }
   };
 }
@@ -3257,23 +5007,28 @@ function openSingleCommentModal(finding, mode) {
 
   titleEl.textContent =
     mode === 'inline'
-      ? `Publier le commentaire inline ${finding.id} (${pr.repo}#${pr.number})`
-      : `Publier un commentaire général (${pr.repo}#${pr.number})`;
-  confirmBtn.textContent = 'Confirmer';
+      ? `Publish inline comment ${finding.id} (${pr.repo}#${pr.number})`
+      : `Publish general comment (${pr.repo}#${pr.number})`;
+  confirmBtn.textContent = 'Confirm';
+
+  const targetLineRangeLabel =
+    finding.startLine && finding.endLine && Number(finding.endLine) > Number(finding.startLine)
+      ? `${finding.filePath}:${finding.startLine}-${finding.endLine}`
+      : `${finding.filePath}:${finding.endLine || finding.startLine || 1}`;
 
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:10px;">
       <p style="margin:0;">
-        <strong>Cible :</strong>
-        <code>${escapeHtml(mode === 'inline' ? `${finding.filePath}:${finding.endLine || finding.startLine || 1}` : 'Conversation générale de la PR')}</code>
+        <strong>Target:</strong>
+        <code>${escapeHtml(mode === 'inline' ? targetLineRangeLabel : 'General PR conversation')}</code>
       </p>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:6px;">Contenu Markdown :</label>
+        <label style="display:block;font-weight:500;margin-bottom:6px;">Markdown Content:</label>
         <textarea id="modalCommentTextarea" class="finding-textarea" style="min-height:150px;">${escapeHtml(finding.customComment)}</textarea>
       </div>
       <label class="checkbox-label" style="margin-top:4px;">
         <input type="checkbox" id="modalSaveAsAgentRuleCb" />
-        <span>Enregistrer également ce point comme règle permanente dans <code>reviewer-dna.md</code></span>
+        <span>Also save this item as a permanent rule in <code>reviewer-dna.md</code></span>
       </label>
     </div>
   `;
@@ -3285,7 +5040,7 @@ function openSingleCommentModal(finding, mode) {
     const saveAsRule = document.getElementById('modalSaveAsAgentRuleCb')?.checked;
     if (!editedBody) return;
     confirmBtn.disabled = true;
-    confirmBtn.textContent = 'Envoi...';
+    confirmBtn.textContent = 'Sending...';
 
     try {
       const res = await fetch('/api/github/comment', {
@@ -3298,12 +5053,14 @@ function openSingleCommentModal(finding, mode) {
           commentBody: editedBody,
           filePath: finding.filePath,
           line: finding.endLine || finding.startLine || 1,
+          startLine: finding.startLine || finding.endLine || 1,
+          endLine: finding.endLine || finding.startLine || 1,
           mode,
           cid: finding.cid,
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Échec de publication GitHub');
+      if (!res.ok) throw new Error(data.error || 'Failed to publish to GitHub');
 
       if (saveAsRule) {
         await fetch('/api/rules', {
@@ -3327,14 +5084,14 @@ function openSingleCommentModal(finding, mode) {
       loadState(true);
       showToast(
         saveAsRule
-          ? `Commentaire ${finding.id} publié et règle ajoutée à reviewer-dna.md.`
-          : `Commentaire ${finding.id} publié sur GitHub.`
+          ? `Comment ${finding.id} published and rule added to reviewer-dna.md.`
+          : `Comment ${finding.id} published on GitHub.`
       );
     } catch (err) {
-      showToast(`Erreur: ${err.message}`, 5000);
+      showToast(`Error: ${err.message}`, 5000);
     } finally {
       confirmBtn.disabled = false;
-      confirmBtn.textContent = 'Confirmer';
+      confirmBtn.textContent = 'Confirm';
     }
   };
 }
@@ -3351,37 +5108,37 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
   const bodyEl = document.getElementById('modalBody');
   const confirmBtn = document.getElementById('confirmModalBtn');
 
-  titleEl.textContent = `Publier Review — ${pr.repo}#${pr.number}`;
-  confirmBtn.textContent = 'Confirmer';
+  titleEl.textContent = `Submit Review — ${pr.repo}#${pr.number}`;
+  confirmBtn.textContent = 'Confirm';
 
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:12px;">
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:6px;">Type d'action GitHub :</label>
+        <label style="display:block;font-weight:500;margin-bottom:6px;">GitHub Review Action:</label>
         <select id="modalReviewEventSelect" class="search-input">
-          <option value="PENDING" ${defaultEvent === 'PENDING' ? 'selected' : ''}>PENDING — Créer un brouillon de review sur GitHub (non soumis)</option>
-          <option value="APPROVE" ${defaultEvent === 'APPROVE' ? 'selected' : ''}>APPROVE — Approuver la PR</option>
-          <option value="COMMENT" ${defaultEvent === 'COMMENT' ? 'selected' : ''}>COMMENT — Publier les commentaires sans bloquer</option>
-          <option value="REQUEST_CHANGES" ${defaultEvent === 'REQUEST_CHANGES' ? 'selected' : ''}>REQUEST_CHANGES — Demander des modifications</option>
+          <option value="PENDING" ${defaultEvent === 'PENDING' ? 'selected' : ''}>PENDING — Create a draft Pending Review on GitHub (not submitted yet)</option>
+          <option value="APPROVE" ${defaultEvent === 'APPROVE' ? 'selected' : ''}>APPROVE — Approve the PR</option>
+          <option value="COMMENT" ${defaultEvent === 'COMMENT' ? 'selected' : ''}>COMMENT — Publish comments without blocking</option>
+          <option value="REQUEST_CHANGES" ${defaultEvent === 'REQUEST_CHANGES' ? 'selected' : ''}>REQUEST_CHANGES — Request changes</option>
         </select>
       </div>
 
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:6px;">Message général (optionnel) :</label>
-        <textarea id="modalReviewSummaryInput" class="finding-textarea" style="min-height:80px;" placeholder="LGTM / Quelques remarques ci-dessous..."></textarea>
+        <label style="display:block;font-weight:500;margin-bottom:6px;">General summary message (optional):</label>
+        <textarea id="modalReviewSummaryInput" class="finding-textarea" style="min-height:80px;" placeholder="LGTM / A few notes below..."></textarea>
       </div>
 
       <div>
         <label class="checkbox-label">
           <input type="checkbox" id="modalIncludeSelectedComments" ${selectedFindings.length > 0 ? 'checked' : ''} />
-          <span>Inclure les <strong>${selectedFindings.length} commentaire(s) sélectionné(s)</strong></span>
+          <span>Include <strong>${selectedFindings.length} selected comment(s)</strong></span>
         </label>
         ${
           selectedFindings.length > 0
             ? `<ul style="margin:6px 0 0;padding-left:20px;color:var(--text-secondary);font-size:11.5px;">
-                ${selectedFindings.map((f) => `<li><strong>${escapeHtml(f.id)}</strong> — ${escapeHtml(stripEmojis(f.title))} (${escapeHtml(f.filePath || 'Général')})</li>`).join('')}
+                ${selectedFindings.map((f) => `<li><strong>${escapeHtml(f.id)}</strong> — ${escapeHtml(stripEmojis(f.title))} (${escapeHtml(f.filePath || 'General')})</li>`).join('')}
               </ul>`
-            : `<p class="meta-text" style="margin:4px 0 0;">Aucun commentaire coché (seul le verdict/message général sera envoyé).</p>`
+            : `<p class="meta-text" style="margin:4px 0 0;">No comments checked (only the review verdict/summary message will be sent).</p>`
         }
       </div>
     </div>
@@ -3399,17 +5156,19 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
           cid: f.cid,
           filePath: f.filePath,
           line: f.endLine || f.startLine || 1,
+          startLine: f.startLine || f.endLine || 1,
+          endLine: f.endLine || f.startLine || 1,
           body: f.customComment,
         }))
       : [];
 
     if (event === 'PENDING' && inlineComments.length === 0 && !summaryBody) {
-      showToast('Sélectionne au moins un commentaire ou saisis un message.');
+      showToast('Select at least one comment or enter a summary message.');
       return;
     }
 
     confirmBtn.disabled = true;
-    confirmBtn.textContent = 'Envoi...';
+    confirmBtn.textContent = 'Sending...';
 
     try {
       const res = await fetch('/api/github/review', {
@@ -3425,7 +5184,7 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Échec lors de la création de la review GitHub');
+      if (!res.ok) throw new Error(data.error || 'Failed to create GitHub review');
 
       for (const f of selectedFindings) {
         if (includeComments) f.posted = true;
@@ -3435,14 +5194,14 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
       loadState(true);
       showToast(
         event === 'PENDING'
-          ? 'Pending Review (brouillon) créée sur GitHub.'
-          : `Review (${event}) publiée sur GitHub.`
+          ? 'Pending Review (draft) created on GitHub.'
+          : `Review (${event}) published on GitHub.`
       );
     } catch (err) {
-      showToast(`Erreur: ${err.message}`, 5000);
+      showToast(`Error: ${err.message}`, 5000);
     } finally {
       confirmBtn.disabled = false;
-      confirmBtn.textContent = 'Confirmer';
+      confirmBtn.textContent = 'Confirm';
     }
   };
 }
@@ -3468,9 +5227,28 @@ document.getElementById('searchInput')?.addEventListener('input', (e) => {
   renderPrList();
 });
 
+document.getElementById('prSortOrderBtn')?.addEventListener('click', () => {
+  state.prSortOrder = state.prSortOrder === 'asc' ? 'desc' : 'asc';
+  try {
+    localStorage.setItem('prHub.prSortOrder', state.prSortOrder);
+  } catch {
+    // Ignore storage errors
+  }
+  renderPrList();
+});
+
 document.querySelectorAll('.view-tab').forEach((tab) => {
-  tab.addEventListener('click', () => {
-    switchTab(tab.dataset.tab);
+  tab.addEventListener('click', (e) => {
+    const targetTab = tab.dataset.tab;
+    if (state.splitMode) {
+      if (e.shiftKey) {
+        switchTab(targetTab, { splitSide: 'right' });
+      } else {
+        switchTab(targetTab, { splitSide: 'left' });
+      }
+      return;
+    }
+    switchTab(targetTab);
   });
 });
 
@@ -3480,7 +5258,7 @@ document.getElementById('themeToggleBtn')?.addEventListener('click', () => {
   const currentIdx = THEME_ORDER.indexOf(current);
   const next = THEME_ORDER[(currentIdx + 1) % THEME_ORDER.length];
   applySavedTheme(next);
-  showToast(`Thème : ${THEME_LABELS[next] || next}`, 1800);
+  showToast(`Theme: ${THEME_LABELS[next] || next}`, 1800);
 });
 
 document.getElementById('syncQueueBtn')?.addEventListener('click', async () => {
@@ -3488,17 +5266,17 @@ document.getElementById('syncQueueBtn')?.addEventListener('click', async () => {
   const spinner = document.getElementById('syncSpinner');
   btn.disabled = true;
   spinner.classList.remove('hidden');
-  showToast('Synchronisation GitHub en cours...');
+  showToast('Syncing with GitHub...');
 
   try {
     const res = await fetch('/api/sync', { method: 'POST' });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erreur sync-queue.sh');
+    if (!res.ok) throw new Error(data.error || 'Error running sync-queue.sh');
     await loadState(true);
     const actionableCount = data.scanResult?.actionable?.length || 0;
-    showToast(`Queue synchronisée (${actionableCount} PR à traiter).`);
+    showToast(`Queue synced (${actionableCount} actionable PR(s)).`);
   } catch (err) {
-    showToast(`Erreur: ${err.message}`, 4500);
+    showToast(`Error: ${err.message}`, 4500);
   } finally {
     btn.disabled = false;
     spinner.classList.add('hidden');
@@ -3520,14 +5298,14 @@ document.getElementById('copyAllSelectedBtn')?.addEventListener('click', async (
     (f) => state.selectedCommentCids.has(f.cid) && !f.dismissed
   );
   if (findings.length === 0) {
-    showToast('Aucun commentaire sélectionné.');
+    showToast('No comments selected.');
     return;
   }
   const combined = findings
     .map((f) => `### ${f.id} — ${stripEmojis(f.title)}${f.filePath ? ` (\`${f.filePath}\`)` : ''}\n\n${f.customComment}`)
     .join('\n\n---\n\n');
   await navigator.clipboard.writeText(combined);
-  showToast(`${findings.length} commentaire(s) copié(s).`);
+  showToast(`${findings.length} comment(s) copied.`);
 });
 
 document.getElementById('createPendingReviewBtn')?.addEventListener('click', () => {
@@ -3540,51 +5318,78 @@ document.getElementById('openBatchReviewModalBtn')?.addEventListener('click', ()
 
 async function openSettingsModal() {
   const cfg = state.config || {};
+  if (!state.teamProfiles || state.teamProfiles.length === 0) {
+    await loadRules();
+  }
+  const profiles = state.teamProfiles || [];
+  const activeProfileId = cfg.teamProfile || state.activeTeamProfile?.id || 'popcorn-back';
+  const activeAgentCli = cfg.agentCli || 'gemini';
+
   const modal = document.getElementById('githubModal');
   const titleEl = document.getElementById('modalTitle');
   const bodyEl = document.getElementById('modalBody');
   const confirmBtn = document.getElementById('confirmModalBtn');
 
-  titleEl.textContent = 'Configuration PR Review Hub (Multi-Team & Multi-Account)';
-  confirmBtn.textContent = 'Enregistrer';
+  titleEl.textContent = 'PR Review Hub Settings (Multi-Team & Multi-Account)';
+  confirmBtn.textContent = 'Save';
 
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:12px;">
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
         <div>
-          <label style="display:block;font-weight:500;margin-bottom:4px;">Utilisateur GitHub :</label>
-          <input type="text" id="cfgGithubUser" class="search-input" value="${escapeHtml(cfg.githubUser || '')}" placeholder="Auto-détecté via gh auth" />
+          <label style="display:block;font-weight:500;margin-bottom:4px;">GitHub User:</label>
+          <input type="text" id="cfgGithubUser" class="search-input" value="${escapeHtml(cfg.githubUser || '')}" placeholder="Auto-detected via gh auth" />
         </div>
         <div>
-          <label style="display:block;font-weight:500;margin-bottom:4px;">Organisation GitHub :</label>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">GitHub Organization:</label>
           <input type="text" id="cfgGithubOrg" class="search-input" value="${escapeHtml(cfg.githubOrg || 'ubitransports')}" />
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1.3fr 1fr;gap:10px;">
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Active Team Profile (Agent &amp; Team DNA):</label>
+          <select id="cfgTeamProfile" class="search-input">
+            ${profiles
+              .map(
+                (p) =>
+                  `<option value="${escapeHtml(p.id)}" ${p.id === activeProfileId ? 'selected' : ''}>${escapeHtml(p.name)} (${escapeHtml(p.id)})</option>`
+              )
+              .join('')}
+          </select>
+        </div>
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">AI Agent CLI Runner:</label>
+          <select id="cfgAgentCli" class="search-input">
+            <option value="gemini" ${activeAgentCli === 'gemini' ? 'selected' : ''}>Gemini CLI (gemini)</option>
+            <option value="claude" ${activeAgentCli === 'claude' ? 'selected' : ''}>Claude Code CLI (claude)</option>
+          </select>
         </div>
       </div>
       <div>
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-          <label style="font-weight:500;">Équipes GitHub suivies :</label>
-          <button type="button" id="cfgDiscoverTeamsBtn" class="btn btn-ghost btn-xs">Détecter mes équipes GitHub</button>
+          <label style="font-weight:500;">Watched GitHub Teams:</label>
+          <button type="button" id="cfgDiscoverTeamsBtn" class="btn btn-ghost btn-xs">Detect my GitHub teams</button>
         </div>
         <div id="cfgDiscoveredTeamsBox" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;"></div>
-        <input type="text" id="cfgGithubTeams" class="search-input" value="${escapeHtml((cfg.githubTeams || []).join(', '))}" placeholder="Ex: ubi-eng-team-popcorn, popcorn-back" />
+        <input type="text" id="cfgGithubTeams" class="search-input" value="${escapeHtml((cfg.githubTeams || []).join(', '))}" placeholder="E.g.: ubi-eng-team-popcorn, popcorn-back" />
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
         <div>
-          <label style="display:block;font-weight:500;margin-bottom:4px;">Workspace local des dépôts (projectsDir) :</label>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Local repositories workspace (projectsDir):</label>
           <input type="text" id="cfgProjectsDir" class="search-input" value="${escapeHtml(cfg.projectsDir || '')}" />
         </div>
         <div>
-          <label style="display:block;font-weight:500;margin-bottom:4px;">Dossier local des reviews (reviewsDir) :</label>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Local reviews folder (reviewsDir):</label>
           <input type="text" id="cfgReviewsDir" class="search-input" value="${escapeHtml(cfg.reviewsDir || '')}" />
         </div>
       </div>
       <div style="display:grid;grid-template-columns:1.3fr 1fr;gap:10px;">
         <div>
-          <label style="display:block;font-weight:500;margin-bottom:4px;">URL de base Jira :</label>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Jira Base URL:</label>
           <input type="text" id="cfgJiraBaseUrl" class="search-input" value="${escapeHtml(cfg.jiraBaseUrl || 'https://ubitransport.atlassian.net/browse')}" />
         </div>
         <div>
-          <label style="display:block;font-weight:500;margin-bottom:4px;">Préfixes Jira :</label>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Jira Prefixes:</label>
           <input type="text" id="cfgJiraPrefixes" class="search-input" value="${escapeHtml((cfg.jiraPrefixes || ['PRD', 'HYB', 'WAN', 'POP', 'OPS', 'SEC']).join(', '))}" />
         </div>
       </div>
@@ -3598,17 +5403,17 @@ async function openSettingsModal() {
     const orgVal = document.getElementById('cfgGithubOrg')?.value.trim() || cfg.githubOrg || '';
     const teamsInput = document.getElementById('cfgGithubTeams');
     if (!box || !teamsInput) return;
-    box.innerHTML = `<span class="meta-text">Recherche des équipes GitHub...</span>`;
+    box.innerHTML = `<span class="meta-text">Searching GitHub teams...</span>`;
     try {
       const res = await fetch(`/api/github/teams?org=${encodeURIComponent(orgVal)}`);
-      if (!res.ok) throw new Error('Indisponible');
+      if (!res.ok) throw new Error('Unavailable');
       const data = await res.json();
       if (data.githubUser && !document.getElementById('cfgGithubUser').value.trim()) {
         document.getElementById('cfgGithubUser').value = data.githubUser;
       }
       const teams = data.teams || [];
       if (teams.length === 0) {
-        box.innerHTML = `<span class="meta-text">Aucune équipe détectée automatiquement pour cette organisation.</span>`;
+        box.innerHTML = `<span class="meta-text">No teams auto-detected for this organization.</span>`;
         return;
       }
       const currentSet = new Set(
@@ -3646,6 +5451,8 @@ async function openSettingsModal() {
   confirmBtn.onclick = async () => {
     const githubUser = document.getElementById('cfgGithubUser').value.trim();
     const githubOrg = document.getElementById('cfgGithubOrg').value.trim();
+    const teamProfile = document.getElementById('cfgTeamProfile')?.value || 'popcorn-back';
+    const agentCli = document.getElementById('cfgAgentCli')?.value || 'gemini';
     const githubTeams = document
       .getElementById('cfgGithubTeams')
       .value.split(',')
@@ -3668,6 +5475,8 @@ async function openSettingsModal() {
         body: JSON.stringify({
           githubUser,
           githubOrg,
+          teamProfile,
+          agentCli,
           githubTeams,
           projectsDir,
           reviewsDir,
@@ -3676,16 +5485,17 @@ async function openSettingsModal() {
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Erreur sauvegarde configuration');
+      if (!res.ok) throw new Error(data.error || 'Error saving settings');
       state.config = data.config;
       modal.classList.add('hidden');
       await loadState(true);
-      showToast('Configuration sauvegardée.');
+      await loadRules();
+      showToast('Settings saved.');
     } catch (err) {
-      showToast(`Erreur: ${err.message}`, 4500);
+      showToast(`Error: ${err.message}`, 4500);
     } finally {
       confirmBtn.disabled = false;
-      confirmBtn.textContent = 'Confirmer';
+      confirmBtn.textContent = 'Confirm';
     }
   };
 }
@@ -3708,9 +5518,12 @@ async function loadRules() {
     const res = await fetch('/api/rules');
     if (!res.ok) return;
     const data = await res.json();
+    state.teamProfiles = data.teamProfiles || [];
+    state.activeTeamProfile = data.activeTeamProfile || null;
     state.rules = data.rules || [];
     state.candidateRules = data.candidates || [];
     state.commonSections = data.commonSections || [];
+    state.teamSections = data.teamSections || [];
     state.dnaSections = data.dnaSections || [];
     state.fpSections = data.fpSections || [];
 
@@ -3723,6 +5536,11 @@ async function loadRules() {
     const commonCountEl = document.getElementById('rulesCommonCount');
     if (commonCountEl) {
       commonCountEl.textContent = String(state.rules.filter((r) => r.target === 'common').length);
+    }
+
+    const teamCountEl = document.getElementById('rulesTeamCount');
+    if (teamCountEl) {
+      teamCountEl.textContent = String(state.rules.filter((r) => r.target === 'team').length);
     }
 
     const dnaCountEl = document.getElementById('rulesDnaCount');
@@ -3746,6 +5564,48 @@ function renderRulesTab() {
   if (!listEl) return;
 
   const q = (state.rulesSearch || '').toLowerCase();
+  const activeProfile = state.activeTeamProfile || {
+    id: state.config?.teamProfile || 'popcorn-back',
+    name: 'Popcorn & Backend PHP',
+    description: '',
+    techStack: [],
+    agentSkills: [],
+    agentInstructions: '',
+  };
+  const profiles = state.teamProfiles || [];
+
+  const teamProfileBannerHtml = `
+    <div class="rule-card" style="border-left:3px solid var(--status-pass);background:var(--bg-elevated);margin-bottom:10px;">
+      <div class="rule-card-header" style="flex-wrap:wrap;gap:10px;">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span class="badge badge-pass">ACTIVE TEAM AGENT</span>
+          <select id="activeTeamProfileSelect" class="search-input" style="min-width:260px;font-weight:600;">
+            ${profiles
+              .map(
+                (p) =>
+                  `<option value="${escapeHtml(p.id)}" ${p.id === activeProfile.id ? 'selected' : ''}>${escapeHtml(p.name)} (${escapeHtml(p.id)})</option>`
+              )
+              .join('')}
+          </select>
+          ${(activeProfile.techStack || [])
+            .map((t) => `<span class="badge badge-mono">${escapeHtml(t)}</span>`)
+            .join('')}
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <button type="button" id="editTeamProfileBtn" class="btn btn-secondary btn-xs">Configure Team Agent</button>
+          <button type="button" id="createNewTeamProfileBtn" class="btn btn-primary btn-xs">+ New Team Profile</button>
+        </div>
+      </div>
+      ${
+        activeProfile.agentInstructions || activeProfile.description
+          ? `<div class="rule-card-body" style="margin-top:6px;font-size:12px;">
+              ${activeProfile.description ? `<div style="margin-bottom:4px;"><strong>Scope:</strong> ${escapeHtml(activeProfile.description)}</div>` : ''}
+              ${activeProfile.agentInstructions ? `<div><strong>Agent Focus:</strong> ${escapeHtml(activeProfile.agentInstructions)}</div>` : ''}
+            </div>`
+          : ''
+      }
+    </div>
+  `;
 
   const candidateItems = (state.candidateRules || []).map((c) => ({
     ...c,
@@ -3771,9 +5631,12 @@ function renderRulesTab() {
   if (filtered.length === 0) {
     const emptyHint =
       state.rulesFilter === 'candidate'
-        ? `Aucune règle candidate en attente de validation. Clique sur "Analyser PRs Équipe (1 an)" pour extraire les conventions de review des 365 derniers jours.`
-        : `Aucune règle ne correspond aux critères.`;
-    listEl.innerHTML = `<div class="empty-card" style="margin:24px auto;"><p>${escapeHtml(emptyHint)}</p></div>`;
+        ? `No candidate rules pending validation. Click "Scan Team PRs (1y)" to extract review conventions from the last 365 days.`
+        : `No rules match the current filter.`;
+    listEl.innerHTML =
+      teamProfileBannerHtml +
+      `<div class="empty-card" style="margin:24px auto;"><p>${escapeHtml(emptyHint)}</p></div>`;
+    bindTeamProfileBannerEvents();
     return;
   }
 
@@ -3783,11 +5646,12 @@ function renderRulesTab() {
       <div class="rule-card" style="border-left:3px solid var(--accent);background:var(--bg-elevated);margin-bottom:8px;">
         <div class="rule-card-header">
           <div class="rule-card-title-group">
-            <span class="badge badge-severity-question">ONBOARDING ÉQUIPE (1 AN)</span>
-            <span class="rule-card-title">${candidateItems.length} règle(s) candidate(s) synthétisée(s) depuis l'historique GitHub — Validation requise avant activation</span>
+            <span class="badge badge-severity-question">TEAM ONBOARDING (1 YEAR)</span>
+            <span class="rule-card-title">${candidateItems.length} candidate rule(s) synthesized from GitHub history — Validation required before activation</span>
           </div>
           <div style="display:flex;gap:6px;">
-            <button id="approveAllCandidatesLocalBtn" class="btn btn-primary btn-xs">Tout valider (ADN Local)</button>
+            <button id="approveAllCandidatesTeamBtn" class="btn btn-secondary btn-xs">Approve All (Team DNA)</button>
+            <button id="approveAllCandidatesLocalBtn" class="btn btn-primary btn-xs">Approve All (Local DNA)</button>
           </div>
         </div>
       </div>
@@ -3799,7 +5663,7 @@ function renderRulesTab() {
       if (r.target === 'candidate') {
         const samplesHtml =
           Array.isArray(r.samples) && r.samples.length > 0
-            ? `<div class="meta-text" style="margin-top:6px;">Exemples détectés (${r.occurrences || r.samples.length} occurrences) : ${r.samples
+            ? `<div class="meta-text" style="margin-top:6px;">Detected examples (${r.occurrences || r.samples.length} occurrences): ${r.samples
                 .map((s) => `<code>${escapeHtml(s.pr)}</code> (@${escapeHtml(s.reviewer)})`)
                 .join(' · ')}</div>`
             : '';
@@ -3807,15 +5671,16 @@ function renderRulesTab() {
           <div class="rule-card" style="border-left:3px solid var(--accent);" data-idx="${idx}">
             <div class="rule-card-header">
               <div class="rule-card-title-group">
-                <span class="badge badge-severity-question">CANDIDATE À VALIDER</span>
+                <span class="badge badge-severity-question">CANDIDATE TO VALIDATE</span>
                 <span class="rule-section-pill">${escapeHtml(r.section || '1. Architecture, Serialization & Clean Code')}</span>
                 <span class="rule-card-title">${escapeHtml(r.title)}</span>
               </div>
               <div style="display:flex;gap:6px;align-items:center;">
-                <button class="btn btn-primary btn-xs approve-candidate-dna-btn" data-idx="${idx}" title="Valider et ajouter à references/reviewer-dna.local.md">Valider (ADN Local)</button>
-                <button class="btn btn-secondary btn-xs approve-candidate-common-btn" data-idx="${idx}" title="Valider et ajouter au socle commun references/common-dna.md">Valider (Commun)</button>
-                <button class="btn btn-ghost btn-xs edit-candidate-btn" data-idx="${idx}">Éditer</button>
-                <button class="btn btn-ghost btn-xs reject-candidate-btn" data-idx="${idx}">Rejeter</button>
+                <button class="btn btn-primary btn-xs approve-candidate-dna-btn" data-idx="${idx}" title="Approve and add to personal references/reviewer-dna.local.md">Approve (Local)</button>
+                <button class="btn btn-secondary btn-xs approve-candidate-team-btn" data-idx="${idx}" title="Approve and add to shared team profile references/teams/${escapeHtml(activeProfile.id)}/team-dna.md">Approve (Team)</button>
+                <button class="btn btn-secondary btn-xs approve-candidate-common-btn" data-idx="${idx}" title="Approve and add to shared references/common-dna.md">Approve (Common)</button>
+                <button class="btn btn-ghost btn-xs edit-candidate-btn" data-idx="${idx}">Edit</button>
+                <button class="btn btn-ghost btn-xs reject-candidate-btn" data-idx="${idx}">Reject</button>
               </div>
             </div>
             <div class="rule-card-body">${escapeHtml(r.body)}${samplesHtml}</div>
@@ -3825,13 +5690,17 @@ function renderRulesTab() {
 
       const badgeLabel =
         r.target === 'common'
-          ? 'SOCLE COMMUN'
+          ? 'COMMON DNA'
+          : r.target === 'team'
+          ? `TEAM DNA (${activeProfile.id.toUpperCase()})`
           : r.target === 'dna'
-          ? 'ADN LOCAL'
+          ? 'LOCAL DNA'
           : 'FALSE POSITIVE';
       const badgeClass =
         r.target === 'common'
           ? 'badge-severity-nit'
+          : r.target === 'team'
+          ? 'badge-peer'
           : r.target === 'dna'
           ? 'badge-severity-ok'
           : 'badge-severity-major';
@@ -3840,14 +5709,14 @@ function renderRulesTab() {
         <div class="rule-card ${r.target === 'false-positive' ? 'rule-fp' : 'rule-dna'}" data-idx="${idx}">
           <div class="rule-card-header">
             <div class="rule-card-title-group">
-              <span class="badge ${badgeClass}">${badgeLabel}</span>
+              <span class="badge ${badgeClass}">${escapeHtml(badgeLabel)}</span>
               <span class="rule-section-pill">${escapeHtml(r.section)}</span>
               <span class="rule-card-title">${escapeHtml(r.title)}</span>
             </div>
             <div style="display:flex;gap:6px;align-items:center;">
               ${r.startLine ? `<span class="meta-text">L${r.startLine}</span>` : ''}
-              <button class="btn btn-ghost btn-xs edit-rule-btn" data-idx="${idx}">Éditer</button>
-              <button class="btn btn-ghost btn-xs delete-rule-btn" data-idx="${idx}">Retirer</button>
+              <button class="btn btn-ghost btn-xs edit-rule-btn" data-idx="${idx}">Edit</button>
+              <button class="btn btn-ghost btn-xs delete-rule-btn" data-idx="${idx}">Remove</button>
             </div>
           </div>
           <div class="rule-card-body">${escapeHtml(r.body)}</div>
@@ -3856,16 +5725,28 @@ function renderRulesTab() {
     })
     .join('');
 
-  listEl.innerHTML = candidateBannerHtml + cardsHtml;
+  listEl.innerHTML = teamProfileBannerHtml + candidateBannerHtml + cardsHtml;
+  bindTeamProfileBannerEvents();
 
   document.getElementById('approveAllCandidatesLocalBtn')?.addEventListener('click', async () => {
     await decideCandidateRuleAction({ action: 'approve-all', target: 'dna' });
+  });
+
+  document.getElementById('approveAllCandidatesTeamBtn')?.addEventListener('click', async () => {
+    await decideCandidateRuleAction({ action: 'approve-all', target: 'team' });
   });
 
   listEl.querySelectorAll('.approve-candidate-dna-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const rule = filtered[Number(btn.dataset.idx)];
       if (rule) await decideCandidateRuleAction({ id: rule.id, action: 'approve', target: 'dna' });
+    });
+  });
+
+  listEl.querySelectorAll('.approve-candidate-team-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const rule = filtered[Number(btn.dataset.idx)];
+      if (rule) await decideCandidateRuleAction({ id: rule.id, action: 'approve', target: 'team' });
     });
   });
 
@@ -3905,6 +5786,132 @@ function renderRulesTab() {
   });
 }
 
+function bindTeamProfileBannerEvents() {
+  document.getElementById('activeTeamProfileSelect')?.addEventListener('change', async (e) => {
+    const newTeamProfile = e.target.value;
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ teamProfile: newTeamProfile }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        state.config = data.config;
+        await loadRules();
+        showToast(`Switched active Team Profile to "${newTeamProfile}".`);
+      }
+    } catch (err) {
+      showToast(`Error switching team profile: ${err.message}`, 4000);
+    }
+  });
+
+  document.getElementById('editTeamProfileBtn')?.addEventListener('click', () => {
+    openTeamProfileModal(state.activeTeamProfile);
+  });
+
+  document.getElementById('createNewTeamProfileBtn')?.addEventListener('click', () => {
+    openTeamProfileModal(null);
+  });
+}
+
+function openTeamProfileModal(existingProfile = null) {
+  const isEdit = Boolean(existingProfile);
+  const modal = document.getElementById('githubModal');
+  const titleEl = document.getElementById('modalTitle');
+  const bodyEl = document.getElementById('modalBody');
+  const confirmBtn = document.getElementById('confirmModalBtn');
+
+  titleEl.textContent = isEdit
+    ? `Configure Team Agent Profile — ${existingProfile.name}`
+    : 'Create New Team Agent Profile';
+  confirmBtn.textContent = isEdit ? 'Save Team Profile' : 'Create & Activate Profile';
+
+  bodyEl.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <p class="meta-text" style="margin:0;">
+        Team profiles are stored in <code>references/teams/&lt;team-id&gt;/</code> (` +
+    '`profile.json`' +
+    ` + ` +
+    '`team-dna.md`' +
+    `) so each team can version its own agent instructions and review rules in Git without conflicts.
+      </p>
+      <div style="display:grid;grid-template-columns:1fr 1.5fr;gap:10px;">
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Team ID (slug):</label>
+          <input type="text" id="teamProfIdInput" class="search-input" value="${escapeHtml(existingProfile?.id || '')}" placeholder="e.g. moneris-back, mobile-ios" ${isEdit ? 'readonly' : ''} />
+        </div>
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Display Name:</label>
+          <input type="text" id="teamProfNameInput" class="search-input" value="${escapeHtml(existingProfile?.name || '')}" placeholder="e.g. Moneris Backend (PHP / Symfony)" />
+        </div>
+      </div>
+      <div>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Scope:</label>
+        <input type="text" id="teamProfDescInput" class="search-input" value="${escapeHtml(existingProfile?.description || '')}" placeholder="Short summary of repositories and scope covered by this team..." />
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Tech Stack (comma-separated):</label>
+          <input type="text" id="teamProfStackInput" class="search-input" value="${escapeHtml((existingProfile?.techStack || []).join(', '))}" placeholder="e.g. PHP 8.3+, Symfony, Doctrine" />
+        </div>
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">GitHub Team Slugs (comma-separated):</label>
+          <input type="text" id="teamProfGhTeamsInput" class="search-input" value="${escapeHtml((existingProfile?.githubTeams || []).join(', '))}" placeholder="e.g. ubi-eng-team-popcorn, popcorn-back" />
+        </div>
+      </div>
+      <div>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Team Agent System Instructions (injected into AI Reviews &amp; Q&amp;A):</label>
+        <textarea id="teamProfInstructionsInput" class="finding-textarea" style="min-height:95px;" placeholder="Specify architectural priorities, frameworks, testing expectations, and patterns the AI agent must focus on for this team...">${escapeHtml(existingProfile?.agentInstructions || '')}</textarea>
+      </div>
+    </div>
+  `;
+
+  modal.classList.remove('hidden');
+
+  confirmBtn.onclick = async () => {
+    const id = document.getElementById('teamProfIdInput')?.value.trim();
+    const name = document.getElementById('teamProfNameInput')?.value.trim();
+    const description = document.getElementById('teamProfDescInput')?.value.trim();
+    const techStack = document.getElementById('teamProfStackInput')?.value.trim();
+    const githubTeams = document.getElementById('teamProfGhTeamsInput')?.value.trim();
+    const agentInstructions = document.getElementById('teamProfInstructionsInput')?.value.trim();
+
+    if (!id && !name) {
+      showToast('Team ID and Display Name are required.');
+      return;
+    }
+
+    confirmBtn.disabled = true;
+    try {
+      const res = await fetch('/api/teams/profiles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: id || name,
+          name: name || id,
+          description,
+          techStack,
+          githubTeams,
+          agentInstructions,
+          activate: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Error saving team profile');
+      state.config = data.config || state.config;
+      modal.classList.add('hidden');
+      await loadRules();
+      showToast(`Team Profile "${data.profile?.name || name}" saved and activated.`);
+    } catch (err) {
+      showToast(`Error: ${err.message}`, 4500);
+    } finally {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Confirm';
+    }
+  };
+}
+
 async function decideCandidateRuleAction(payload) {
   try {
     const res = await fetch('/api/rules/candidates/decision', {
@@ -3913,17 +5920,17 @@ async function decideCandidateRuleAction(payload) {
       body: JSON.stringify(payload),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erreur décision règle candidate');
+    if (!res.ok) throw new Error(data.error || 'Error updating candidate rule');
     await loadRules();
     showToast(
       payload.action === 'reject'
-        ? 'Règle candidate rejetée.'
+        ? 'Candidate rule rejected.'
         : payload.action === 'approve-all'
-        ? 'Toutes les règles candidates ont été validées dans ADN Local.'
-        : `Règle validée et ajoutée (${payload.target === 'common' ? 'Socle Commun' : 'ADN Local'}).`
+        ? `All candidate rules approved into ${payload.target === 'team' ? 'Team DNA' : 'Local DNA'}.`
+        : `Rule approved and added (${payload.target === 'common' ? 'Common DNA' : payload.target === 'team' ? 'Team DNA' : 'Local DNA'}).`
     );
   } catch (err) {
-    showToast(`Erreur: ${err.message}`, 4500);
+    showToast(`Error: ${err.message}`, 4500);
   }
 }
 
@@ -3944,21 +5951,23 @@ function openCandidateEditorModal(candidateRule) {
   const titleEl = document.getElementById('modalTitle');
   const bodyEl = document.getElementById('modalBody');
   const confirmBtn = document.getElementById('confirmModalBtn');
+  const activeProfileId = state.activeTeamProfile?.id || state.config?.teamProfile || 'popcorn-back';
 
-  titleEl.textContent = `Éditer & Valider la règle candidate`;
-  confirmBtn.textContent = 'Valider la règle';
+  titleEl.textContent = `Edit & Approve Candidate Rule`;
+  confirmBtn.textContent = 'Approve Rule';
 
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:10px;">
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Destination :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Target:</label>
         <select id="candidateTargetSelect" class="search-input">
-          <option value="dna">ADN Local / Équipe (references/reviewer-dna.local.md)</option>
-          <option value="common">Socle Commun (references/common-dna.md)</option>
+          <option value="dna">Local Personal DNA (references/reviewer-dna.local.md)</option>
+          <option value="team">Team DNA (references/teams/${escapeHtml(activeProfileId)}/team-dna.md)</option>
+          <option value="common">Common Org DNA (references/common-dna.md)</option>
         </select>
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Section :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Section:</label>
         <select id="candidateSectionSelect" class="search-input">
           ${sections
             .map(
@@ -3969,11 +5978,11 @@ function openCandidateEditorModal(candidateRule) {
         </select>
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Titre de la règle (Anglais) :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Rule Title (English):</label>
         <input type="text" id="candidateTitleInput" class="search-input" value="${escapeHtml(candidateRule.title || '')}" />
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Consigne (Anglais) :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Instruction (English):</label>
         <textarea id="candidateBodyInput" class="finding-textarea" style="min-height:110px;">${escapeHtml(candidateRule.body || '')}</textarea>
       </div>
     </div>
@@ -3987,7 +5996,7 @@ function openCandidateEditorModal(candidateRule) {
     const title = document.getElementById('candidateTitleInput').value.trim();
     const body = document.getElementById('candidateBodyInput').value.trim();
     if (!title || !body) {
-      showToast('Titre et description requis.');
+      showToast('Title and description are required.');
       return;
     }
     confirmBtn.disabled = true;
@@ -4039,24 +6048,27 @@ function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
   const confirmBtn = document.getElementById('confirmModalBtn');
 
   titleEl.textContent = isEdit
-    ? `Éditer la règle : ${existingRule.title}`
+    ? `Edit Rule: ${existingRule.title}`
     : target === 'false-positive'
-    ? 'Ajouter un Faux Positif (false-positives.local.md)'
-    : 'Ajouter une Règle Agent';
-  confirmBtn.textContent = isEdit ? 'Mettre à jour' : 'Ajouter la règle';
+    ? 'Add False Positive (false-positives.local.md)'
+    : 'Add Agent Rule';
+  confirmBtn.textContent = isEdit ? 'Update' : 'Add Rule';
+
+  const activeProfileId = state.activeTeamProfile?.id || state.config?.teamProfile || 'popcorn-back';
 
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:10px;">
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Fichier cible :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Target File:</label>
         <select id="editorRuleTargetSelect" class="search-input" ${isEdit ? 'disabled' : ''}>
-          <option value="dna" ${target === 'dna' ? 'selected' : ''}>ADN Local / Équipe (references/reviewer-dna.local.md)</option>
-          <option value="common" ${target === 'common' ? 'selected' : ''}>Socle Commun (references/common-dna.md)</option>
-          <option value="false-positive" ${target === 'false-positive' ? 'selected' : ''}>Faux Positifs (references/false-positives.local.md)</option>
+          <option value="dna" ${target === 'dna' ? 'selected' : ''}>Local Personal DNA (references/reviewer-dna.local.md)</option>
+          <option value="team" ${target === 'team' ? 'selected' : ''}>Team DNA (references/teams/${escapeHtml(activeProfileId)}/team-dna.md)</option>
+          <option value="common" ${target === 'common' ? 'selected' : ''}>Common Org DNA (references/common-dna.md)</option>
+          <option value="false-positive" ${target === 'false-positive' ? 'selected' : ''}>False Positives (references/false-positives.local.md)</option>
         </select>
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Section :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Section:</label>
         <select id="editorRuleSectionSelect" class="search-input">
           ${sections
             .map(
@@ -4067,11 +6079,11 @@ function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
         </select>
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Titre de la règle (Anglais) :</label>
-        <input type="text" id="editorRuleTitleInput" class="search-input" value="${escapeHtml(existingRule?.title || '')}" placeholder="Ex: Strict DateTimeImmutable Usage" />
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Rule Title (English):</label>
+        <input type="text" id="editorRuleTitleInput" class="search-input" value="${escapeHtml(existingRule?.title || '')}" placeholder="E.g.: Strict DateTimeImmutable Usage" />
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Consigne (Anglais) :</label>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Instruction (English):</label>
         <textarea id="editorRuleBodyInput" class="finding-textarea" style="min-height:110px;" placeholder="Explain what the agent should enforce or ignore...">${escapeHtml(existingRule?.body || '')}</textarea>
       </div>
     </div>
@@ -4085,7 +6097,7 @@ function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
     const title = document.getElementById('editorRuleTitleInput').value.trim();
     const body = document.getElementById('editorRuleBodyInput').value.trim();
     if (!title || !body) {
-      showToast('Titre et description requis.');
+      showToast('Title and description are required.');
       return;
     }
 
@@ -4101,15 +6113,15 @@ function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
         ),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Erreur sauvegarde règle');
+      if (!res.ok) throw new Error(data.error || 'Error saving rule');
       modal.classList.add('hidden');
       await loadRules();
-      showToast(isEdit ? `Règle "${title}" mise à jour.` : `Règle "${title}" ajoutée.`);
+      showToast(isEdit ? `Rule "${title}" updated.` : `Rule "${title}" added.`);
     } catch (err) {
-      showToast(`Erreur: ${err.message}`, 4500);
+      showToast(`Error: ${err.message}`, 4500);
     } finally {
       confirmBtn.disabled = false;
-      confirmBtn.textContent = 'Confirmer';
+      confirmBtn.textContent = 'Confirm';
     }
   };
 }
@@ -4120,8 +6132,8 @@ function promptDeleteRule(rule) {
   const bodyEl = document.getElementById('modalBody');
   const confirmBtn = document.getElementById('confirmModalBtn');
 
-  titleEl.textContent = `Retirer la règle de l'agent`;
-  confirmBtn.textContent = 'Supprimer définitivement';
+  titleEl.textContent = `Remove Agent Rule`;
+  confirmBtn.textContent = 'Delete permanently';
 
   const targetFileLabel =
     rule.target === 'common'
@@ -4133,8 +6145,8 @@ function promptDeleteRule(rule) {
   bodyEl.innerHTML = `
     <div>
       <p style="margin:0 0 8px;">
-        Confirmer la suppression de la règle <strong>${escapeHtml(rule.title)}</strong> dans
-        <code>${escapeHtml(targetFileLabel)}</code> ?
+        Confirm deletion of rule <strong>${escapeHtml(rule.title)}</strong> from
+        <code>${escapeHtml(targetFileLabel)}</code>?
       </p>
       <pre style="background:var(--bg-app);padding:8px 10px;border-radius:4px;border:1px solid var(--border);white-space:pre-wrap;font-size:11.5px;color:var(--text-secondary);">${escapeHtml(rule.rawMarkdown)}</pre>
     </div>
@@ -4151,15 +6163,15 @@ function promptDeleteRule(rule) {
         body: JSON.stringify({ id: rule.id, target: rule.target }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Erreur suppression règle');
+      if (!res.ok) throw new Error(data.error || 'Error deleting rule');
       modal.classList.add('hidden');
       await loadRules();
-      showToast(`Règle "${rule.title}" retirée de l'agent.`);
+      showToast(`Rule "${rule.title}" removed from agent.`);
     } catch (err) {
-      showToast(`Erreur: ${err.message}`, 4500);
+      showToast(`Error: ${err.message}`, 4500);
     } finally {
       confirmBtn.disabled = false;
-      confirmBtn.textContent = 'Confirmer';
+      confirmBtn.textContent = 'Confirm';
     }
   };
 }
@@ -4167,7 +6179,7 @@ function promptDeleteRule(rule) {
 document.getElementById('bootstrapTeamRulesBtn')?.addEventListener('click', async () => {
   const btn = document.getElementById('bootstrapTeamRulesBtn');
   if (btn) btn.disabled = true;
-  showToast('Analyse des PRs et commentaires de review de l’équipe sur 1 an (365j)...');
+  showToast('Scanning team PRs and review comments over 1 year (365d)...');
   try {
     const res = await fetch('/api/rules/bootstrap', {
       method: 'POST',
@@ -4175,7 +6187,7 @@ document.getElementById('bootstrapTeamRulesBtn')?.addEventListener('click', asyn
       body: JSON.stringify({ days: 365 }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erreur analyse PRs sur 1 an');
+    if (!res.ok) throw new Error(data.error || 'Error scanning 1-year PR history');
     await loadRules();
     // Switch filter tab to "candidate" so the user sees the proposed rules to validate/reject
     state.rulesFilter = 'candidate';
@@ -4185,10 +6197,10 @@ document.getElementById('bootstrapTeamRulesBtn')?.addEventListener('click', asyn
       .forEach((b) => b.classList.toggle('active', b.dataset.ruleTarget === 'candidate'));
     renderRulesTab();
     showToast(
-      `${data.addedCandidatesCount || 0} nouvelle(s) règle(s) candidate(s) extraite(s) sur ${data.analyzedCommentsCount || 0} commentaires (${data.analyzedPrsCount || 0} PRs).`
+      `${data.addedCandidatesCount || 0} new candidate rule(s) extracted from ${data.analyzedCommentsCount || 0} comments (${data.analyzedPrsCount || 0} PRs).`
     );
   } catch (err) {
-    showToast(`Erreur: ${err.message}`, 5000);
+    showToast(`Error: ${err.message}`, 5000);
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -4241,27 +6253,26 @@ function renderCollapsibleLayoutState() {
     returnActiveBtn.classList.toggle('hidden', !state.prQueueFullPage || !state.selectedPrKey);
     const activePr = state.prs.find((p) => p.key === state.selectedPrKey);
     if (activePr) {
-      returnActiveBtn.textContent = `Reprendre ${activePr.repo} #${activePr.number} →`;
+      returnActiveBtn.textContent = `Resume ${activePr.repo} #${activePr.number} →`;
     }
   }
 
   if (fileBtn) {
-    fileBtn.textContent = state.fileTreeCollapsed ? 'Afficher Fichiers (b)' : 'Masquer Fichiers (b)';
+    const isDiffVisible = state.splitMode
+      ? state.splitLeftTab === 'diff' || state.splitRightTab === 'diff'
+      : state.activeTab === 'diff';
+    fileBtn.classList.toggle('hidden', !isDiffVisible);
     fileBtn.classList.toggle('btn-primary', state.fileTreeCollapsed);
   }
   if (inlineDiffBtn) {
-    const total = (state.currentDiff?.files || []).length;
-    inlineDiffBtn.textContent = state.fileTreeCollapsed
-      ? `Fichiers (${total}) (b)`
-      : 'Masquer Fichiers (b)';
     inlineDiffBtn.classList.toggle('btn-primary', state.fileTreeCollapsed);
     inlineDiffBtn.classList.toggle('btn-secondary', !state.fileTreeCollapsed);
   }
   if (inlineFocusBtn) {
-    inlineFocusBtn.textContent = state.focusDiffMode ? 'Afficher En-tête (Esc)' : 'Focus Diff (z)';
     inlineFocusBtn.classList.toggle('btn-primary', state.focusDiffMode);
     inlineFocusBtn.classList.toggle('btn-secondary', !state.focusDiffMode);
   }
+  syncKeybindingLegends();
 }
 
 async function enterPrReviewWorkspace(prKey, targetTab = null) {
@@ -4270,15 +6281,16 @@ async function enterPrReviewWorkspace(prKey, targetTab = null) {
   state.prQueueFullPage = false;
   state.prSidebarCollapsed = true;
 
-  // Clicking a PR (targetTab === null) or clicking "Ouvrir Diff" lands directly in Focus Diff mode
-  // WITH the modified files tree open on the left (`fileTreeCollapsed = false`)
-  if (!targetTab || targetTab === 'diff') {
+  // Clicking a PR (targetTab === null or 'report') opens the Audit Report view (`1. Audit Report`)
+  // Clicking "Open Diff" (targetTab === 'diff') opens the Git Diff view
+  const effectiveTab = targetTab || 'report';
+  if (effectiveTab === 'diff') {
     state.fileTreeCollapsed = false;
-    state.focusDiffMode = true;
-    switchTab('diff', { keepFocusDiff: true });
+    state.focusDiffMode = false;
+    switchTab('diff');
   } else {
     state.focusDiffMode = false;
-    switchTab(targetTab);
+    switchTab(effectiveTab);
   }
   renderCollapsibleLayoutState();
 
@@ -4356,6 +6368,8 @@ function scrollActivePanelBy(deltaY) {
   }
 }
 
+let activeRecordingShortcutId = null;
+
 function openKeyboardShortcutsModal() {
   const modal = document.getElementById('githubModal');
   const titleEl = document.getElementById('modalTitle');
@@ -4363,51 +6377,82 @@ function openKeyboardShortcutsModal() {
   const confirmBtn = document.getElementById('confirmModalBtn');
   if (!modal || !titleEl || !bodyEl || !confirmBtn) return;
 
-  titleEl.textContent = 'Raccourcis Clavier (Navigation 100% Clavier)';
-  confirmBtn.textContent = 'Fermer';
+  activeRecordingShortcutId = null;
+  titleEl.textContent = 'Keyboard Shortcuts — Click a key to customize';
+  confirmBtn.textContent = 'Close';
 
-  const shortcuts = [
-    ['Entrée (dans la liste PRs)', 'Ouvrir la PR directement en Focus Diff + Arbre Fichiers'],
-    ['b (ou ])', 'Afficher / Masquer l’arbre des fichiers modifiés à gauche'],
-    ['q', 'Revenir à la sélection de PRs pleine page (Toutes les PRs)'],
-    ['← / → (ou h / l)', 'Fichier modifié précédent / suivant (Diff)'],
-    ['↑ / ↓ / PageUp / PageDown', 'Défiler dans le diff ou le rapport actif'],
-    ['- / + (ou =) / 0', 'Dézoomer / Zoomer dans le diff / Reset 100%'],
-    ['n / p', 'Hunk ou Finding suivant / précédent'],
-    ['z ou f', 'Mode Focus Diff plein écran (masquer/afficher l’en-tête PR)'],
-    ['Esc', 'Quitter Focus Diff / Fermer modale ou drawer'],
-    ['g', 'Sélecteur rapide de fichier (Diff / Tree)'],
-    ['j / k', 'PR suivante / PR précédente dans la queue'],
-    ['1 — 5', 'Changer d’onglet (Audit, Commentaires, Diff, Tree, Règles)'],
-    ['[', 'Masquer/Afficher colonne PRs'],
-    ['t', 'Basculer le fichier entre Diff Git et Arbre de Travail'],
-    ['i', 'Ouvrir le fichier courant dans PhpStorm'],
-    ['s', 'Mode Split côte-à-côte (Rapport + Code)'],
-    ['o', 'Ouvrir le Diff dans une fenêtre Pop-out'],
-    ['c (puis Entrée)', 'Ouvrir Agent Q&A (Entrée ou Cmd+Entrée pour envoyer)'],
-    ['r', 'Relancer l’audit IA sur la PR'],
-    ['m', 'Ouvrir la modale Publier Review sur GitHub'],
-    ['/', 'Rechercher / Filtrer une PR'],
-    ['?', 'Afficher cette aide des raccourcis clavier'],
-  ];
+  const renderShortcutsModalContent = () => {
+    const entries = Object.entries(DEFAULT_KEYBINDINGS);
+    bodyEl.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:4px;">
+        <span class="meta-text">Click any key badge below and press your desired key. All UI legends update automatically.</span>
+        <button type="button" id="resetAllShortcutsBtn" class="btn btn-secondary btn-xs">Reset to default</button>
+      </div>
+      <div class="shortcuts-grid">
+        ${entries
+          .map(([actionId, def]) => {
+            const currentKey = getKeybind(actionId);
+            const isRecording = activeRecordingShortcutId === actionId;
+            const isModified = currentKey !== def.key;
+            const displayLabel = isRecording
+              ? 'Press a key…'
+              : formatKeybindLabel(currentKey);
+            return `
+              <div class="shortcut-row">
+                <span>${escapeHtml(def.label)}</span>
+                <span class="shortcut-keys">
+                  <button
+                    type="button"
+                    class="shortcut-recorder-btn ${isRecording ? 'recording' : ''}"
+                    data-action-id="${escapeHtml(actionId)}"
+                    title="Click to change this shortcut (default: ${escapeHtml(formatKeybindLabel(def.key))})"
+                  >${escapeHtml(displayLabel)}</button>
+                  ${
+                    isModified
+                      ? `<button type="button" class="btn btn-ghost btn-xs shortcut-reset-one-btn" data-action-id="${escapeHtml(actionId)}" title="Reset to default (${escapeHtml(formatKeybindLabel(def.key))})">&#8634;</button>`
+                      : ''
+                  }
+                </span>
+              </div>
+            `;
+          })
+          .join('')}
+      </div>
+    `;
 
-  bodyEl.innerHTML = `
-    <div class="shortcuts-grid">
-      ${shortcuts
-        .map(
-          ([keys, desc]) => `
-        <div class="shortcut-row">
-          <span>${escapeHtml(desc)}</span>
-          <span class="shortcut-keys"><kbd>${escapeHtml(keys)}</kbd></span>
-        </div>
-      `
-        )
-        .join('')}
-    </div>
-  `;
+    bodyEl.querySelector('#resetAllShortcutsBtn')?.addEventListener('click', () => {
+      activeRecordingShortcutId = null;
+      resetAllKeybindings();
+      renderShortcutsModalContent();
+      showToast('All keyboard shortcuts reset to default.');
+    });
+
+    bodyEl.querySelectorAll('.shortcut-recorder-btn').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const actionId = btn.dataset.actionId;
+        activeRecordingShortcutId = activeRecordingShortcutId === actionId ? null : actionId;
+        renderShortcutsModalContent();
+      });
+    });
+
+    bodyEl.querySelectorAll('.shortcut-reset-one-btn').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const actionId = btn.dataset.actionId;
+        activeRecordingShortcutId = null;
+        resetKeybind(actionId);
+        renderShortcutsModalContent();
+      });
+    });
+  };
+
+  renderShortcutsModalContent();
+  modal._refreshShortcutsModal = renderShortcutsModalContent;
 
   modal.classList.remove('hidden');
   confirmBtn.onclick = () => {
+    activeRecordingShortcutId = null;
     modal.classList.add('hidden');
   };
 }
@@ -4423,11 +6468,34 @@ document.getElementById('returnToActivePrBtn')?.addEventListener('click', () => 
 });
 
 // =============================================================================
-// Keyboard Shortcuts (100% Keyboard-Driven Interface)
+// Keyboard Shortcuts (100% Keyboard-Driven & Customizable Interface)
 // =============================================================================
 document.addEventListener('keydown', (e) => {
   const modal = document.getElementById('githubModal');
   const isModalOpen = modal && !modal.classList.contains('hidden');
+
+  // If the user is currently recording a custom keybind inside the shortcuts modal
+  if (isModalOpen && activeRecordingShortcutId) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') {
+      return;
+    }
+    if (e.key === 'Escape') {
+      activeRecordingShortcutId = null;
+      modal._refreshShortcutsModal?.();
+      return;
+    }
+    const targetAction = activeRecordingShortcutId;
+    activeRecordingShortcutId = null;
+    setKeybind(targetAction, e.key);
+    modal._refreshShortcutsModal?.();
+    showToast(
+      `Shortcut updated: ${DEFAULT_KEYBINDINGS[targetAction]?.label} → ${formatKeybindLabel(e.key)}`,
+      2200
+    );
+    return;
+  }
 
   if (e.key === 'Escape') {
     const tag = (e.target?.tagName || '').toLowerCase();
@@ -4461,7 +6529,7 @@ document.addEventListener('keydown', (e) => {
   if (isModalOpen) return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-  if (e.key === 'Enter' && state.prQueueFullPage) {
+  if (e.key === getKeybind('openPr') && state.prQueueFullPage) {
     e.preventDefault();
     if (state.selectedPrKey) {
       enterPrReviewWorkspace(state.selectedPrKey, null);
@@ -4469,7 +6537,7 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  if (e.key === 'q') {
+  if (e.key === getKeybind('prQueue') || e.key === '[') {
     e.preventDefault();
     if (state.prQueueFullPage && state.selectedPrKey) {
       enterPrReviewWorkspace(state.selectedPrKey, null);
@@ -4479,16 +6547,47 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  if (e.key === 'ArrowLeft' || e.key === 'h') {
-    if (state.focusDiffMode || state.activeTab === 'diff' || state.activeTab === 'tree' || state.splitMode) {
-      e.preventDefault();
-      selectRelativeDiffFile(-1);
+  if (
+    (e.key === getKeybind('prevFile') || (getKeybind('prevFile') === 'ArrowLeft' && e.key === 'h')) &&
+    !state.prQueueFullPage &&
+    (state.focusDiffMode || state.activeTab === 'diff' || state.splitMode)
+  ) {
+    e.preventDefault();
+    selectRelativeDiffFile(-1);
+  } else if (
+    (e.key === getKeybind('nextFile') || (getKeybind('nextFile') === 'ArrowRight' && e.key === 'l')) &&
+    !state.prQueueFullPage &&
+    (state.focusDiffMode || state.activeTab === 'diff' || state.splitMode)
+  ) {
+    e.preventDefault();
+    selectRelativeDiffFile(1);
+  } else if (e.key === getKeybind('nextPr') || e.key === getKeybind('prevPr')) {
+    e.preventDefault();
+    const list = getFilteredPrs();
+    if (list.length === 0) return;
+    const idx = list.findIndex((p) => p.key === state.selectedPrKey);
+    const nextIdx =
+      e.key === getKeybind('nextPr')
+        ? Math.min(list.length - 1, idx + 1)
+        : Math.max(0, idx <= 0 ? 0 : idx - 1);
+    selectPr(list[nextIdx].key, true);
+    const neighborPr = list[nextIdx + 1] || list[nextIdx - 1];
+    if (neighborPr) prefetchPrData(neighborPr);
+  } else if (e.key === getKeybind('nextHunk') || e.key === getKeybind('prevHunk')) {
+    e.preventDefault();
+    const delta = e.key === getKeybind('nextHunk') ? 1 : -1;
+    if (state.focusDiffMode || state.activeTab === 'diff') {
+      jumpToRelativeHunk(delta);
+    } else if (state.activeTab === 'report' || state.activeTab === 'comments') {
+      jumpToRelativeFinding(delta);
     }
-  } else if (e.key === 'ArrowRight' || e.key === 'l') {
-    if (state.focusDiffMode || state.activeTab === 'diff' || state.activeTab === 'tree' || state.splitMode) {
-      e.preventDefault();
-      selectRelativeDiffFile(1);
-    }
+  } else if (e.key === getKeybind('openIde')) {
+    e.preventDefault();
+    openCurrentPrInIde(
+      'phpstorm',
+      state.selectedDiffFile || '',
+      state.highlightedLine || 1
+    );
   } else if (e.key === 'ArrowDown') {
     if (!e.target?.classList?.contains('diff-scroll-area')) {
       e.preventDefault();
@@ -4499,89 +6598,62 @@ document.addEventListener('keydown', (e) => {
       e.preventDefault();
       scrollActivePanelBy(-72);
     }
-  } else if (e.key === 'n' || e.key === 'p') {
-    e.preventDefault();
-    const delta = e.key === 'n' ? 1 : -1;
-    if (state.focusDiffMode || state.activeTab === 'diff') {
-      jumpToRelativeHunk(delta);
-    } else if (state.activeTab === 'report' || state.activeTab === 'comments') {
-      jumpToRelativeFinding(delta);
-    }
-  } else if (e.key === 'g') {
-    e.preventDefault();
-    if (state.focusDiffMode || state.activeTab === 'diff') {
-      document.getElementById('diffFileJumpSelect')?.focus();
-    } else if (state.activeTab === 'tree') {
-      document.getElementById('treeFileFilterInput')?.focus();
-    }
-  } else if (e.key === 't') {
-    e.preventDefault();
-    if (state.activeTab === 'tree' && state.selectedTreeFile) {
-      navigateToCodeLocation(state.selectedTreeFile, state.selectedTreeLine, 'diff');
-    } else if (state.selectedDiffFile) {
-      if (state.focusDiffMode) setFocusDiffMode(false);
-      navigateToCodeLocation(state.selectedDiffFile, state.highlightedLine, 'tree');
-    }
-  } else if (e.key === 'i') {
-    e.preventDefault();
-    openCurrentPrInIde('phpstorm', state.selectedDiffFile || state.selectedTreeFile || '', state.highlightedLine || 1);
-  } else if (e.key === 'j' || e.key === 'k') {
-    e.preventDefault();
-    const list = getFilteredPrs();
-    if (list.length === 0) return;
-    const idx = list.findIndex((p) => p.key === state.selectedPrKey);
-    const nextIdx =
-      e.key === 'j'
-        ? Math.min(list.length - 1, idx + 1)
-        : Math.max(0, idx <= 0 ? 0 : idx - 1);
-    selectPr(list[nextIdx].key, true);
-  } else if (e.key === '1') {
+  } else if (e.key === getKeybind('tab1')) {
     switchTab('report');
-  } else if (e.key === '2') {
-    switchTab('comments');
-  } else if (e.key === '3') {
+  } else if (e.key === getKeybind('tab2')) {
+    switchTab('overview');
+  } else if (e.key === getKeybind('tab3')) {
     switchTab('diff');
-  } else if (e.key === '4') {
-    switchTab('tree');
-  } else if (e.key === '5') {
+  } else if (e.key === getKeybind('tab4')) {
+    switchTab('comments');
+  } else if (e.key === getKeybind('tab5')) {
     switchTab('rules');
-  } else if (e.key === '[') {
-    e.preventDefault();
-    showFullPagePrQueue();
-  } else if (e.key === 'b' || e.key === ']') {
-    e.preventDefault();
-    toggleFileTree();
-  } else if (e.key === 'z' || e.key === 'f') {
+  } else if (e.key === getKeybind('toggleFiles') || e.key === ']') {
+    const isDiffVisible = state.splitMode
+      ? state.splitLeftTab === 'diff' || state.splitRightTab === 'diff'
+      : state.activeTab === 'diff';
+    if (!state.prQueueFullPage && isDiffVisible) {
+      e.preventDefault();
+      toggleFileTree();
+    }
+  } else if (e.key === getKeybind('focusDiff') || (getKeybind('focusDiff') === 'z' && e.key === 'f')) {
     e.preventDefault();
     toggleZenMode();
-  } else if (e.key === 's') {
+  } else if (e.key === getKeybind('splitMode')) {
     e.preventDefault();
     if (state.focusDiffMode) setFocusDiffMode(false);
     toggleSplitMode();
-  } else if (e.key === 'o') {
+  } else if (e.key === getKeybind('popout')) {
     openPopoutWorkspace();
-  } else if (e.key === 'c') {
+  } else if (e.key === getKeybind('agentChat')) {
     e.preventDefault();
     toggleChatDrawer();
-  } else if (e.key === 'r') {
+  } else if (e.key === getKeybind('rerunReview')) {
+    e.preventDefault();
     if (state.selectedPrKey) triggerManualReviewForKey(state.selectedPrKey);
-  } else if (e.key === 'm') {
+  } else if (e.key === getKeybind('openGithub')) {
+    e.preventDefault();
+    const ghHref = document.getElementById('openGithubPrBtn')?.href;
+    if (ghHref && ghHref !== '#' && !ghHref.endsWith('#')) {
+      window.open(ghHref, '_blank', 'noopener');
+    }
+  } else if (e.key === getKeybind('publishModal')) {
     e.preventDefault();
     openBatchReviewModal('APPROVE');
-  } else if (e.key === '/') {
+  } else if (e.key === getKeybind('searchPr')) {
     e.preventDefault();
     showFullPagePrQueue();
     document.getElementById('searchInput')?.focus();
-  } else if (e.key === '-' || e.key === '_') {
+  } else if (e.key === getKeybind('zoomOut') || e.key === '_') {
     e.preventDefault();
     adjustDiffZoom(-1);
-  } else if (e.key === '+' || e.key === '=') {
+  } else if (e.key === getKeybind('zoomIn') || e.key === '=') {
     e.preventDefault();
     adjustDiffZoom(1);
-  } else if (e.key === '0') {
+  } else if (e.key === getKeybind('zoomReset')) {
     e.preventDefault();
     applyDiffZoomVariables(100);
-  } else if (e.key === '?') {
+  } else if (e.key === getKeybind('helpModal')) {
     e.preventDefault();
     openKeyboardShortcutsModal();
   }

@@ -19,11 +19,14 @@ import {
   extractJiraKey,
   detectStackedPr,
   normalizeCiState,
+  parseCodeOwners,
+  resolveRequiredOwnerTeams,
+  computeMergeReadiness,
 } from '../lib/metadata.mjs';
 import { setCustomAgentRunnerForTests } from '../lib/agent.mjs';
 import { synthesizeCandidateRulesFromComments } from '../lib/onboarding.mjs';
 import { saveCandidateRules } from '../lib/rules.mjs';
-import { createHubServer } from '../server.mjs';
+import { createHubServer, setCustomOverviewHandlerForTests } from '../server.mjs';
 import { execFileSync } from 'node:child_process';
 
 // =============================================================================
@@ -517,7 +520,7 @@ describe('Metadata, Working Tree Explorer, Worktrees & Agent Q&A', () => {
       if (prompt.includes('Execute a Mode 1 code review')) {
         return `# Code Review: demo-service #42\n\n## 1. Executive Summary & Verdict\n- **Verdict:** 🟢 **Ready to Approve**\n`;
       }
-      return `En réponse à ta question : OrderProcessor::processOrder() retourne bien un booléen strict.`;
+      return `In answer to your question: OrderProcessor::processOrder() returns a strict boolean.`;
     });
 
     server = createHubServer();
@@ -743,9 +746,9 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     assert.ok(css.includes('.app-shell.focus-diff-mode .view-tabs'));
     assert.ok(css.includes('.diff-scroll-area'));
     assert.ok(js.includes('selectRelativeDiffFile'));
-    assert.ok(js.includes("e.key === 'ArrowLeft'"));
-    assert.ok(js.includes("e.key === 'ArrowRight'"));
-    assert.ok(js.includes('diffFileJumpSelect'));
+    assert.ok(js.includes("getKeybind('prevFile')"));
+    assert.ok(js.includes("getKeybind('nextFile')"));
+    assert.ok(!js.includes('diffFileJumpSelect'));
     assert.ok(js.includes('openKeyboardShortcutsModal'));
     assert.ok(js.includes('applyDiffZoomVariables'));
     assert.ok(css.includes('--diff-font-size'));
@@ -880,25 +883,25 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     assert.ok(!html.includes('id="prAuthorInitialsBadge"'));
     assert.ok(!js.includes('author-initials-circle'));
 
-    // Zero abbreviations ("en toutes lettres") & rich PR detail tags in HTML and JS
-    assert.ok(html.includes('Configuration'));
-    assert.ok(html.includes('Tout auditer'));
-    assert.ok(html.includes('Synchroniser GitHub'));
+    // Zero abbreviations (full words in English) & rich PR detail tags in HTML and JS
+    assert.ok(html.includes('Settings'));
+    assert.ok(html.includes('Review All'));
+    assert.ok(html.includes('Sync GitHub'));
     assert.ok(html.includes('Peer-Review'));
     assert.ok(html.includes('Self-Review'));
-    assert.ok(html.includes('Monter Worktree'));
-    assert.ok(js.includes('Tous les dépôts'));
-    assert.ok(js.includes('CI : Succès'));
-    assert.ok(js.includes('CI : Échec'));
-    assert.ok(js.includes('Branche empilée →'));
-    assert.ok(js.includes('Worktree : Git direct'));
-    assert.ok(js.includes('Ouvrir Diff'));
-    assert.ok(js.includes('Lire Audit'));
-    assert.ok(js.includes('Approuvé par :'));
-    assert.ok(js.includes('Changements demandés par :'));
-    assert.ok(js.includes('En attente de :'));
-    assert.ok(js.includes('Conflit Git'));
-    assert.ok(js.includes('Fusionnable'));
+    assert.ok(html.includes('Mount Worktree'));
+    assert.ok(js.includes('All repositories'));
+    assert.ok(js.includes('CI: Success'));
+    assert.ok(js.includes('CI: Failure'));
+    assert.ok(js.includes('Stacked branch →'));
+    assert.ok(js.includes('Worktree: Direct Git'));
+    assert.ok(js.includes('Open Diff'));
+    assert.ok(js.includes('Read Audit'));
+    assert.ok(js.includes('Approved by:'));
+    assert.ok(js.includes('Changes requested by:'));
+    assert.ok(js.includes('Waiting for:'));
+    assert.ok(js.includes('Git conflict'));
+    assert.ok(js.includes('Mergeable'));
     assert.ok(!js.includes('$1 blk'));
     assert.ok(!js.includes('$1 maj'));
 
@@ -908,8 +911,8 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     assert.ok(js.includes("const THEME_ORDER = ['light', 'purple', 'dark']"));
 
     // Dedicated 'b' shortcut for modified file tree & Enter/Cmd+Enter chat submission
-    assert.ok(js.includes("e.key === 'b'"));
-    assert.ok(js.includes('Masquer Fichiers (b)'));
+    assert.ok(js.includes("getKeybind('toggleFiles')"));
+    assert.ok(js.includes('Hide Files ('));
     assert.ok(js.includes("document.getElementById('agentChatInput')?.addEventListener('keydown'"));
     assert.ok(js.includes('form.requestSubmit()'));
 
@@ -922,10 +925,505 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     assert.ok(css.includes('.diff-expand-btn'));
     assert.ok(css.includes('.diff-row-expanded-ctx'));
 
+    // Responsive Split-view toolbars, resizable left file tree, full file names & collapsible folders
+    assert.ok(html.includes('id="diffSidebarResizer"'));
+    assert.ok(html.includes('id="tab-overview"'));
+    assert.ok(css.includes('.file-tree-resizer'));
+    assert.ok(css.includes('--file-sidebar-width'));
+    assert.ok(css.includes('.diff-folder-group'));
+    assert.ok(css.includes('.diff-file-path-sub'));
+    assert.ok(js.includes('initSidebarResizers'));
+    assert.ok(js.includes('renderDiffFileItemHtml'));
+
+    // Customizable keybindings & dynamic legends
+    assert.ok(js.includes('DEFAULT_KEYBINDINGS'));
+    assert.ok(js.includes('setKeybind'));
+    assert.ok(js.includes('syncKeybindingLegends'));
+    assert.ok(js.includes('shortcut-recorder-btn'));
+    assert.ok(html.includes('data-kb-id="toggleFiles"'));
+
+    // Clickable breadcrumbs & inline manual comment composer
+    assert.ok(js.includes('renderClickableBreadcrumbsHtml'));
+    assert.ok(js.includes('bindClickableBreadcrumbs'));
+    assert.ok(css.includes('.clickable-breadcrumb-bar'));
+    assert.ok(js.includes('openInlineCommentComposer'));
+    assert.ok(js.includes('saveManualInlineComment'));
+    assert.ok(css.includes('.diff-line-add-btn'));
+
     // Server pagination for >100 changed files
     const serverSrc = fs.readFileSync(new URL('../server.mjs', import.meta.url), 'utf8');
     assert.ok(serverSrc.includes("'--paginate'"));
     assert.ok(serverSrc.includes("'--slurp'"));
+  });
+
+  test('Manual inline comments CRUD (/api/manual-comments) persists and merges into /api/review', async () => {
+    // 1. Create a manual inline comment on a PR
+    const createRes = await fetch(`${baseUrl}/api/manual-comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prKey: '2cloud-services#9999',
+        filePath: 'projects/services/mobility-account/src/Service/ExportService.php',
+        line: 77,
+        title: 'Check null return value',
+        severity: '🟠 Major',
+        comment: 'Please guard against null here before calling `->getId()`.',
+      }),
+    });
+    assert.equal(createRes.status, 200);
+    const createdData = await createRes.json();
+    assert.equal(createdData.ok, true);
+    assert.ok(createdData.comment.cid.startsWith('2cloud-services#9999::#M1-'));
+    assert.equal(createdData.comment.isManual, true);
+    assert.equal(createdData.comment.startLine, 77);
+
+    // 2. Verify GET /api/review includes the manual comment even without a markdown file
+    const reviewRes = await fetch(
+      `${baseUrl}/api/review?key=${encodeURIComponent('2cloud-services#9999')}`
+    );
+    assert.equal(reviewRes.status, 200);
+    const reviewData = await reviewRes.json();
+    const manualFinding = reviewData.findings.find((f) => f.cid === createdData.comment.cid);
+    assert.ok(manualFinding, 'Expected manual comment in GET /api/review findings');
+    assert.equal(manualFinding.customComment, 'Please guard against null here before calling `->getId()`.');
+
+    // 3. Edit the manual comment
+    const updateRes = await fetch(`${baseUrl}/api/manual-comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prKey: '2cloud-services#9999',
+        cid: createdData.comment.cid,
+        filePath: 'projects/services/mobility-account/src/Service/ExportService.php',
+        line: 77,
+        title: 'Updated title',
+        severity: '🔴 Blocker',
+        comment: 'Updated comment body.',
+      }),
+    });
+    assert.equal(updateRes.status, 200);
+    const updatedData = await updateRes.json();
+    assert.equal(updatedData.comment.title, 'Updated title');
+    assert.equal(updatedData.comment.customComment, 'Updated comment body.');
+
+    // 4. Delete the manual comment
+    const delRes = await fetch(`${baseUrl}/api/manual-comments`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prKey: '2cloud-services#9999',
+        cid: createdData.comment.cid,
+      }),
+    });
+    assert.equal(delRes.status, 200);
+    const delData = await delRes.json();
+    assert.equal(delData.ok, true);
+    assert.equal(delData.manualComments.length, 0);
+  });
+
+  test('Multi-line manual inline comments, CODEOWNERS team approval & Mergeable computation, Draft PRs, createdAt sort, default Report landing, and configurable Split panes', async () => {
+    // 1. CODEOWNERS parser & required service team resolution
+    const sampleCodeOwners = `
+/projects/services/mobility-account @ubitransports/popcorn-back
+/projects/services/subscription @ubitransports/popcorn-back
+/projects/services/passenger-information-fare @ubitransports/pili-back
+/projects/services/user-service @ubitransports/banana-back
+/projects/common @ubitransports/popcorn-back @ubitransports/pili-back @ubitransports/banana-back @ubitransports/papaya-back
+`;
+    const rules = parseCodeOwners(sampleCodeOwners);
+    assert.equal(rules.length, 5);
+
+    const maTeams = resolveRequiredOwnerTeams(
+      ['projects/services/mobility-account/src/Entity/Contract.php'],
+      rules
+    );
+    assert.deepEqual(maTeams, ['popcorn-back']);
+
+    const multiTeams = resolveRequiredOwnerTeams(
+      [
+        'projects/services/mobility-account/src/Entity/Contract.php',
+        'projects/services/passenger-information-fare/src/Dto/FareDto.php',
+      ],
+      rules
+    );
+    assert.deepEqual(multiTeams, ['popcorn-back', 'pili-back']);
+
+    // 2. computeMergeReadiness checks Draft, Git conflict, CODEOWNERS team approval, Changes Requested, and CI
+    const draftCheck = computeMergeReadiness({
+      pr: {
+        isDraft: true,
+        mergeable: 'MERGEABLE',
+        changedFilePaths: ['projects/services/mobility-account/src/Entity/Contract.php'],
+        latestReviews: [{ login: 'p-pichet', state: 'APPROVED' }],
+      },
+      ciStatus: 'PASS',
+      codeOwnersRules: rules,
+    });
+    assert.equal(draftCheck.isMergeable, false);
+    assert.ok(draftCheck.blockingReasons.includes('Draft'));
+
+    const missingOwnerApprove = computeMergeReadiness({
+      pr: {
+        isDraft: false,
+        mergeable: 'MERGEABLE',
+        changedFilePaths: ['projects/services/mobility-account/src/Entity/Contract.php'],
+        latestReviews: [{ login: 'external-user', state: 'APPROVED' }],
+      },
+      ciStatus: 'PASS',
+      codeOwnersRules: rules,
+    });
+    assert.equal(missingOwnerApprove.isMergeable, false);
+    assert.equal(missingOwnerApprove.requiredOwnerTeams[0].teamSlug, 'popcorn-back');
+    assert.equal(missingOwnerApprove.requiredOwnerTeams[0].approved, false);
+
+    const readyToMerge = computeMergeReadiness({
+      pr: {
+        isDraft: false,
+        mergeable: 'MERGEABLE',
+        changedFilePaths: ['projects/services/mobility-account/src/Entity/Contract.php'],
+        latestReviews: [{ login: 'nahsing-ubi', state: 'APPROVED' }],
+      },
+      ciStatus: 'PASS',
+      codeOwnersRules: rules,
+    });
+    assert.equal(readyToMerge.isMergeable, true);
+    assert.equal(readyToMerge.blockingReasons.length, 0);
+    assert.equal(readyToMerge.requiredOwnerTeams[0].approved, true);
+    assert.ok(readyToMerge.requiredOwnerTeams[0].approvedBy.includes('@nahsing-ubi'));
+
+    // 3. Multi-line manual comment creation (startLine .. endLine) and diff resolution
+    const multiCreateRes = await fetch(`${baseUrl}/api/manual-comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prKey: '2cloud-services#9999',
+        filePath: 'src/Service/ExampleService.php',
+        startLine: 11,
+        endLine: 15,
+        title: 'Extract block into method',
+        severity: '🟡 Suggestion',
+        comment: 'Lines 11 to 15 can be extracted into a dedicated helper method.',
+      }),
+    });
+    assert.equal(multiCreateRes.status, 200);
+    const multiCreated = await multiCreateRes.json();
+    assert.equal(multiCreated.comment.startLine, 11);
+    assert.equal(multiCreated.comment.endLine, 15);
+
+    const samplePatch = [
+      '@@ -10,6 +10,8 @@ namespace App\\Service;',
+      ' class ExampleService',
+      ' {',
+      '-    private string $oldProp;',
+      '+    private readonly string $newProp;',
+      '+    private readonly int $count;',
+      '     public function execute(): void',
+      '     {',
+      '         return;',
+    ].join('\n');
+    const resolvedMulti = resolveFindingAgainstDiff(multiCreated.comment, [
+      { filename: 'src/Service/ExampleService.php', patch: samplePatch },
+    ]);
+    assert.equal(resolvedMulti.inDiff, true);
+    assert.equal(resolvedMulti.resolvedStartLine, 11);
+    assert.equal(resolvedMulti.resolvedLine, 15);
+
+    // Clean up multi-line manual comment
+    await fetch(`${baseUrl}/api/manual-comments`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prKey: '2cloud-services#9999', cid: multiCreated.comment.cid }),
+    });
+
+    // 4. Verify UI includes Draft filter, Sort button, configurable Split selectors, and opens on Report
+    const [htmlRes, jsRes, cssRes] = await Promise.all([
+      fetch(`${baseUrl}/`),
+      fetch(`${baseUrl}/app.js`),
+      fetch(`${baseUrl}/styles.css`),
+    ]);
+    const html = await htmlRes.text();
+    const js = await jsRes.text();
+    const css = await cssRes.text();
+
+    assert.ok(html.includes('data-filter="draft"'));
+    assert.ok(html.includes('id="prSortOrderBtn"'));
+    assert.ok(html.includes('id="splitPaneSelectors"'));
+    assert.ok(html.includes('id="splitLeftTabSelect"'));
+    assert.ok(html.includes('id="splitRightTabSelect"'));
+    assert.ok(html.includes('id="prDraftBadge"'));
+    assert.ok(html.includes('id="prMergeableBadge"'));
+    assert.ok(html.includes('id="prCodeOwnersBadges"'));
+    assert.ok(css.includes('tr.comment-range-selected'));
+    assert.ok(css.includes('.tab-panel[data-split-pane="left"]'));
+    assert.ok(css.includes('.tab-panel[data-split-pane="right"]'));
+    assert.ok(js.includes('bindMultiLineCommentSelection'));
+    assert.ok(js.includes('setSplitLeftPanel'));
+    assert.ok(js.includes('setSplitRightPanel'));
+    assert.ok(js.includes("const effectiveTab = targetTab || 'report'"));
+  });
+
+  test('Ultra-thin single-line hunk separator, immediate mouseup multi-line comment composer, PR Overview tab (Description, Commits, Threads), and 4. Propositions IA', async () => {
+    const [htmlRes, jsRes, cssRes] = await Promise.all([
+      fetch(`${baseUrl}/`),
+      fetch(`${baseUrl}/app.js`),
+      fetch(`${baseUrl}/styles.css`),
+    ]);
+    const html = await htmlRes.text();
+    const js = await jsRes.text();
+    const css = await cssRes.text();
+
+    // 1. Working tree tab removed; replaced by 2. Description & Conversation (`overview`) and 4. AI Proposals (`comments`)
+    assert.ok(!html.includes('data-tab="tree"'));
+    assert.ok(!html.includes('id="tab-tree"'));
+    assert.ok(html.includes('data-tab="overview"'));
+    assert.ok(html.includes('2. Description &amp; Conversation'));
+    assert.ok(html.includes('id="tabOverviewCommitsCount"'));
+    assert.ok(html.includes('id="tabOverviewCommentsCount"'));
+    assert.ok(html.includes('4. AI Proposals'));
+
+    // 2. Ultra-thin single-line hunk separator (.diff-row-hunk) & 3+ digit line number non-wrapping
+    assert.ok(css.includes('height: 20px;'));
+    assert.ok(css.includes('padding-top: 0 !important;'));
+    assert.ok(css.includes('padding-bottom: 0 !important;'));
+    assert.ok(js.includes('<td class="diff-line-code"><div class="diff-hunk-header-bar">'));
+
+    // 3. Immediate inline comment composer on mouse release (mouseup) for line drag & code text drag
+    assert.ok(js.includes('_activeLineDragMouseUpHandler'));
+    assert.ok(js.includes('getSelectedTextLineRange'));
+    assert.ok(js.includes('ev.preventDefault()'));
+
+    // 4. Test GET /api/github/overview, POST /api/github/thread-reply, and POST /api/github/thread-resolve
+    let lastOverviewAction = null;
+    setCustomOverviewHandlerForTests(async (payload) => {
+      const { action } = payload;
+      lastOverviewAction = { action, payload };
+      if (action === 'overview') {
+        return {
+          repo: payload.repo,
+          number: payload.number,
+          title: 'feat(MA): PRD-17956 - Normalize bank card category',
+          body: '### Context\nNormalize bank card categories.',
+          author: 'fawr-ubi',
+          commitsCount: 2,
+          totalCommentsCount: 3,
+          unresolvedThreadsCount: 1,
+          commits: [
+            {
+              oid: '1111111111111111111111111111111111111111',
+              shortOid: '1111111',
+              messageHeadline: 'feat(MA): PRD-17956 - Initial commit',
+              committedDate: '2026-11-09T10:00:00Z',
+              author: 'fawr-ubi',
+            },
+            {
+              oid: '2222222222222222222222222222222222222222',
+              shortOid: '2222222',
+              messageHeadline: 'test(MA): PRD-17956 - Add unit tests',
+              committedDate: '2026-11-09T11:00:00Z',
+              author: 'fawr-ubi',
+            },
+          ],
+          generalComments: [
+            {
+              id: 'IC_1',
+              author: 'p-pichet',
+              body: 'Looks good overall!',
+              createdAt: '2026-11-09T11:15:00Z',
+            },
+          ],
+          reviews: [],
+          reviewThreads: [
+            {
+              id: 'PRRT_123',
+              isResolved: false,
+              isOutdated: false,
+              path: 'src/Service/CardCategoryNormalizer.php',
+              line: 42,
+              startLine: 40,
+              comments: [
+                {
+                  id: 'PRRC_1',
+                  author: 'nahsing-ubi',
+                  body: 'Could we use a match expression here?',
+                  createdAt: '2026-11-09T11:20:00Z',
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (action === 'reply') {
+        return {
+          ok: true,
+          comment: {
+            id: 'PRRC_2',
+            body: payload.body,
+            author: 'fawr-ubi',
+            createdAt: '2026-11-09T11:30:00Z',
+          },
+        };
+      }
+      if (action === 'resolve') {
+        return {
+          ok: true,
+          thread: {
+            id: payload.threadId,
+            isResolved: Boolean(payload.resolve),
+          },
+        };
+      }
+      return { ok: true };
+    });
+
+    try {
+      const ovRes = await fetch(
+        `${baseUrl}/api/github/overview?repo=2cloud-services&number=5651`
+      );
+      assert.equal(ovRes.status, 200);
+      const ovData = await ovRes.json();
+      assert.equal(ovData.commitsCount, 2);
+      assert.equal(ovData.commits.length, 2);
+      assert.equal(ovData.reviewThreads.length, 1);
+      assert.equal(ovData.reviewThreads[0].id, 'PRRT_123');
+
+      const replyRes = await fetch(`${baseUrl}/api/github/thread-reply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repo: '2cloud-services',
+          number: 5651,
+          threadId: 'PRRT_123',
+          body: 'Done in commit 2222222!',
+        }),
+      });
+      assert.equal(replyRes.status, 200);
+      const replyData = await replyRes.json();
+      assert.equal(replyData.ok, true);
+      assert.equal(lastOverviewAction.action, 'reply');
+      assert.equal(lastOverviewAction.payload.threadId, 'PRRT_123');
+
+      const resolveRes = await fetch(`${baseUrl}/api/github/thread-resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repo: '2cloud-services',
+          number: 5651,
+          threadId: 'PRRT_123',
+          resolve: true,
+        }),
+      });
+      assert.equal(resolveRes.status, 200);
+      const resolveData = await resolveRes.json();
+      assert.equal(resolveData.ok, true);
+      assert.equal(resolveData.thread.isResolved, true);
+    } finally {
+      setCustomOverviewHandlerForTests(null);
+    }
+  });
+
+  test('2-tier Git diff menu without PhpStorm/Tree/Hunk text, J/K PR list auto-scroll, Split mode file tree auto-collapse, and GitHub syntax & file colors', async () => {
+    const [htmlRes, jsRes, cssRes] = await Promise.all([
+      fetch(`${baseUrl}/`),
+      fetch(`${baseUrl}/app.js`),
+      fetch(`${baseUrl}/styles.css`),
+    ]);
+    const html = await htmlRes.text();
+    const js = await jsRes.text();
+    const css = await cssRes.text();
+
+    // 1. 2-tier diff header layout & removed PhpStorm / Tree / <- PRs / Hunk word from diff submenu
+    assert.ok(js.includes('diff-file-header-identity'));
+    assert.ok(js.includes('diff-file-header-toolbar'));
+    assert.ok(js.includes('diff-nav-group'));
+    assert.ok(js.includes('diff-hunk-nav-group'));
+    assert.ok(!js.includes('id="diffOpenIdeBtn"'));
+    assert.ok(!js.includes('id="diffOpenFullFileBtn"'));
+    assert.ok(!js.includes('id="diffBackToQueueInlineBtn"'));
+    assert.ok(!js.includes('&uarr; Hunk'));
+    assert.ok(!js.includes('&darr; Hunk'));
+
+    // 2. Auto-scroll PR list (#prList) when navigating with j / k
+    assert.ok(js.includes("const activeCard = listEl.querySelector('.pr-card.active')"));
+    assert.ok(js.includes("activeCard?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })"));
+
+    // 3. Smart Split-mode adaptation: auto-collapse file tree sidebar & compact buttons
+    assert.ok(js.includes('state._prevSplitFileTree = state.fileTreeCollapsed'));
+    assert.ok(css.includes('.panels-container.split-mode .diff-file-header'));
+    assert.ok(css.includes('.panels-container.split-mode .diff-file-header-toolbar .btn'));
+
+    // 4. GitHub-style file status badges (M/A/D/R only, no extension badge) and syntax highlighting inside diff lines
+    assert.ok(html.includes('gherkin.min.js'));
+    assert.ok(js.includes('getFileStatusMeta'));
+    assert.ok(js.includes('getFileExtMeta'));
+    assert.ok(js.includes('highlightDiffCodeLine'));
+    assert.ok(js.includes('diff-line-prefix'));
+    assert.ok(js.includes('diff-line-syntax'));
+    assert.ok(js.includes('file-status-badge'));
+    assert.ok(!js.includes('file-ext-badge'));
+    assert.ok(css.includes('.file-status-badge'));
+    assert.ok(css.includes('.diff-line-syntax .hljs-keyword'));
+    assert.ok(css.includes('[data-theme="purple"] .diff-line-syntax .hljs-keyword'));
+    assert.ok(css.includes('[data-theme="light"] .diff-line-syntax .hljs-keyword'));
+
+    // 5. Hybrid server/client pre-fetch & Tab 2 aligned commit/conversation layout
+    assert.ok(js.includes('prefetchPrData'));
+    assert.ok(js.includes('scheduleClientPrPrefetch'));
+    assert.ok(js.includes('pr-commit-top-row'));
+    assert.ok(js.includes('pr-commit-sub-row'));
+    assert.ok(js.includes('compact-review'));
+    assert.ok(css.includes('.pr-commit-top-row'));
+    assert.ok(css.includes('.pr-commit-sub-row'));
+    assert.ok(css.includes('.pr-thread-card.compact-review .pr-thread-header'));
+    assert.ok(css.includes('.pr-thread-comment,'));
+
+    // 6. Multi-Team Profiles & 4-Layer Rule Architecture (GET/POST /api/teams/profiles & target: 'team')
+    assert.ok(html.includes('data-rule-target="team"'));
+    assert.ok(js.includes('openTeamProfileModal'));
+    assert.ok(js.includes('activeTeamProfileSelect'));
+
+    const tmpTeamsDir = path.join(tmpRoot, 'teams');
+    fs.mkdirSync(tmpTeamsDir, { recursive: true });
+    process.env.REVIEW_HUB_TEAMS_DIR = tmpTeamsDir;
+    try {
+      const createTeamRes = await fetch(`${baseUrl}/api/teams/profiles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: 'moneris-back',
+          name: 'Moneris Backend Team',
+          description: 'Payment & Moneris gateway microservices',
+          techStack: ['PHP 8.3+', 'Symfony', 'Moneris SDK'],
+          githubTeams: ['ubi-eng-team-moneris'],
+          agentInstructions: 'Enforce strict idempotency and PCI-DSS logging rules on payment endpoints.',
+          activate: true,
+        }),
+      });
+      assert.equal(createTeamRes.status, 200);
+      const createdTeamData = await createTeamRes.json();
+      assert.equal(createdTeamData.ok, true);
+      assert.equal(createdTeamData.profile.id, 'moneris-back');
+      assert.equal(createdTeamData.activeTeamProfile.id, 'moneris-back');
+
+      const addTeamRuleRes = await fetch(`${baseUrl}/api/rules`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target: 'team',
+          teamProfile: 'moneris-back',
+          section: '1. Architecture, Serialization & Clean Code',
+          title: 'Idempotent Payment Gateway Retries',
+          body: 'Always attach an idempotency key when calling external payment gateway endpoints.',
+        }),
+      });
+      assert.equal(addTeamRuleRes.status, 200);
+      const teamRulesData = await addTeamRuleRes.json();
+      assert.equal(teamRulesData.ok, true);
+      assert.ok(
+        teamRulesData.teamRules.some((r) => r.title === 'Idempotent Payment Gateway Retries')
+      );
+    } finally {
+      delete process.env.REVIEW_HUB_TEAMS_DIR;
+    }
   });
 });
 
