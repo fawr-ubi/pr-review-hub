@@ -646,7 +646,7 @@ export function triggerPrReview({ cfg, pr }) {
         cwd: repoPath,
         agentCli: cfg.agentCli || 'agy',
         approvalMode: 'yolo',
-        timeoutMs: 600000,
+        timeoutMs: 120000,
         includeDirs: [SKILL_ROOT, cfg.reviewsDir, repoPath],
         model: cfg.model || '',
         onStreamUpdate: ({ phase }) => {
