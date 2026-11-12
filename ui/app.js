@@ -5634,6 +5634,9 @@ async function openSettingsModal() {
           html += `<option value="${escapeHtml(currentVal)}" selected>${escapeHtml(currentVal)} (Custom/Unavailable)</option>`;
         }
         modelSelect.innerHTML = html;
+      } else {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || `HTTP ${res.status}`);
       }
     } catch (e) {
       console.error('Failed to fetch models', e);

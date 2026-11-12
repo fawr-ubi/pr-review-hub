@@ -789,8 +789,17 @@ export function createHubServer() {
         try {
           if (cli === 'agy') {
             try {
-              const { execFileSync } = await import('node:child_process');
-              const stdout = execFileSync('agy', ['models'], { encoding: 'utf8', env: process.env });
+              let stdout;
+              try {
+                const { execFileSync } = await import('node:child_process');
+                stdout = execFileSync('agy', ['models'], { encoding: 'utf8', env: process.env });
+              } catch (err) {
+                if (err.stdout) {
+                  stdout = err.stdout;
+                } else {
+                  throw err;
+                }
+              }
               const models = (stdout || '').split('\n').filter(Boolean).map(line => {
                 const [id, ...rest] = line.trim().split(/\s+/);
                 if (id && !id.includes('Fetching')) return { id, name: rest.join(' ') };
