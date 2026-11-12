@@ -589,6 +589,8 @@ function warmOpenPrCachesInBackground(prs, cfg) {
   })();
 }
 
+const _findingsFileCache = new Map();
+
 export function buildStateResponse() {
   const { cfg, reviewsDir, archiveDir, cacheDir, stateFile, uiStateFile } = getPaths();
   const projectsDir = getProjectsDir(cfg);
@@ -616,8 +618,16 @@ export function buildStateResponse() {
     if (reviewFile && (hasActiveFile || isArchivedFile)) {
       const fullPath = isArchivedFile ? path.join(archiveDir, reviewFile) : path.join(reviewsDir, reviewFile);
       try {
-        const md = fs.readFileSync(fullPath, 'utf8');
-        const parsed = parseFindingsFromMarkdown(md);
+        const stats = fs.statSync(fullPath);
+        let parsed = [];
+        if (_findingsFileCache.has(fullPath) && _findingsFileCache.get(fullPath).mtimeMs === stats.mtimeMs) {
+          parsed = _findingsFileCache.get(fullPath).parsed;
+        } else {
+          const md = fs.readFileSync(fullPath, 'utf8');
+          parsed = parseFindingsFromMarkdown(md);
+          _findingsFileCache.set(fullPath, { mtimeMs: stats.mtimeMs, parsed });
+        }
+        
         findingsCount = parsed.length;
         for (const f of parsed) {
           const cid = `${key}::${f.id}`;
@@ -796,9 +806,10 @@ export function createHubServer() {
               } catch (err) {
                 stdout = (err.stdout || '') + '\n' + (err.stderr || '');
               }
-              const models = (stdout || '').split('\n').filter(Boolean).map(line => {
+              const cleanedStdout = (stdout || '').replace(/[\\s\\S]*?Fetching available models\\.\\.\\./g, '');
+              const models = cleanedStdout.split('\n').filter(Boolean).map(line => {
                 const [id, ...rest] = line.trim().split(/\s+/);
-                if (id && !id.includes('Fetching')) return { id, name: rest.join(' ') };
+                if (id) return { id, name: rest.join(' ') };
                 return null;
               }).filter(Boolean);
               return sendJson(res, 200, { models });
