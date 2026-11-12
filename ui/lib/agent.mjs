@@ -198,21 +198,8 @@ async function _runCliPromptInternal({
   // Antigravity CLI (`agy`) — first-class default agent runner
   if (cli === 'agy') {
     return new Promise((resolve, reject) => {
-      let tempPromptFile = null;
-      let effectivePrompt = prompt;
+      const useStdin = prompt.length > 4000;
       const dirsToAdd = [...validIncludeDirs];
-
-      if (prompt.length > 32000) {
-        tempPromptFile = path.join(
-          os.tmpdir(),
-          `prh-agy-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.md`
-        );
-        fs.writeFileSync(tempPromptFile, prompt, 'utf8');
-        if (!dirsToAdd.includes(os.tmpdir())) {
-          dirsToAdd.push(os.tmpdir());
-        }
-        effectivePrompt = `Read the complete review instructions and diff in the file "${tempPromptFile}" and output ONLY the requested Markdown response.`;
-      }
 
       const args = [
         '--dangerously-skip-permissions',
@@ -226,12 +213,19 @@ async function _runCliPromptInternal({
       for (const dir of dirsToAdd) {
         args.push('--add-dir', dir);
       }
-      args.push('-p', effectivePrompt);
+      if (!useStdin) {
+        args.push('-p', prompt);
+      }
 
       const child = spawn(bin, args, {
         cwd: workingDir,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [useStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       });
+
+      if (useStdin) {
+        child.stdin.write(prompt);
+        child.stdin.end();
+      }
 
       let partialText = '';
       let finalResponse = '';
@@ -239,19 +233,8 @@ async function _runCliPromptInternal({
       let rawStderr = '';
       let lineBuffer = '';
 
-      const cleanupTemp = () => {
-        if (tempPromptFile && fs.existsSync(tempPromptFile)) {
-          try {
-            fs.unlinkSync(tempPromptFile);
-          } catch {
-            // ignore
-          }
-        }
-      };
-
       const timer = setTimeout(() => {
         child.kill('SIGTERM');
-        cleanupTemp();
         reject(new Error(`Antigravity CLI (agy) timeout exceeded (${Math.round(timeoutMs / 1000)}s)`));
       }, timeoutMs);
 
@@ -308,13 +291,11 @@ async function _runCliPromptInternal({
 
       child.on('error', (err) => {
         clearTimeout(timer);
-        cleanupTemp();
         reject(err);
       });
 
       child.on('close', (code) => {
         clearTimeout(timer);
-        cleanupTemp();
         if (lineBuffer) processAgyJsonLine(lineBuffer);
         const out = finalResponse || partialText.trim();
         if (out) {
@@ -665,7 +646,7 @@ export function triggerPrReview({ cfg, pr }) {
         cwd: repoPath,
         agentCli: cfg.agentCli || 'agy',
         approvalMode: 'yolo',
-        timeoutMs: 300000,
+        timeoutMs: 600000,
         includeDirs: [SKILL_ROOT, cfg.reviewsDir, repoPath],
         model: cfg.model || '',
         onStreamUpdate: ({ phase }) => {
