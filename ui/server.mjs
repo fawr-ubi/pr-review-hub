@@ -794,11 +794,7 @@ export function createHubServer() {
                 const { execFileSync } = await import('node:child_process');
                 stdout = execFileSync('agy', ['models'], { encoding: 'utf8', env: process.env });
               } catch (err) {
-                if (err.stdout) {
-                  stdout = err.stdout;
-                } else {
-                  throw err;
-                }
+                stdout = (err.stdout || '') + '\n' + (err.stderr || '');
               }
               const models = (stdout || '').split('\n').filter(Boolean).map(line => {
                 const [id, ...rest] = line.trim().split(/\s+/);
