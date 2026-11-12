@@ -71,6 +71,89 @@ const state = {
   keybindings: {},
 };
 
+
+let debugConsoleOpen = false;
+
+function renderDebugConsole() {
+  const content = document.getElementById('debugConsoleContent');
+  if (!content) return;
+  content.innerHTML = state.logs.map(log => {
+    let color = 'var(--text-color)';
+    let bgColor = 'transparent';
+    if (log.type === 'JS_ERR' || log.type === 'API_ERR' || (log.type === 'API_RES' && log.data && !log.data.ok)) {
+      color = 'var(--danger-color)';
+      bgColor = 'rgba(239, 68, 68, 0.1)';
+    } else if (log.type === 'API_RES') {
+      color = 'var(--success-color)';
+    }
+    
+    let time = new Date(log.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 });
+    let dataStr = log.data ? ` <span style="opacity:0.6;">${JSON.stringify(log.data)}</span>` : '';
+    return `<div style="padding:4px 6px;border-radius:4px;background:${bgColor};color:${color};display:flex;gap:8px;">
+      <span style="opacity:0.5;min-width:90px;">[${time}]</span>
+      <strong style="min-width:65px;">${log.type}</strong>
+      <span style="word-break:break-all;">${escapeHtml(log.message)}${dataStr}</span>
+    </div>`;
+  }).reverse().join('');
+}
+
+function toggleDebugConsole() {
+  const drawer = document.getElementById('debugConsoleDrawer');
+  if (!drawer) return;
+  debugConsoleOpen = !debugConsoleOpen;
+  drawer.style.transform = debugConsoleOpen ? 'translateY(0)' : 'translateY(100%)';
+  if (debugConsoleOpen) {
+    renderDebugConsole();
+    logEvent('UI_STATE', 'Opened Debug Console');
+  }
+}
+
+function logEvent(type, message, data = null) {
+  state.logs.push({
+    timestamp: new Date().toISOString(),
+    type,
+    message,
+    data
+  });
+  if (state.logs.length > 100) {
+    state.logs.shift();
+  }
+  if (debugConsoleOpen) {
+    renderDebugConsole();
+  }
+}
+
+// Intercept fetch
+const originalFetch = window.fetch;
+window.fetch = async function(...args) {
+  const [resource, config] = args;
+  const start = performance.now();
+  const method = config?.method || 'GET';
+  const url = typeof resource === 'string' ? resource : resource.url;
+  
+  logEvent('API_REQ', `${method} ${url}`);
+  
+  try {
+    const response = await originalFetch.apply(this, args);
+    const duration = Math.round(performance.now() - start);
+    logEvent('API_RES', `${method} ${url} - ${response.status}`, { durationMs: duration, ok: response.ok });
+    return response;
+  } catch (error) {
+    const duration = Math.round(performance.now() - start);
+    logEvent('API_ERR', `${method} ${url} - ${error.message}`, { durationMs: duration });
+    throw error;
+  }
+};
+
+// Intercept console.error
+const originalConsoleError = console.error;
+console.error = function(...args) {
+  const message = args.map(a => (a instanceof Error ? a.stack || a.message : (typeof a === 'object' ? JSON.stringify(a) : String(a)))).join(' ');
+  logEvent('JS_ERR', message);
+  originalConsoleError.apply(this, args);
+};
+
+
 const DEFAULT_KEYBINDINGS = {
   openPr: { key: 'Enter', label: 'Open PR on 1. Audit Report' },
   nextPr: { key: 'j', label: 'Next PR in queue' },
@@ -7325,3 +7408,22 @@ document.addEventListener('keydown', (e) => {
 loadState(false);
 loadRules();
 checkAppUpdateAvailability();
+
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('openDebugConsoleHeaderBtn')?.addEventListener('click', toggleDebugConsole);
+  document.getElementById('closeDebugConsoleBtn')?.addEventListener('click', toggleDebugConsole);
+  document.getElementById('clearDebugLogsBtn')?.addEventListener('click', () => {
+    state.logs = [];
+    renderDebugConsole();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    // Toggle Debug Console with ~ or Ctrl+L
+    if ((e.key === '~' || e.key === '`' || (e.ctrlKey && e.key.toLowerCase() === 'l')) && !e.target.matches('input, textarea, select')) {
+      e.preventDefault();
+      toggleDebugConsole();
+    }
+  });
+});
+
