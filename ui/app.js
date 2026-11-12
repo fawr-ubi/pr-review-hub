@@ -9,6 +9,7 @@ const syncChannel =
   typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('pr-review-hub-sync') : null;
 
 const state = {
+  logs: [],
   prs: [],
   uiState: {},
   jobs: [],
