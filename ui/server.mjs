@@ -784,6 +784,39 @@ export function createHubServer() {
         return sendJson(res, 200, { config: cfg, version: getAppVersion() });
       }
 
+      if (req.method === 'GET' && pathname === '/api/models') {
+        const { exec } = require('child_process');
+        const cli = urlObj.searchParams.get('cli') || 'agy';
+        try {
+          if (cli === 'agy') {
+            exec('agy models', { encoding: 'utf8', env: process.env }, (err, stdout) => {
+               const models = (stdout || '').split('\n').filter(Boolean).map(line => {
+                 const [id, ...rest] = line.trim().split(/\s+/);
+                 if (id && !id.includes('Fetching')) return { id, name: rest.join(' ') };
+                 return null;
+               }).filter(Boolean);
+               return sendJson(res, 200, { models });
+            });
+            return;
+          }
+          
+          const staticModels = {
+             gemini: [
+               { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+               { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+               { id: 'gemini-2.0-pro-exp-02-05', name: 'Gemini 2.0 Pro Experimental' }
+             ],
+             claude: [
+               { id: 'claude-3-7-sonnet-20250219', name: 'Claude 3.7 Sonnet' },
+               { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet' }
+             ]
+          };
+          return sendJson(res, 200, { models: staticModels[cli] || [] });
+        } catch (err) {
+          console.error("SERVER 500 ERROR:", err); return sendJson(res, 500, { error: err.message });
+        }
+      }
+
       if (req.method === 'POST' && pathname === '/api/config') {
         const body = await readRequestBody(req);
         const updated = saveConfig(body);

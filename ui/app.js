@@ -5482,22 +5482,11 @@ async function openSettingsModal() {
       </div>
       <div>
         <label style="display:block;font-weight:500;margin-bottom:4px;">AI Model Override (leave empty for CLI default):</label>
-        <input type="text" id="cfgModel" list="cfgModelList" class="search-input" value="${escapeHtml(cfg.model || '')}" placeholder="e.g. gemini-3.8-flash-medium" />
-        <datalist id="cfgModelList">
-          <!-- Antigravity (agy) Models -->
-          <option value="gemini-4-argon-medium"></option>
-          <option value="gemini-4-argon-high"></option>
-          <option value="gemini-3.8-flash-medium"></option>
-          <option value="gemini-3.8-flash-high"></option>
-          <option value="gemini-3.1-pro-high"></option>
-          <!-- Gemini CLI Models -->
-          <option value="gemini-2.5-pro"></option>
-          <option value="gemini-2.5-flash"></option>
-          <option value="gemini-2.0-pro-exp-02-05"></option>
-          <!-- Claude CLI Models -->
-          <option value="claude-3-7-sonnet-20250219"></option>
-          <option value="claude-3-5-sonnet-20241022"></option>
-        </datalist>
+        <select id="cfgModel" class="search-input">
+          <option value="">-- CLI Default --</option>
+          ${cfg.model ? `<option value="${escapeHtml(cfg.model)}" selected>${escapeHtml(cfg.model)}</option>` : ''}
+          <option disabled>Loading models...</option>
+        </select>
       </div>
       <div>
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -5622,6 +5611,39 @@ async function openSettingsModal() {
 
   document.getElementById('cfgDiscoverTeamsBtn')?.addEventListener('click', renderDiscoveredTeamPills);
   renderDiscoveredTeamPills();
+
+  async function refreshModels() {
+    const cli = document.getElementById('cfgAgentCli').value;
+    const modelSelect = document.getElementById('cfgModel');
+    const currentVal = modelSelect.value;
+    
+    // Set loading state
+    modelSelect.innerHTML = '<option value="">-- CLI Default --</option><option disabled>Loading models...</option>';
+    
+    try {
+      const res = await fetch(`/api/models?cli=${encodeURIComponent(cli)}`);
+      if (res.ok) {
+        const { models } = await res.json();
+        let html = '<option value="">-- CLI Default --</option>';
+        models.forEach(m => {
+          const isSelected = m.id === currentVal ? 'selected' : '';
+          html += `<option value="${escapeHtml(m.id)}" ${isSelected}>${escapeHtml(m.name)} (${escapeHtml(m.id)})</option>`;
+        });
+        // If currentVal is not empty and not in the fetched list, append it so it's not lost
+        if (currentVal && !models.find(m => m.id === currentVal)) {
+          html += `<option value="${escapeHtml(currentVal)}" selected>${escapeHtml(currentVal)} (Custom/Unavailable)</option>`;
+        }
+        modelSelect.innerHTML = html;
+      }
+    } catch (e) {
+      console.error('Failed to fetch models', e);
+      modelSelect.innerHTML = '<option value="">-- CLI Default --</option><option disabled>Error loading models</option>';
+    }
+  }
+
+  document.getElementById('cfgAgentCli')?.addEventListener('change', refreshModels);
+  // Initial fetch
+  refreshModels();
 
   confirmBtn.onclick = async () => {
     const githubUser = document.getElementById('cfgGithubUser').value.trim();
