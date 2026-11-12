@@ -852,9 +852,28 @@ export function createHubServer() {
         const body = await readRequestBody(req);
         const version = getAppVersion();
         const item = addRexFeedback(cfg, body, version);
+        
+        let issueUrl = null;
+        if (body.category === 'report-bug' && body.logs) {
+          try {
+            const title = `[Bug] ${body.title || 'Reported Issue'} - ${cfg.githubUser}`;
+            let issueBody = `**Reporter:** @${cfg.githubUser}\n**Team:** ${cfg.teamProfile}\n**App Version:** ${version}\n\n**Description:**\n${body.description || 'No description provided'}\n\n`;
+            
+            issueBody += `<details><summary><b>Activity Logs</b></summary>\n\n` +
+              `\`\`\`json\n` +
+              JSON.stringify(body.logs, null, 2) +
+              `\n\`\`\`\n</details>`;
+              
+            issueUrl = await createGitHubIssue(cfg, title, issueBody);
+          } catch (err) {
+            console.error('Failed to create GitHub Issue:', err);
+            // We continue, issueUrl remains null
+          }
+        }
+        
         const items = listRexFeedback(cfg);
         const markdown = formatRexMarkdownReport({ items, cfg, version });
-        return sendJson(res, 200, { ok: true, item, items, markdown, version });
+        return sendJson(res, 200, { ok: true, item, items, markdown, version, issueUrl });
       }
 
       if (req.method === 'DELETE' && pathname === '/api/rex') {

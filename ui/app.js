@@ -5472,6 +5472,10 @@ async function openSettingsModal() {
           </select>
         </div>
         <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Central Issues Repo (GitHub):</label>
+          <input type="text" id="cfgCentralIssuesRepo" class="search-input" value="${escapeHtml(cfg.centralIssuesRepo || 'fawr-ubi/pr-review-hub')}" placeholder="owner/repo" />
+        </div>
+        <div>
           <label style="display:block;font-weight:500;margin-bottom:4px;">AI Agent CLI Runner:</label>
           <select id="cfgAgentCli" class="search-input">
             <option value="agy" ${activeAgentCli === 'agy' ? 'selected' : ''}>Antigravity CLI (agy)</option>
@@ -5652,6 +5656,7 @@ async function openSettingsModal() {
     const githubUser = document.getElementById('cfgGithubUser').value.trim();
     const githubOrg = document.getElementById('cfgGithubOrg').value.trim();
     const teamProfile = document.getElementById('cfgTeamProfile')?.value || 'popcorn-back';
+    const centralIssuesRepo = document.getElementById('cfgCentralIssuesRepo')?.value.trim() || 'fawr-ubi/pr-review-hub';
     const agentCli = document.getElementById('cfgAgentCli')?.value || 'agy';
     const model = document.getElementById('cfgModel')?.value.trim() || '';
     const githubTeams = document
@@ -5677,6 +5682,7 @@ async function openSettingsModal() {
           githubUser,
           githubOrg,
           teamProfile,
+          centralIssuesRepo,
           agentCli,
           model,
           githubTeams,
@@ -6005,6 +6011,7 @@ async function openRexFeedbackModal() {
               <option value="agent-quality">🤖 AI Agent Quality / False Positive</option>
               <option value="team-rule">📏 Team DNA Rule Idea</option>
               <option value="feature-request">🚀 Feature Request</option>
+              <option value="report-bug">🚨 Report Bug / Issue (attaches logs)</option>
             </select>
           </div>
           <div>
@@ -6122,6 +6129,7 @@ async function openRexFeedbackModal() {
             activeTab,
             title,
             description,
+            logs: category === 'report-bug' ? state.logs : null
           }),
         });
         const data = await res.json();
