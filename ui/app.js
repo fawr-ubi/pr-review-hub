@@ -79,7 +79,7 @@ function renderDebugConsole() {
   const content = document.getElementById('debugConsoleContent');
   if (!content) return;
   content.innerHTML = state.logs.map(log => {
-    let color = 'var(--text-color)';
+    let color = 'var(--text-primary)';
     let bgColor = 'transparent';
     if (log.type === 'JS_ERR' || log.type === 'API_ERR' || (log.type === 'API_RES' && log.data && !log.data.ok)) {
       color = 'var(--danger-color)';
