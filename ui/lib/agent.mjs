@@ -130,7 +130,49 @@ function cleanReviewMarkdownOutput(rawText = '') {
   return text;
 }
 
-async function runCliPrompt({
+const MODEL_FALLBACKS = {
+  'gemini-4-argon-high': 'gemini-3.8-flash-high',
+  'gemini-4-argon-medium': 'gemini-3.8-flash-medium',
+  'gemini-4-argon-low': 'gemini-3.8-flash-low',
+  'gemini-3.1-pro-high': 'gemini-3.8-flash-high',
+  'gemini-3.1-pro-low': 'gemini-3.8-flash-low',
+  'gemini-2.5-pro': 'gemini-2.5-flash',
+  'gemini-2.0-pro-exp-02-05': 'gemini-2.5-flash',
+  'claude-3-7-sonnet-20250219': 'claude-3-5-haiku-20241022',
+  'claude-3-5-sonnet-20241022': 'claude-3-5-haiku-20241022',
+};
+
+function isRetryableModelError(errMsg) {
+  const e = String(errMsg).toLowerCase();
+  return (
+    e.includes('not recognized') ||
+    e.includes('quota') ||
+    e.includes('503') ||
+    e.includes('504') ||
+    e.includes('502') ||
+    e.includes('500') ||
+    e.includes('unavailable') ||
+    e.includes('429') ||
+    e.includes('exhausted')
+  );
+}
+
+async function runCliPrompt(args) {
+  try {
+    return await _runCliPromptInternal(args);
+  } catch (err) {
+    if (args.model && MODEL_FALLBACKS[args.model] && isRetryableModelError(err.message)) {
+      const fallbackModel = MODEL_FALLBACKS[args.model];
+      if (args.onStreamUpdate) {
+        args.onStreamUpdate({ phase: `⚠️ Model ${args.model} unavailable. Retrying with fallback: ${fallbackModel}...`, partialText: '' });
+      }
+      return await _runCliPromptInternal({ ...args, model: fallbackModel });
+    }
+    throw err;
+  }
+}
+
+async function _runCliPromptInternal({
 
   prompt,
   cwd,

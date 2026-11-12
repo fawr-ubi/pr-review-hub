@@ -5459,9 +5459,9 @@ async function openSettingsModal() {
           <input type="text" id="cfgGithubOrg" class="search-input" value="${escapeHtml(cfg.githubOrg || 'ubitransports')}" />
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:1.3fr 1fr 1.3fr;gap:10px;">
+      <div style="display:grid;grid-template-columns:1.5fr 1fr;gap:10px;">
         <div>
-          <label style="display:block;font-weight:500;margin-bottom:4px;">Active Team Profile (Agent &amp; Team DNA):</label>
+          <label style="display:block;font-weight:500;margin-bottom:4px;">Active Team Profile:</label>
           <select id="cfgTeamProfile" class="search-input">
             ${profiles
               .map(
@@ -5479,26 +5479,25 @@ async function openSettingsModal() {
             <option value="claude" ${activeAgentCli === 'claude' ? 'selected' : ''}>Claude Code CLI (claude)</option>
           </select>
         </div>
-
-        <div>
-          <label style="display:block;font-weight:500;margin-bottom:4px;">AI Model (leave empty for CLI default):</label>
-          <input type="text" id="cfgModel" list="cfgModelList" class="search-input" value="${escapeHtml(cfg.model || '')}" placeholder="e.g. gemini-2.5-pro" />
-          <datalist id="cfgModelList">
-            <!-- Antigravity (agy) Models -->
-            <option value="gemini-4-argon-medium"></option>
-            <option value="gemini-4-argon-high"></option>
-            <option value="gemini-3.8-flash-medium"></option>
-            <option value="gemini-3.8-flash-high"></option>
-            <option value="gemini-3.1-pro-high"></option>
-            <!-- Gemini CLI Models -->
-            <option value="gemini-2.5-pro"></option>
-            <option value="gemini-2.5-flash"></option>
-            <option value="gemini-2.0-pro-exp-02-05"></option>
-            <!-- Claude CLI Models -->
-            <option value="claude-3-7-sonnet-20250219"></option>
-            <option value="claude-3-5-sonnet-20241022"></option>
-          </datalist>
-        </div>
+      </div>
+      <div>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">AI Model Override (leave empty for CLI default):</label>
+        <input type="text" id="cfgModel" list="cfgModelList" class="search-input" value="${escapeHtml(cfg.model || '')}" placeholder="e.g. gemini-3.8-flash-medium" />
+        <datalist id="cfgModelList">
+          <!-- Antigravity (agy) Models -->
+          <option value="gemini-4-argon-medium"></option>
+          <option value="gemini-4-argon-high"></option>
+          <option value="gemini-3.8-flash-medium"></option>
+          <option value="gemini-3.8-flash-high"></option>
+          <option value="gemini-3.1-pro-high"></option>
+          <!-- Gemini CLI Models -->
+          <option value="gemini-2.5-pro"></option>
+          <option value="gemini-2.5-flash"></option>
+          <option value="gemini-2.0-pro-exp-02-05"></option>
+          <!-- Claude CLI Models -->
+          <option value="claude-3-7-sonnet-20250219"></option>
+          <option value="claude-3-5-sonnet-20241022"></option>
+        </datalist>
       </div>
       <div>
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
