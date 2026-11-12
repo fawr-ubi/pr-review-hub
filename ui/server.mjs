@@ -785,19 +785,22 @@ export function createHubServer() {
       }
 
       if (req.method === 'GET' && pathname === '/api/models') {
-        const { exec } = require('child_process');
         const cli = urlObj.searchParams.get('cli') || 'agy';
         try {
           if (cli === 'agy') {
-            exec('agy models', { encoding: 'utf8', env: process.env }, (err, stdout) => {
-               const models = (stdout || '').split('\n').filter(Boolean).map(line => {
-                 const [id, ...rest] = line.trim().split(/\s+/);
-                 if (id && !id.includes('Fetching')) return { id, name: rest.join(' ') };
-                 return null;
-               }).filter(Boolean);
-               return sendJson(res, 200, { models });
-            });
-            return;
+            try {
+              const { execFileSync } = await import('node:child_process');
+              const stdout = execFileSync('agy', ['models'], { encoding: 'utf8', env: process.env });
+              const models = (stdout || '').split('\n').filter(Boolean).map(line => {
+                const [id, ...rest] = line.trim().split(/\s+/);
+                if (id && !id.includes('Fetching')) return { id, name: rest.join(' ') };
+                return null;
+              }).filter(Boolean);
+              return sendJson(res, 200, { models });
+            } catch (err) {
+              console.error("Failed to execute agy models:", err);
+              return sendJson(res, 500, { error: err.message });
+            }
           }
           
           const staticModels = {
