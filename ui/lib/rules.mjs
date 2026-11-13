@@ -179,6 +179,9 @@ export function getReferencePaths(teamProfileId = '') {
   const commonDnaPath =
     process.env.REVIEW_HUB_COMMON_DNA_FILE || path.join(refDir, 'common-dna.md');
   const teamDnaPath = process.env.REVIEW_HUB_TEAM_DNA_FILE || activeTeam.dnaPath;
+  const teamFpPath =
+    process.env.REVIEW_HUB_TEAM_FP_FILE ||
+    path.join(path.dirname(teamDnaPath), 'false-positives.md');
   const dnaPath = process.env.REVIEW_HUB_DNA_FILE || localDnaDefault;
   const fpPath = process.env.REVIEW_HUB_FP_FILE || localFpDefault;
   const changelogPath = process.env.REVIEW_HUB_CHANGELOG_FILE || localChangelogDefault;
@@ -188,6 +191,7 @@ export function getReferencePaths(teamProfileId = '') {
   return {
     commonDnaPath,
     teamDnaPath,
+    teamFpPath,
     activeTeam,
     dnaPath,
     combinedDnaPath: legacyDnaPath,
@@ -199,25 +203,78 @@ export function getReferencePaths(teamProfileId = '') {
   };
 }
 
+function readSafeTrim(filePath) {
+  return filePath && fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8').trim() : '';
+}
+
+/**
+ * Returns ONLY shared, deterministic rules for a Team Profile (`common-dna.md` + `team-dna.md` + team `false-positives.md`).
+ * Strictly excludes `.local.md` personal files so shared Hub reviews remain identical across all teammates.
+ */
+export function getSharedReviewRulesBundle(teamProfileId = '') {
+  const { commonDnaPath, teamDnaPath, teamFpPath, activeTeam } = getReferencePaths(teamProfileId);
+  const commonMd = readSafeTrim(commonDnaPath);
+  const teamMd = readSafeTrim(teamDnaPath);
+  const teamFpMd = readSafeTrim(teamFpPath);
+
+  return {
+    scope: 'shared',
+    activeTeam,
+    commonDnaPath,
+    teamDnaPath,
+    teamFpPath,
+    rulesMarkdown: [commonMd, teamMd].filter(Boolean).join('\n\n---\n\n'),
+    falsePositivesMarkdown: teamFpMd,
+  };
+}
+
+/**
+ * Returns shared rules PLUS the developer's local `.local.md` preferences for personal/pre-PR passes.
+ */
+export function getPersonalReviewRulesBundle(teamProfileId = '') {
+  const { commonDnaPath, teamDnaPath, teamFpPath, dnaPath, fpPath, activeTeam } =
+    getReferencePaths(teamProfileId);
+  const commonMd = readSafeTrim(commonDnaPath);
+  const teamMd = readSafeTrim(teamDnaPath);
+  const localMd = readSafeTrim(dnaPath);
+  const teamFpMd = readSafeTrim(teamFpPath);
+  const localFpMd = readSafeTrim(fpPath);
+
+  return {
+    scope: 'personal',
+    activeTeam,
+    commonDnaPath,
+    teamDnaPath,
+    teamFpPath,
+    dnaPath,
+    fpPath,
+    rulesMarkdown: [commonMd, teamMd, localMd].filter(Boolean).join('\n\n---\n\n'),
+    falsePositivesMarkdown: [teamFpMd, localFpMd].filter(Boolean).join('\n\n---\n\n'),
+  };
+}
+
 /**
  * Keeps legacy `references/reviewer-dna.md` and `references/false-positives.md` synchronized
  * on disk (both gitignored) by combining `common-dna.md` + `teams/<team>/team-dna.md` + `reviewer-dna.local.md`
- * so any external skill invocation reading `references/reviewer-dna.md` automatically gets all 3 layers.
+ * so any external skill invocation reading `references/reviewer-dna.md` automatically gets all layers.
  */
 export function syncCombinedReferenceFiles(teamProfileId = '') {
   if (process.env.REVIEW_HUB_DNA_FILE || process.env.REVIEW_HUB_FP_FILE) return;
-  const { commonDnaPath, teamDnaPath, dnaPath, fpPath, legacyDnaPath, legacyFpPath } =
+  const { commonDnaPath, teamDnaPath, teamFpPath, dnaPath, fpPath, legacyDnaPath, legacyFpPath } =
     getReferencePaths(teamProfileId);
   try {
-    const commonMd = fs.existsSync(commonDnaPath) ? fs.readFileSync(commonDnaPath, 'utf8').trim() : '';
-    const teamMd = fs.existsSync(teamDnaPath) ? fs.readFileSync(teamDnaPath, 'utf8').trim() : '';
-    const localMd = fs.existsSync(dnaPath) ? fs.readFileSync(dnaPath, 'utf8').trim() : '';
+    const commonMd = readSafeTrim(commonDnaPath);
+    const teamMd = readSafeTrim(teamDnaPath);
+    const localMd = readSafeTrim(dnaPath);
     const combinedDna = [commonMd, teamMd, localMd].filter(Boolean).join('\n\n---\n\n') + '\n';
     if (combinedDna.trim()) {
       fs.writeFileSync(legacyDnaPath, combinedDna, 'utf8');
     }
-    if (fs.existsSync(fpPath)) {
-      fs.copyFileSync(fpPath, legacyFpPath);
+    const combinedFp = [readSafeTrim(teamFpPath), readSafeTrim(fpPath)]
+      .filter(Boolean)
+      .join('\n\n---\n\n');
+    if (combinedFp) {
+      fs.writeFileSync(legacyFpPath, `${combinedFp}\n`, 'utf8');
     }
   } catch {
     // ignore sync errors
@@ -385,15 +442,17 @@ export function saveCandidateRules(candidates = []) {
 }
 
 export function listAllRules(teamProfileId = '') {
-  const { commonDnaPath, teamDnaPath, activeTeam, dnaPath, fpPath } =
+  const { commonDnaPath, teamDnaPath, teamFpPath, activeTeam, dnaPath, fpPath } =
     getReferencePaths(teamProfileId);
   const commonMd = fs.existsSync(commonDnaPath) ? fs.readFileSync(commonDnaPath, 'utf8') : '';
   const teamMd = fs.existsSync(teamDnaPath) ? fs.readFileSync(teamDnaPath, 'utf8') : '';
+  const teamFpMd = fs.existsSync(teamFpPath) ? fs.readFileSync(teamFpPath, 'utf8') : '';
   const dnaMd = fs.existsSync(dnaPath) ? fs.readFileSync(dnaPath, 'utf8') : '';
   const fpMd = fs.existsSync(fpPath) ? fs.readFileSync(fpPath, 'utf8') : '';
 
   const commonParsed = parseRulesMarkdown(commonMd, 'common');
   const teamParsed = parseRulesMarkdown(teamMd, 'team');
+  const teamFpParsed = parseRulesMarkdown(teamFpMd, 'team-false-positive');
   const dnaParsed = parseRulesMarkdown(dnaMd, 'dna');
   const fpParsed = parseRulesMarkdown(fpMd, 'false-positive');
   const candidateRules = loadCandidateRules();
@@ -404,24 +463,43 @@ export function listAllRules(teamProfileId = '') {
     activeTeamProfile: activeTeam,
     commonSections: commonParsed.sections,
     teamSections: teamParsed.sections,
+    teamFpSections: teamFpParsed.sections,
     dnaSections: dnaParsed.sections,
     fpSections: fpParsed.sections,
     commonRules: commonParsed.rules,
     teamRules: teamParsed.rules,
+    teamFalsePositives: teamFpParsed.rules,
     dnaRules: dnaParsed.rules,
     falsePositives: fpParsed.rules,
     candidateRules,
     candidates: candidateRules,
-    rules: [...dnaParsed.rules, ...teamParsed.rules, ...commonParsed.rules, ...fpParsed.rules],
+    rules: [
+      ...dnaParsed.rules,
+      ...teamParsed.rules,
+      ...commonParsed.rules,
+      ...teamFpParsed.rules,
+      ...fpParsed.rules,
+    ],
   };
 }
 
 function resolveTargetFilePath(target, teamProfileId = '') {
-  const { commonDnaPath, teamDnaPath, activeTeam, dnaPath, fpPath } =
+  const { commonDnaPath, teamDnaPath, teamFpPath, activeTeam, dnaPath, fpPath } =
     getReferencePaths(teamProfileId);
   if (target === 'common') return { filePath: commonDnaPath, label: 'common-dna.md' };
   if (target === 'team')
     return { filePath: teamDnaPath, label: `teams/${activeTeam.id}/team-dna.md` };
+  if (target === 'team-false-positive') {
+    if (!fs.existsSync(teamFpPath)) {
+      fs.mkdirSync(path.dirname(teamFpPath), { recursive: true });
+      fs.writeFileSync(
+        teamFpPath,
+        `# Team False Positives & Intentional Exceptions — ${activeTeam.name}\n\n---\n`,
+        'utf8'
+      );
+    }
+    return { filePath: teamFpPath, label: `teams/${activeTeam.id}/false-positives.md` };
+  }
   if (target === 'false-positive') return { filePath: fpPath, label: 'false-positives.md' };
   return { filePath: dnaPath, label: 'reviewer-dna.md' };
 }

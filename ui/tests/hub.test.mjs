@@ -24,7 +24,21 @@ import {
   resolveRequiredOwnerTeams,
   computeMergeReadiness,
 } from '../lib/metadata.mjs';
-import { setCustomAgentRunnerForTests } from '../lib/agent.mjs';
+import {
+  setCustomAgentRunnerForTests,
+  runCliPrompt,
+  runPrReviewJob,
+  dismissFindingAsFalsePositive,
+} from '../lib/agent.mjs';
+import { AutoReviewScheduler } from '../lib/scheduler.mjs';
+import {
+  hasReviewArtifact,
+  saveReviewArtifact,
+  pullSharedStore,
+  pushSharedStore,
+  recordSharedFindingAction,
+  readSharedFindingsState,
+} from '../lib/store.mjs';
 import { synthesizeCandidateRulesFromComments } from '../lib/onboarding.mjs';
 import { saveCandidateRules } from '../lib/rules.mjs';
 import { createHubServer, setCustomOverviewHandlerForTests } from '../server.mjs';
@@ -1519,5 +1533,516 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     assert.ok(docData.checks.some((c) => c.id === 'skillSymlink' && c.ok === true));
   });
 });
+
+// =============================================================================
+// 8. Shared Review Hub (Write-Once, Read-Many) & Auto-Review Scheduler Tests
+// =============================================================================
+describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
+  let tmpDir;
+
+  before(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pr-hub-shared-engine-'));
+  });
+
+  after(() => {
+    setCustomAgentRunnerForTests(null);
+    delete process.env.REVIEW_HUB_COMMON_DNA_FILE;
+    delete process.env.REVIEW_HUB_TEAM_DNA_FILE;
+    delete process.env.REVIEW_HUB_TEAM_FP_FILE;
+    delete process.env.REVIEW_HUB_DNA_FILE;
+    delete process.env.REVIEW_HUB_FP_FILE;
+    if (tmpDir && fs.existsSync(tmpDir)) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('runCliPrompt resets heartbeat on streaming chunks and auto-retries once on silent stall', async () => {
+    const streamBin = path.join(tmpDir, 'fake-agy-stream.sh');
+    fs.writeFileSync(
+      streamBin,
+      [
+        `#!/bin/sh`,
+        `printf '%s\\n' '{"event":"init"}'`,
+        `sleep 0.25`,
+        `printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"# Code Review: "}}'`,
+        `sleep 0.25`,
+        `printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"streamed "}}'`,
+        `sleep 0.25`,
+        `printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"ok"}}'`,
+        `sleep 0.25`,
+        `printf '%s\\n' '{"event":"result","result":{"response":"# Code Review: streamed ok"}}'`,
+      ].join('\n'),
+      { mode: 0o755 }
+    );
+
+    // Total runtime >1000ms > inactivityTimeoutMs (650ms), yet succeeds because chunks reset heartbeat
+    const streamedOut = await runCliPrompt({
+      prompt: 'Short test prompt',
+      cwd: tmpDir,
+      agentCli: 'agy',
+      timeoutMs: 5000,
+      inactivityTimeoutMs: 650,
+      maxRetries: 0,
+      _customBinPath: streamBin,
+    });
+    assert.equal(streamedOut, '# Code Review: streamed ok');
+
+    // Attempt 1 stalls silently (>650ms), triggering heartbeat kill + 1 automatic retry which succeeds
+    const stateMarker = path.join(tmpDir, 'stall-attempt.txt');
+    const stallThenRecoverBin = path.join(tmpDir, 'fake-agy-stall-recover.sh');
+    fs.writeFileSync(
+      stallThenRecoverBin,
+      [
+        `#!/bin/sh`,
+        `MARKER=${JSON.stringify(stateMarker)}`,
+        `COUNT=0`,
+        `if [ -f "$MARKER" ]; then COUNT=$(cat "$MARKER"); fi`,
+        `COUNT=$((COUNT + 1))`,
+        `printf '%s' "$COUNT" > "$MARKER"`,
+        `if [ "$COUNT" = "1" ]; then`,
+        `  sleep 5`,
+        `else`,
+        `  printf '%s\\n' '{"event":"result","result":{"response":"# Code Review: recovered on retry"}}'`,
+        `fi`,
+      ].join('\n'),
+      { mode: 0o755 }
+    );
+
+    const phases = [];
+    const recoveredOut = await runCliPrompt({
+      prompt: 'Short retry prompt',
+      cwd: tmpDir,
+      agentCli: 'agy',
+      timeoutMs: 6000,
+      inactivityTimeoutMs: 650,
+      maxRetries: 1,
+      _customBinPath: stallThenRecoverBin,
+      onStreamUpdate: ({ phase }) => {
+        if (phase) phases.push(phase);
+      },
+    });
+    assert.equal(recoveredOut, '# Code Review: recovered on retry');
+    assert.equal(fs.readFileSync(stateMarker, 'utf8'), '2');
+    assert.ok(phases.some((p) => p.includes('Auto-retrying')));
+  });
+
+  test('scope: "shared" excludes .local.md rules and enforces Zero-Waste prompt, while scope: "personal" includes .local.md without polluting shared store', async () => {
+    const commonDna = path.join(tmpDir, 'common-dna.md');
+    const teamDna = path.join(tmpDir, 'team-dna.md');
+    const teamFp = path.join(tmpDir, 'team-fp.md');
+    const localDna = path.join(tmpDir, 'reviewer-dna.local.md');
+    const localFp = path.join(tmpDir, 'false-positives.local.md');
+    const reviewsDir = path.join(tmpDir, 'rule-scope-reviews');
+    fs.mkdirSync(reviewsDir, { recursive: true });
+
+    fs.writeFileSync(commonDna, '## Common\n- **SHARED_COMMON_RULE_01:** Enforce strict types.\n', 'utf8');
+    fs.writeFileSync(teamDna, '## Team\n- **SHARED_TEAM_RULE_02:** Use API Platform processors.\n', 'utf8');
+    fs.writeFileSync(teamFp, '## Team Exceptions\n- **SHARED_TEAM_FP_03:** Legacy DTO allowed.\n', 'utf8');
+    fs.writeFileSync(localDna, '## Personal\n- **SECRET_LOCAL_DNA_RULE_99:** Personal preference only.\n', 'utf8');
+    fs.writeFileSync(localFp, '## Personal Exceptions\n- **SECRET_LOCAL_FP_99:** Personal exception only.\n', 'utf8');
+
+    process.env.REVIEW_HUB_COMMON_DNA_FILE = commonDna;
+    process.env.REVIEW_HUB_TEAM_DNA_FILE = teamDna;
+    process.env.REVIEW_HUB_TEAM_FP_FILE = teamFp;
+    process.env.REVIEW_HUB_DNA_FILE = localDna;
+    process.env.REVIEW_HUB_FP_FILE = localFp;
+
+    const capturedPrompts = [];
+    setCustomAgentRunnerForTests(async ({ prompt }) => {
+      capturedPrompts.push(prompt);
+      return `# Code Review: 2cloud-services#5701 — Test Scope\n\n## 1. Task Summary & Functional Problem Solved\n- **Verdict:** 🟢 Ready to Approve\n`;
+    });
+
+    const cfg = {
+      githubOrg: 'ubitransports',
+      githubUser: 'worker-bot',
+      teamProfile: 'popcorn-back',
+      projectsDir: tmpDir,
+      reviewsDir,
+      agentCli: 'agy',
+    };
+    const pr = {
+      repo: '2cloud-services',
+      number: 5701,
+      title: 'feat(MA): PRD-18100 - Test shared vs personal scope',
+      author: 'alice',
+      headRefOid: '1111222233334444555566667777888899990000',
+    };
+
+    await runPrReviewJob({ cfg, pr, scope: 'shared' });
+    assert.equal(capturedPrompts.length, 1);
+    const sharedPrompt = capturedPrompts[0];
+    assert.ok(sharedPrompt.includes('FAST ZERO-WASTE MODE'));
+    assert.ok(sharedPrompt.includes('SHARED_COMMON_RULE_01'));
+    assert.ok(sharedPrompt.includes('SHARED_TEAM_RULE_02'));
+    assert.ok(sharedPrompt.includes('SHARED_TEAM_FP_03'));
+    assert.ok(!sharedPrompt.includes('SECRET_LOCAL_DNA_RULE_99'));
+    assert.ok(!sharedPrompt.includes('SECRET_LOCAL_FP_99'));
+    assert.equal(
+      hasReviewArtifact({
+        cfg,
+        repo: '2cloud-services',
+        number: 5701,
+        headSha: pr.headRefOid,
+        teamProfile: 'popcorn-back',
+      }),
+      true
+    );
+
+    const personalPr = {
+      repo: '2cloud-services',
+      number: 5702,
+      title: 'feat(MA): PRD-18101 - Personal pass',
+      author: 'alice',
+      headRefOid: 'aaaabbbbccccddddeeeeffff0000111122223333',
+    };
+    await runPrReviewJob({ cfg, pr: personalPr, scope: 'personal' });
+    assert.equal(capturedPrompts.length, 2);
+    const personalPrompt = capturedPrompts[1];
+    assert.ok(personalPrompt.includes('SECRET_LOCAL_DNA_RULE_99'));
+    assert.ok(personalPrompt.includes('SECRET_LOCAL_FP_99'));
+    // Personal pass must NOT register a shared Hub artifact
+    assert.equal(
+      hasReviewArtifact({
+        cfg,
+        repo: '2cloud-services',
+        number: 5702,
+        headSha: personalPr.headRefOid,
+        teamProfile: 'popcorn-back',
+      }),
+      false
+    );
+
+    setCustomAgentRunnerForTests(null);
+    delete process.env.REVIEW_HUB_COMMON_DNA_FILE;
+    delete process.env.REVIEW_HUB_TEAM_DNA_FILE;
+    delete process.env.REVIEW_HUB_TEAM_FP_FILE;
+    delete process.env.REVIEW_HUB_DNA_FILE;
+    delete process.env.REVIEW_HUB_FP_FILE;
+  });
+
+  test('AutoReviewScheduler enforces concurrency=1 FIFO, priority jump, Draft exclusion, Reader skip, and Write-Once SHA deduplication', async () => {
+    const schedReviewsDir = path.join(tmpDir, 'scheduler-reviews');
+    fs.mkdirSync(schedReviewsDir, { recursive: true });
+
+    let currentRole = 'worker';
+    const makeCfg = () => ({
+      githubOrg: 'ubitransports',
+      githubUser: 'worker-bot',
+      teamProfile: 'popcorn-back',
+      hubRole: currentRole,
+      autoReviewEnabled: true,
+      autoSyncIntervalSec: 300,
+      projectsDir: tmpDir,
+      reviewsDir: schedReviewsDir,
+    });
+
+    const seedState = (sha101 = 'sha101_v1_000000') => {
+      const statePayload = {
+        prs: {
+          '2cloud-services#101': {
+            key: '2cloud-services#101',
+            repo: '2cloud-services',
+            number: 101,
+            state: 'OPEN',
+            isDraft: false,
+            headRefOid: sha101,
+            syncStatus: 'NEEDS_REVIEW',
+            updatedAt: '2026-11-13T12:00:00Z',
+          },
+          '2cloud-services#102': {
+            key: '2cloud-services#102',
+            repo: '2cloud-services',
+            number: 102,
+            state: 'OPEN',
+            isDraft: false,
+            headRefOid: 'sha102_v1_000000',
+            syncStatus: 'NEEDS_REVIEW',
+            updatedAt: '2026-11-13T11:00:00Z',
+          },
+          '2cloud-services#103': {
+            key: '2cloud-services#103',
+            repo: '2cloud-services',
+            number: 103,
+            state: 'OPEN',
+            isDraft: true,
+            headRefOid: 'sha103_draft_000',
+            syncStatus: 'DRAFT',
+            updatedAt: '2026-11-13T13:00:00Z',
+          },
+        },
+      };
+      fs.writeFileSync(
+        path.join(schedReviewsDir, '.state.json'),
+        JSON.stringify(statePayload, null, 2),
+        'utf8'
+      );
+    };
+    seedState();
+
+    let inFlight = 0;
+    let maxConcurrent = 0;
+    const executionOrder = [];
+
+    const scheduler = new AutoReviewScheduler({
+      loadConfigFn: makeCfg,
+      scanPrQueueFn: async () => ({ actionable: [], drafts: [], upToDate: [] }),
+      runReviewFn: async ({ cfg, pr, existingJob }) => {
+        inFlight++;
+        maxConcurrent = Math.max(maxConcurrent, inFlight);
+        executionOrder.push(`${pr.repo}#${pr.number}@${pr.headRefOid}`);
+        await new Promise((r) => setTimeout(r, 35));
+        saveReviewArtifact({
+          cfg,
+          repo: pr.repo,
+          number: pr.number,
+          headSha: pr.headRefOid,
+          teamProfile: cfg.teamProfile,
+          scope: 'shared',
+          markdown: `# Code Review: ${pr.repo}#${pr.number}\n\n🟢 Ready to Approve\n`,
+          verdict: '🟢 Ready to Approve',
+          findingsSummary: '0 🔴, 0 🟠, 0 🟡, 0 🔵',
+        });
+        if (existingJob) {
+          existingJob.status = 'completed';
+          existingJob.phase = 'Completed';
+        }
+        inFlight--;
+      },
+    });
+
+    // 1. Cycle 1: Worker enqueues #101 and #102 sequentially, excluding Draft #103
+    const cycle1 = await scheduler.runSyncCycle();
+    assert.equal(cycle1.enqueuedCount, 2);
+    await scheduler.waitForIdle();
+
+    assert.equal(maxConcurrent, 1, 'Worker must never run more than 1 review concurrently');
+    assert.deepEqual(executionOrder, [
+      '2cloud-services#101@sha101_v1_000000',
+      '2cloud-services#102@sha102_v1_000000',
+    ]);
+
+    // 2. Cycle 2 (same SHAs): Write-Once guarantees 0 duplicate runs
+    const cycle2 = await scheduler.runSyncCycle();
+    assert.equal(cycle2.enqueuedCount, 0);
+    await scheduler.waitForIdle();
+    assert.equal(executionOrder.length, 2);
+
+    // 3. Priority jump test: enqueue 2 new PRs, then promote the second to front while #201 runs
+    scheduler.enqueuePrReview(
+      { repo: '2cloud-services', number: 201, headRefOid: 'sha201' },
+      { priority: false }
+    );
+    scheduler.enqueuePrReview(
+      { repo: '2cloud-services', number: 202, headRefOid: 'sha202' },
+      { priority: false }
+    );
+    scheduler.enqueuePrReview(
+      { repo: '2cloud-services', number: 203, headRefOid: 'sha203' },
+      { priority: true }
+    );
+    await scheduler.waitForIdle();
+    assert.deepEqual(executionOrder.slice(2), [
+      '2cloud-services#201@sha201',
+      '2cloud-services#203@sha203',
+      '2cloud-services#202@sha202',
+    ]);
+
+    // 4. Reader role never auto-enqueues even when a PR has a new commit SHA
+    currentRole = 'reader';
+    const updatedState = JSON.parse(
+      fs.readFileSync(path.join(schedReviewsDir, '.state.json'), 'utf8')
+    );
+    fs.writeFileSync(
+      path.join(schedReviewsDir, '.state.json'),
+      JSON.stringify(
+        {
+          prs: {
+            ...updatedState.prs,
+            '2cloud-services#101': {
+              ...updatedState.prs['2cloud-services#101'],
+              headRefOid: 'sha101_v2_newcommit',
+              syncStatus: 'NEEDS_UPDATE',
+            },
+          },
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+    const readerCycle = await scheduler.runSyncCycle();
+    assert.equal(readerCycle.enqueuedCount, 0);
+    assert.equal(executionOrder.length, 5);
+  });
+
+  test('GitSharedStore syncs shared review + collaborative posted/dismissed state from Worker to Reader while keeping customComment local', async () => {
+    const bareRepoDir = path.join(tmpDir, 'shared-reviews-remote.git');
+    const workerReviewsDir = path.join(tmpDir, 'worker-reviews');
+    const readerReviewsDir = path.join(tmpDir, 'reader-reviews');
+    const readerConfigPath = path.join(tmpDir, 'reader-config.json');
+
+    fs.mkdirSync(bareRepoDir, { recursive: true });
+    fs.mkdirSync(workerReviewsDir, { recursive: true });
+    fs.mkdirSync(readerReviewsDir, { recursive: true });
+    execFileSync('git', ['init', '--bare'], { cwd: bareRepoDir });
+
+    const workerCfg = {
+      githubOrg: 'ubitransports',
+      githubUser: 'antoine-worker',
+      teamProfile: 'popcorn-back',
+      hubRole: 'worker',
+      autoReviewEnabled: true,
+      autoSyncIntervalSec: 300,
+      sharedStoreRepo: bareRepoDir,
+      sharedStoreBranch: 'reviews-store',
+      projectsDir: tmpDir,
+      reviewsDir: workerReviewsDir,
+    };
+
+    const sampleSharedMd = [
+      '# Code Review: 2cloud-services#5750 — Shared Hub E2E',
+      '',
+      '## 1. Task Summary & Functional Problem Solved',
+      '- **Verdict:** 🟠 Request Changes',
+      '',
+      '## 3. Detailed Findings',
+      '',
+      '### 🟠 Major Issues',
+      '',
+      '#### #1 — `src/Service/PaymentGateway.php:44`',
+      '- **Category:** Reliability',
+      '- **Why it matters:** Missing idempotency key.',
+      '- **Ready-to-paste GitHub comment:**',
+      '```markdown',
+      'Please pass an explicit idempotency key to the gateway request.',
+      '```',
+      '',
+      '#### #2 — `src/Service/PaymentGateway.php:88`',
+      '- **Category:** Style',
+      '- **Why it matters:** Optional nit.',
+      '- **Ready-to-paste GitHub comment:**',
+      '```markdown',
+      'Consider extracting constant.',
+      '```',
+    ].join('\n');
+
+    const prSha = 'deadbeef1234567890abcdef1234567890abcdef';
+    saveReviewArtifact({
+      cfg: workerCfg,
+      repo: '2cloud-services',
+      number: 5750,
+      headSha: prSha,
+      teamProfile: 'popcorn-back',
+      scope: 'shared',
+      markdown: sampleSharedMd,
+      verdict: '🟠 Request Changes',
+      findingsSummary: '0 🔴, 2 🟠, 0 🟡, 0 🔵',
+      jiraKey: 'PRD-18200',
+      reviewedBy: 'antoine-worker',
+    });
+
+    // Worker posts #1 and dismisses #2, then pushes to bare Git repo
+    recordSharedFindingAction({
+      cfg: workerCfg,
+      cid: '2cloud-services#5750::#1',
+      action: 'posted',
+      actor: 'antoine-worker',
+      url: 'https://github.com/ubitransports/2cloud-services/pull/5750#discussion_r1',
+    });
+    const teamFpTmp = path.join(tmpDir, 'shared-team-fp.md');
+    process.env.REVIEW_HUB_TEAM_FP_FILE = teamFpTmp;
+    dismissFindingAsFalsePositive({
+      cfg: workerCfg,
+      pr: { repo: '2cloud-services', number: 5750 },
+      finding: { id: '#2', title: 'Optional nit', filePath: 'src/Service/PaymentGateway.php' },
+      reason: 'Accepted by team convention',
+      scope: 'team',
+      actor: 'colleague-reviewer',
+    });
+    delete process.env.REVIEW_HUB_TEAM_FP_FILE;
+
+    const pushRes = await pushSharedStore(workerCfg, 'chore(ReviewHub): N/A - Push #5750 review');
+    assert.equal(pushRes.pushed, true);
+
+    // Reader node starts with empty local reviewsDir, pulls from bare Git repo, and serves via HTTP
+    const prevConfigEnv = process.env.REVIEW_HUB_CONFIG;
+    process.env.REVIEW_HUB_CONFIG = readerConfigPath;
+    saveConfig(
+      {
+        githubOrg: 'ubitransports',
+        githubUser: 'bob-reader',
+        teamProfile: 'popcorn-back',
+        hubRole: 'reader',
+        autoReviewEnabled: false,
+        sharedStoreRepo: bareRepoDir,
+        sharedStoreBranch: 'reviews-store',
+        projectsDir: tmpDir,
+        reviewsDir: readerReviewsDir,
+        onboardingCompleted: true,
+      },
+      readerConfigPath
+    );
+
+    const pullRes = await pullSharedStore(loadConfig(readerConfigPath));
+    assert.equal(pullRes.synced, true);
+    assert.equal(pullRes.hydratedCount, 1);
+
+    const readerServer = createHubServer();
+    await new Promise((r) => readerServer.listen(0, '127.0.0.1', r));
+    const readerUrl = `http://127.0.0.1:${readerServer.address().port}`;
+
+    try {
+      const stateRes = await fetch(`${readerUrl}/api/state`);
+      const stateData = await stateRes.json();
+      const hydratedPr = stateData.prs.find((p) => p.key === '2cloud-services#5750');
+      assert.ok(hydratedPr, 'Reader must see hydrated PR from GitSharedStore');
+      assert.equal(hydratedPr.syncStatus, 'UP_TO_DATE');
+      assert.equal(hydratedPr.postedCount, 1);
+      assert.equal(hydratedPr.dismissedCount, 1);
+
+      // Reader edits customComment locally on #1 — must NOT leak into shared findings-state.json
+      await fetch(`${readerUrl}/api/ui-state`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cid: '2cloud-services#5750::#1',
+          customComment: 'Bob personal draft wording (strictly local)',
+        }),
+      });
+
+      const revRes = await fetch(
+        `${readerUrl}/api/review?file=review-2cloud-services-5750.md&key=${encodeURIComponent('2cloud-services#5750')}`
+      );
+      assert.equal(revRes.status, 200);
+      const revData = await revRes.json();
+      assert.equal(revData.findings.length, 2);
+
+      const f1 = revData.findings.find((f) => f.id === '#1');
+      const f2 = revData.findings.find((f) => f.id === '#2');
+      assert.equal(f1.posted, true);
+      assert.equal(f1.postedBy, 'antoine-worker');
+      assert.equal(f1.customComment, 'Bob personal draft wording (strictly local)');
+
+      assert.equal(f2.dismissed, true);
+      assert.equal(f2.dismissedBy, 'colleague-reviewer');
+
+      const sharedOnReaderDisk = readSharedFindingsState(loadConfig(readerConfigPath));
+      assert.equal(
+        sharedOnReaderDisk.findings['2cloud-services#5750::#1']?.customComment,
+        undefined,
+        'Personal customComment must never be written to shared findings-state.json'
+      );
+    } finally {
+      await new Promise((r) => readerServer.close(r));
+      if (prevConfigEnv) {
+        process.env.REVIEW_HUB_CONFIG = prevConfigEnv;
+      } else {
+        delete process.env.REVIEW_HUB_CONFIG;
+      }
+    }
+  });
+});
+
 
 

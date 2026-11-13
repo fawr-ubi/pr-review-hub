@@ -322,6 +322,46 @@ export function getDefaultConfig() {
     syncScript: path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh'),
     port: 4242,
     onboardingCompleted: false,
+    hubRole: process.env.REVIEW_HUB_ROLE === 'reader' ? 'reader' : 'worker',
+    autoReviewEnabled:
+      process.env.REVIEW_HUB_AUTO_REVIEW != null
+        ? process.env.REVIEW_HUB_AUTO_REVIEW !== 'false'
+        : true,
+    autoSyncIntervalSec: Math.max(
+      30,
+      Number(process.env.REVIEW_HUB_SYNC_INTERVAL_SEC) || 300
+    ),
+    sharedStoreRepo: expandHome((process.env.REVIEW_HUB_SHARED_STORE_REPO || '').trim()),
+    sharedStoreBranch: (process.env.REVIEW_HUB_SHARED_STORE_BRANCH || 'reviews-store').trim() || 'reviews-store',
+  };
+}
+
+function normalizeSharedHubFields(raw, defaults) {
+  const roleRaw = String(raw.hubRole ?? defaults.hubRole ?? 'worker').trim().toLowerCase();
+  const hubRole = roleRaw === 'reader' ? 'reader' : 'worker';
+  const autoReviewEnabled =
+    typeof raw.autoReviewEnabled === 'boolean'
+      ? raw.autoReviewEnabled
+      : raw.autoReviewEnabled != null
+      ? String(raw.autoReviewEnabled).toLowerCase() !== 'false'
+      : defaults.autoReviewEnabled;
+  const parsedInterval = Number(raw.autoSyncIntervalSec ?? defaults.autoSyncIntervalSec ?? 300);
+  const autoSyncIntervalSec = Number.isFinite(parsedInterval)
+    ? Math.max(30, Math.round(parsedInterval))
+    : 300;
+  const sharedStoreRepo = expandHome(
+    String(raw.sharedStoreRepo ?? defaults.sharedStoreRepo ?? '').trim()
+  );
+  const sharedStoreBranch =
+    String(raw.sharedStoreBranch ?? defaults.sharedStoreBranch ?? 'reviews-store').trim() ||
+    'reviews-store';
+
+  return {
+    hubRole,
+    autoReviewEnabled,
+    autoSyncIntervalSec,
+    sharedStoreRepo,
+    sharedStoreBranch,
   };
 }
 
@@ -339,6 +379,7 @@ export function loadConfig(customConfigFile = '') {
       const merged = {
         ...defaults,
         ...saved,
+        ...normalizeSharedHubFields(saved, defaults),
         githubTeams: Array.isArray(saved.githubTeams) ? saved.githubTeams : defaults.githubTeams,
         jiraPrefixes: Array.isArray(saved.jiraPrefixes)
           ? saved.jiraPrefixes
@@ -366,9 +407,13 @@ export function loadConfig(customConfigFile = '') {
 export function saveConfig(partialConfig, customConfigFile = '') {
   const current = loadConfig(customConfigFile);
   const configFile = customConfigFile || getConfigFile();
-  const updated = {
+  const rawUpdated = {
     ...current,
     ...partialConfig,
+  };
+  const updated = {
+    ...rawUpdated,
+    ...normalizeSharedHubFields(rawUpdated, current),
   };
   if (typeof updated.githubTeams === 'string') {
     updated.githubTeams = updated.githubTeams

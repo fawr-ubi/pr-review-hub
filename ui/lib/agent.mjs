@@ -7,8 +7,17 @@ import { SKILL_ROOT, findCliBinaryPath } from './config.mjs';
 import { parseFindingsFromMarkdown } from './parser.mjs';
 import { extractJiraKey } from './metadata.mjs';
 import { getLocalRepoPath, getProjectsDir } from './worktree.mjs';
-import { getReferencePaths, syncCombinedReferenceFiles } from './rules.mjs';
-import { recordPrReview } from './sync.mjs';
+import {
+  getReferencePaths,
+  getSharedReviewRulesBundle,
+  getPersonalReviewRulesBundle,
+  syncCombinedReferenceFiles,
+} from './rules.mjs';
+import {
+  saveReviewArtifact,
+  recordSharedFindingAction,
+  pushSharedStore,
+} from './store.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -157,41 +166,131 @@ function isRetryableModelError(errMsg) {
   );
 }
 
-async function runCliPrompt(args) {
-  try {
-    return await _runCliPromptInternal(args);
-  } catch (err) {
-    if (args.model && MODEL_FALLBACKS[args.model] && isRetryableModelError(err.message)) {
-      const fallbackModel = MODEL_FALLBACKS[args.model];
-      if (args.onStreamUpdate) {
-        args.onStreamUpdate({ phase: `⚠️ Model ${args.model} unavailable. Retrying with fallback: ${fallbackModel}...`, partialText: '' });
+function isRetryableCliError(errMsg) {
+  const e = String(errMsg).toLowerCase();
+  return (
+    isRetryableModelError(e) ||
+    e.includes('stalled') ||
+    e.includes('exited with code') ||
+    e.includes('econnreset') ||
+    e.includes('etimedout') ||
+    e.includes('socket hang up')
+  );
+}
+
+export async function runCliPrompt(args) {
+  const maxRetries = args.maxRetries ?? 1;
+  let attempt = 0;
+  let currentModel = args.model || '';
+
+  while (attempt <= maxRetries) {
+    try {
+      return await _runCliPromptInternal({ ...args, model: currentModel });
+    } catch (err) {
+      if (currentModel && MODEL_FALLBACKS[currentModel] && isRetryableModelError(err.message)) {
+        const fallbackModel = MODEL_FALLBACKS[currentModel];
+        args.onStreamUpdate?.({
+          phase: `⚠️ Model ${currentModel} unavailable. Retrying with fallback: ${fallbackModel}…`,
+          partialText: '',
+        });
+        currentModel = fallbackModel;
+        attempt++;
+        continue;
       }
-      return await _runCliPromptInternal({ ...args, model: fallbackModel });
+
+      if (attempt < maxRetries && isRetryableCliError(err.message)) {
+        attempt++;
+        args.onStreamUpdate?.({
+          phase: `⚠️ CLI stall/error (${err.message}). Auto-retrying (${attempt + 1}/${maxRetries + 1})…`,
+          partialText: '',
+        });
+        continue;
+      }
+      throw err;
     }
-    throw err;
   }
 }
 
-async function _runCliPromptInternal({
+function attachDualTimeoutTimers({ child, cliLabel, timeoutMs, inactivityTimeoutMs, onReject }) {
+  let settled = false;
+  let inactivityTimer = null;
 
+  const terminateChild = () => {
+    try {
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.kill('SIGTERM');
+      const forceTimer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+      }, 2000);
+      forceTimer.unref?.();
+    } catch {
+      // ignore
+    }
+  };
+
+  const formatDuration = (ms) => (ms >= 1000 ? `${Math.round(ms / 1000)}s` : `${ms}ms`);
+
+  const wallTimer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    if (inactivityTimer) clearTimeout(inactivityTimer);
+    terminateChild();
+    onReject(new Error(`${cliLabel} timeout exceeded (${formatDuration(timeoutMs)})`));
+  }, timeoutMs);
+
+  const resetHeartbeat = () => {
+    if (settled || !inactivityTimeoutMs || inactivityTimeoutMs <= 0) return;
+    if (inactivityTimer) clearTimeout(inactivityTimer);
+    inactivityTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(wallTimer);
+      terminateChild();
+      onReject(
+        new Error(`${cliLabel} stalled with no output for ${formatDuration(inactivityTimeoutMs)}`)
+      );
+    }, inactivityTimeoutMs);
+  };
+
+  const clearAll = () => {
+    settled = true;
+    clearTimeout(wallTimer);
+    if (inactivityTimer) clearTimeout(inactivityTimer);
+  };
+
+  resetHeartbeat();
+  return { resetHeartbeat, clearAll, isSettled: () => settled };
+}
+
+async function _runCliPromptInternal({
   prompt,
   cwd,
   agentCli = 'agy',
   approvalMode = 'yolo',
   timeoutMs = 420000,
+  inactivityTimeoutMs = 210000,
   fastChatMode = false,
   includeDirs = [],
   onStreamUpdate = null,
   model = '',
+  _customBinPath = '',
 }) {
-  if (customAgentRunner) {
+  if (customAgentRunner && !_customBinPath) {
     if (onStreamUpdate) {
       onStreamUpdate({ phase: 'Running agent…', partialText: '' });
     }
     return customAgentRunner({ prompt, cwd, approvalMode, agentCli });
   }
 
-  const { cli, bin } = resolveAgentBinary(agentCli);
+  const { cli, bin } = _customBinPath
+    ? { cli: ['agy', 'gemini', 'claude'].includes(agentCli) ? agentCli : 'agy', bin: _customBinPath }
+    : resolveAgentBinary(agentCli);
   const workingDir = cwd && fs.existsSync(cwd) ? cwd : process.cwd();
   const validIncludeDirs = includeDirs.filter((d) => d && fs.existsSync(d));
 
@@ -233,10 +332,13 @@ async function _runCliPromptInternal({
       let rawStderr = '';
       let lineBuffer = '';
 
-      const timer = setTimeout(() => {
-        child.kill('SIGTERM');
-        reject(new Error(`Antigravity CLI (agy) timeout exceeded (${Math.round(timeoutMs / 1000)}s)`));
-      }, timeoutMs);
+      const timers = attachDualTimeoutTimers({
+        child,
+        cliLabel: 'Antigravity CLI (agy)',
+        timeoutMs,
+        inactivityTimeoutMs,
+        onReject: reject,
+      });
 
       const processAgyJsonLine = (line) => {
         const trimmed = line.trim();
@@ -275,6 +377,7 @@ async function _runCliPromptInternal({
       };
 
       child.stdout.on('data', (chunk) => {
+        timers.resetHeartbeat();
         const str = chunk.toString('utf8');
         rawStdout += str;
         lineBuffer += str;
@@ -286,16 +389,19 @@ async function _runCliPromptInternal({
       });
 
       child.stderr.on('data', (chunk) => {
+        timers.resetHeartbeat();
         rawStderr += chunk.toString('utf8');
       });
 
       child.on('error', (err) => {
-        clearTimeout(timer);
+        if (timers.isSettled()) return;
+        timers.clearAll();
         reject(err);
       });
 
       child.on('close', (code) => {
-        clearTimeout(timer);
+        if (timers.isSettled()) return;
+        timers.clearAll();
         if (lineBuffer) processAgyJsonLine(lineBuffer);
         const out = finalResponse || partialText.trim();
         if (out) {
@@ -340,10 +446,13 @@ async function _runCliPromptInternal({
 
       let stdout = '';
       let stderr = '';
-      const timer = setTimeout(() => {
-        child.kill('SIGTERM');
-        reject(new Error(`Claude CLI timeout exceeded (${Math.round(timeoutMs / 1000)}s)`));
-      }, timeoutMs);
+      const timers = attachDualTimeoutTimers({
+        child,
+        cliLabel: 'Claude CLI',
+        timeoutMs,
+        inactivityTimeoutMs,
+        onReject: reject,
+      });
 
       if (useStdin && child.stdin) {
         child.stdin.write(prompt);
@@ -351,17 +460,21 @@ async function _runCliPromptInternal({
       }
 
       child.stdout.on('data', (chunk) => {
+        timers.resetHeartbeat();
         stdout += chunk.toString('utf8');
       });
       child.stderr.on('data', (chunk) => {
+        timers.resetHeartbeat();
         stderr += chunk.toString('utf8');
       });
       child.on('error', (err) => {
-        clearTimeout(timer);
+        if (timers.isSettled()) return;
+        timers.clearAll();
         reject(err);
       });
       child.on('close', (code) => {
-        clearTimeout(timer);
+        if (timers.isSettled()) return;
+        timers.clearAll();
         if (code === 0 && stdout.trim()) {
           resolve(stdout.trim());
         } else {
@@ -415,10 +528,13 @@ async function _runCliPromptInternal({
     let rawStderr = '';
     let lineBuffer = '';
 
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      reject(new Error(`Gemini CLI timeout exceeded (${Math.round(timeoutMs / 1000)}s)`));
-    }, timeoutMs);
+    const timers = attachDualTimeoutTimers({
+      child,
+      cliLabel: 'Gemini CLI',
+      timeoutMs,
+      inactivityTimeoutMs,
+      onReject: reject,
+    });
 
     const processJsonLine = (line) => {
       const trimmed = line.trim();
@@ -458,6 +574,7 @@ async function _runCliPromptInternal({
     };
 
     child.stdout.on('data', (chunk) => {
+      timers.resetHeartbeat();
       const str = chunk.toString('utf8');
       rawStdout += str;
       lineBuffer += str;
@@ -469,16 +586,19 @@ async function _runCliPromptInternal({
     });
 
     child.stderr.on('data', (chunk) => {
+      timers.resetHeartbeat();
       rawStderr += chunk.toString('utf8');
     });
 
     child.on('error', (err) => {
-      clearTimeout(timer);
+      if (timers.isSettled()) return;
+      timers.clearAll();
       reject(err);
     });
 
     child.on('close', (code) => {
-      clearTimeout(timer);
+      if (timers.isSettled()) return;
+      timers.clearAll();
       if (lineBuffer) processJsonLine(lineBuffer);
       if (partialText.trim()) {
         resolve(partialText.trim());
@@ -496,7 +616,7 @@ async function _runCliPromptInternal({
   });
 }
 
-async function fetchPrContextFromGithub(cfg, pr) {
+async function fetchPrContextFromGithub(cfg, pr, repoPath = '') {
   if (customAgentRunner) {
     return {
       headSha: pr.headRefOid || pr.lastReviewedSha || 'HEAD',
@@ -518,11 +638,11 @@ async function fetchPrContextFromGithub(cfg, pr) {
         '--json',
         'title,body,baseRefName,headRefName,headRefOid,author,files',
       ],
-      { maxBuffer: 15 * 1024 * 1024, timeout: 20000 }
+      { maxBuffer: 15 * 1024 * 1024, timeout: 25000 }
     ).catch(() => ({ stdout: '{}' })),
     execFileAsync('gh', ['pr', 'diff', String(pr.number), '--repo', repoSlug], {
       maxBuffer: 25 * 1024 * 1024,
-      timeout: 30000,
+      timeout: 45000,
     }).catch(() => ({ stdout: '' })),
   ]);
 
@@ -538,7 +658,65 @@ async function fetchPrContextFromGithub(cfg, pr) {
   const changedFilesList = Array.isArray(parsed.files)
     ? parsed.files.map((f) => `${f.path} (+${f.additions || 0}/-${f.deletions || 0})`)
     : [];
-  const diffText = String(diffRes.stdout || '').trim();
+  let diffText = String(diffRes.stdout || '').trim();
+
+  // Fallback 1: Reconstruct unified diff from GitHub REST /files patches if `gh pr diff` timed out
+  if (!diffText) {
+    try {
+      const filesRes = await execFileAsync(
+        'gh',
+        ['api', `repos/${repoSlug}/pulls/${pr.number}/files?per_page=100`],
+        { maxBuffer: 20 * 1024 * 1024, timeout: 25000 }
+      );
+      const filesArr = JSON.parse(filesRes.stdout || '[]');
+      if (Array.isArray(filesArr) && filesArr.length > 0) {
+        diffText = filesArr
+          .filter((f) => f && f.filename && f.patch)
+          .map(
+            (f) =>
+              `diff --git a/${f.filename} b/${f.filename}\n--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch}`
+          )
+          .join('\n\n');
+      }
+    } catch {
+      // ignore REST fallback failure
+    }
+  }
+
+  // Fallback 2: Local git branch range or commit diff if available on disk
+  const baseBranch = parsed.baseRefName || pr.baseRefName || '';
+  if (!diffText && repoPath && fs.existsSync(repoPath) && headSha && headSha !== 'HEAD') {
+    if (baseBranch) {
+      try {
+        const rangeDiffRes = await execFileAsync(
+          'git',
+          ['-C', repoPath, 'diff', '--unified=3', `origin/${baseBranch}...${headSha}`],
+          { maxBuffer: 20 * 1024 * 1024, timeout: 15000 }
+        );
+        diffText = String(rangeDiffRes.stdout || '').trim();
+      } catch {
+        // ignore un-fetched ref
+      }
+    }
+    if (!diffText) {
+      try {
+        const localDiffRes = await execFileAsync(
+          'git',
+          ['-C', repoPath, 'show', '--format=', '--unified=3', headSha],
+          { maxBuffer: 20 * 1024 * 1024, timeout: 15000 }
+        );
+        diffText = String(localDiffRes.stdout || '').trim();
+      } catch {
+        // ignore local git fallback failure
+      }
+    }
+  }
+
+  if (!customAgentRunner && !diffText && changedFilesList.length === 0) {
+    throw new Error(
+      'GitHub diff unavailable (API 502 or network error) — will retry automatically on next sync'
+    );
+  }
 
   return {
     headSha,
@@ -548,176 +726,227 @@ async function fetchPrContextFromGithub(cfg, pr) {
   };
 }
 
-export function triggerPrReview({ cfg, pr }) {
+export function createQueuedReviewJob({ pr, scope = 'shared' }) {
   const prKey = `${pr.repo}#${pr.number}`;
+  const normalizedScope = scope === 'personal' ? 'personal' : 'shared';
   const existing = [...activeJobs.values()].find(
-    (j) => j.prKey === prKey && j.type === 'review' && j.status === 'running'
+    (j) =>
+      j.prKey === prKey &&
+      j.type === 'review' &&
+      j.scope === normalizedScope &&
+      (j.status === 'running' || j.status === 'queued')
   );
   if (existing) return existing;
 
-  const jobId = `review-${pr.repo}-${pr.number}-${Date.now()}`;
+  const jobId = `review-${pr.repo}-${pr.number}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const job = {
     id: jobId,
     prKey,
     repo: pr.repo,
     number: Number(pr.number),
+    scope: normalizedScope,
     type: 'review',
-    status: 'running',
-    phase: 'Fetching PR diff and metadata from GitHub…',
+    status: 'queued',
+    phase: 'Queued in worker (waiting for active review)…',
     startedAt: new Date().toISOString(),
     finishedAt: null,
     error: null,
   };
   activeJobs.set(jobId, job);
+  return job;
+}
 
-  (async () => {
-    try {
-      const projectsDir = getProjectsDir(cfg);
-      const repoPath = getLocalRepoPath(projectsDir, pr.repo);
-      fs.mkdirSync(cfg.reviewsDir, { recursive: true });
-      const reviewFileName = `review-${pr.repo}-${pr.number}.md`;
-      const reviewFilePath = path.join(cfg.reviewsDir, reviewFileName);
-      const jiraKey = extractJiraKey(pr) || '—';
+export async function runPrReviewJob({ cfg, pr, scope = 'shared', existingJob = null }) {
+  const normalizedScope = scope === 'personal' ? 'personal' : 'shared';
+  const job = existingJob || createQueuedReviewJob({ pr, scope: normalizedScope });
+  job.status = 'running';
+  job.startedAt = new Date().toISOString();
+  job.phase = 'Fetching PR diff and metadata from GitHub…';
+  job.error = null;
 
-      const { headSha, prBody, diffText, changedFilesList } = await fetchPrContextFromGithub(
-        cfg,
-        pr
-      );
+  try {
+    const projectsDir = getProjectsDir(cfg);
+    const repoPath = getLocalRepoPath(projectsDir, pr.repo);
+    fs.mkdirSync(cfg.reviewsDir, { recursive: true });
+    const reviewFileName = `review-${pr.repo}-${pr.number}.md`;
+    const reviewFilePath = path.join(cfg.reviewsDir, reviewFileName);
+    const jiraKey = extractJiraKey(pr) || '—';
 
-      syncCombinedReferenceFiles(cfg.teamProfile);
-      const { commonDnaPath, teamDnaPath, activeTeam, dnaPath, fpPath, combinedDnaPath } =
-        getReferencePaths(cfg.teamProfile);
+    const { headSha, prBody, diffText, changedFilesList } = await fetchPrContextFromGithub(
+      cfg,
+      pr,
+      repoPath
+    );
 
-      const readSafe = (p) => (p && fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim() : '');
-      const combinedRulesText =
-        readSafe(combinedDnaPath) ||
-        [readSafe(commonDnaPath), readSafe(teamDnaPath), readSafe(dnaPath)]
-          .filter(Boolean)
-          .join('\n\n');
-      const fpRulesText = readSafe(fpPath);
-      const checklistText = readSafe(path.join(SKILL_ROOT, 'references/review-checklist.md'));
-      const templateText = readSafe(path.join(SKILL_ROOT, 'assets/review-artifact-template.md'));
+    const rulesBundle =
+      normalizedScope === 'personal'
+        ? getPersonalReviewRulesBundle(cfg.teamProfile)
+        : getSharedReviewRulesBundle(cfg.teamProfile);
+    const { activeTeam, rulesMarkdown: combinedRulesText, falsePositivesMarkdown: fpRulesText } =
+      rulesBundle;
 
-      const teamContextLine = activeTeam
-        ? `Active Team Profile: "${activeTeam.name}" (${activeTeam.id}). Tech Stack: ${(activeTeam.techStack || []).join(', ') || 'General'}.${activeTeam.agentInstructions ? ` Team Agent Focus: ${activeTeam.agentInstructions}` : ''}`
-        : '';
+    const readSafe = (p) => (p && fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim() : '');
+    const checklistText = readSafe(path.join(SKILL_ROOT, 'references/review-checklist.md'));
+    const templateText = readSafe(path.join(SKILL_ROOT, 'assets/review-artifact-template.md'));
 
-      const maxDiffChars = 110000;
-      const truncatedDiff =
-        diffText.length > maxDiffChars
-          ? `${diffText.slice(0, maxDiffChars)}\n\n[... Diff truncated at ${maxDiffChars} characters ...]`
-          : diffText;
+    const teamContextLine = activeTeam
+      ? `Active Team Profile: "${activeTeam.name}" (${activeTeam.id}) [Scope: ${normalizedScope.toUpperCase()}]. Tech Stack: ${(activeTeam.techStack || []).join(', ') || 'General'}.${activeTeam.agentInstructions ? ` Team Agent Focus: ${activeTeam.agentInstructions}` : ''}`
+      : '';
 
-      const prompt = [
-        `Execute a Mode 1 code review using the skill at ${path.join(SKILL_ROOT, 'SKILL.md')} for PR ${cfg.githubOrg}/${pr.repo}#${pr.number} ("${pr.title || ''}", author: ${pr.author || 'unknown'}, head SHA: ${headSha}).`,
-        teamContextLine,
-        `Read ${commonDnaPath}, ${teamDnaPath}, ${dnaPath}, ${path.join(SKILL_ROOT, 'references/review-checklist.md')}, and ${fpPath}.`,
-        `Write the full Markdown review report in 100% English to ${reviewFilePath} (or output the complete Markdown report directly as your response), starting with "# Code Review: ${pr.repo}#${pr.number} — ${pr.title || ''}" and "## 1. Task Summary & Functional Problem Solved" (Business & Functional Problem Solved, Technical & Feature Solution, Jira & Scope Compliance), and providing a single English "Ready-to-paste GitHub comment:" block per finding.`,
-        `Never publish any comment to GitHub.`,
-        templateText ? `\n--- Output Markdown Template ---\n${templateText}` : '',
-        combinedRulesText
-          ? `\n--- Active Reviewer & Team DNA Rules ---\n${combinedRulesText.slice(0, 18000)}`
-          : '',
-        fpRulesText
-          ? `\n--- Known False Positives (DO NOT FLAG THESE) ---\n${fpRulesText.slice(0, 8000)}`
-          : '',
-        checklistText ? `\n--- Review Checklist ---\n${checklistText}` : '',
-        prBody ? `\n--- PR Description ---\n${prBody.slice(0, 6000)}` : '',
-        changedFilesList.length > 0
-          ? `\n--- Modified Files (${changedFilesList.length}) ---\n${changedFilesList.join('\n')}`
-          : '',
-        truncatedDiff ? `\n--- Full Unified Git Diff ---\n\`\`\`diff\n${truncatedDiff}\n\`\`\`` : '',
-      ]
-        .filter(Boolean)
-        .join('\n');
+    const maxDiffChars = 110000;
+    const truncatedDiff =
+      diffText.length > maxDiffChars
+        ? `${diffText.slice(0, maxDiffChars)}\n\n[... Diff truncated at ${maxDiffChars} characters ...]`
+        : diffText;
 
-      const resolvedCliLabel = (() => {
-        try {
-          return resolveAgentBinary(cfg.agentCli || 'agy').cli;
-        } catch {
-          return cfg.agentCli || 'agy';
-        }
-      })();
-      job.cli = resolvedCliLabel;
-      job.phase = `Running AI audit (${resolvedCliLabel})…`;
+    const prompt = [
+      `Execute a Mode 1 code review for PR ${cfg.githubOrg}/${pr.repo}#${pr.number} ("${pr.title || ''}", author: ${pr.author || 'unknown'}, head SHA: ${headSha}).`,
+      teamContextLine,
+      `FAST ZERO-WASTE MODE (CRITICAL):`,
+      `1. All active review rules, false positives, review checklist, output template, PR description, and the full unified Git diff are ALREADY embedded inline below.`,
+      `2. DO NOT read SKILL.md, DO NOT read reference rule files from disk, DO NOT run \`gh\`, \`git\`, \`docker\`, tests, or ANY shell command (\`run_command\` is FORBIDDEN), and DO NOT call file-writing tools.`,
+      `3. LOCAL BRANCH WARNING: The local workspace directory is checked out on the developer's own working branch, NOT on this PR's head commit (${headSha}). Newly added or modified files in this PR will NOT match on disk — rely directly on the inline Unified Git Diff below.`,
+      `4. STRICT TOOL BUDGET (HARD MAX: 3 READ-ONLY CALLS TOTAL): Only read an existing unchanged base class/interface on disk if strictly required to confirm a Blocker/Major contract bug, and NEVER exceed 3 file reads total. Synthesize and return your complete Markdown review immediately.`,
+      `Output the complete Markdown review report in 100% English directly as your response text, starting with "# Code Review: ${pr.repo}#${pr.number} — ${pr.title || ''}" and "## 1. Task Summary & Functional Problem Solved" (Business & Functional Problem Solved, Technical & Feature Solution, Jira & Scope Compliance), and providing a single English "Ready-to-paste GitHub comment:" block per finding.`,
+      `Never publish any comment to GitHub.`,
+      templateText ? `\n--- Output Markdown Template ---\n${templateText}` : '',
+      combinedRulesText
+        ? `\n--- Active ${normalizedScope === 'personal' ? 'Personal & Team' : 'Shared Team'} DNA Rules ---\n${combinedRulesText.slice(0, 18000)}`
+        : '',
+      fpRulesText
+        ? `\n--- Known False Positives (DO NOT FLAG THESE) ---\n${fpRulesText.slice(0, 8000)}`
+        : '',
+      checklistText ? `\n--- Review Checklist ---\n${checklistText}` : '',
+      prBody ? `\n--- PR Description ---\n${prBody.slice(0, 6000)}` : '',
+      changedFilesList.length > 0
+        ? `\n--- Modified Files (${changedFilesList.length}) ---\n${changedFilesList.join('\n')}`
+        : '',
+      truncatedDiff ? `\n--- Full Unified Git Diff ---\n\`\`\`diff\n${truncatedDiff}\n\`\`\`` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
 
-      const out = await runCliPrompt({
-        prompt,
-        cwd: repoPath,
-        agentCli: cfg.agentCli || 'agy',
-        approvalMode: 'yolo',
-        timeoutMs: 420000,
-        includeDirs: [SKILL_ROOT, cfg.reviewsDir, repoPath],
-        model: cfg.model || '',
-        onStreamUpdate: ({ phase }) => {
-          if (phase) job.phase = phase;
-        },
-      });
-
-      const cleanedOut = cleanReviewMarkdownOutput(out);
-      if (cleanedOut && cleanedOut.includes('#')) {
-        fs.writeFileSync(reviewFilePath, `${cleanedOut}\n`, 'utf8');
-      } else if (fs.existsSync(reviewFilePath)) {
-        const diskContent = cleanReviewMarkdownOutput(fs.readFileSync(reviewFilePath, 'utf8'));
-        if (diskContent) {
-          fs.writeFileSync(reviewFilePath, `${diskContent}\n`, 'utf8');
-        }
+    const resolvedCliLabel = (() => {
+      try {
+        return resolveAgentBinary(cfg.agentCli || 'agy').cli;
+      } catch {
+        return cfg.agentCli || 'agy';
       }
+    })();
+    job.cli = resolvedCliLabel;
+    job.phase = `Running AI audit (${resolvedCliLabel})…`;
 
-      if (!fs.existsSync(reviewFilePath)) {
-        throw new Error(
-          'AI CLI finished without producing a Markdown review report. Check your AGY / Gemini / Claude CLI authentication.'
-        );
+    // Snapshot previous mtime if file existed so a stale file on disk isn't mistaken for fresh output
+    const prevMtimeMs = fs.existsSync(reviewFilePath) ? fs.statSync(reviewFilePath).mtimeMs : 0;
+
+    const out = await runCliPrompt({
+      prompt,
+      cwd: repoPath,
+      agentCli: cfg.agentCli || 'agy',
+      approvalMode: 'yolo',
+      timeoutMs: 420000,
+      inactivityTimeoutMs: 210000,
+      maxRetries: 1,
+      includeDirs: [cfg.reviewsDir, repoPath].filter(Boolean),
+      model: cfg.model || '',
+      onStreamUpdate: ({ phase }) => {
+        if (phase) job.phase = phase;
+      },
+    });
+
+    let md = '';
+    const cleanedOut = cleanReviewMarkdownOutput(out);
+    if (cleanedOut && cleanedOut.includes('#')) {
+      md = `${cleanedOut}\n`;
+    } else if (fs.existsSync(reviewFilePath) && fs.statSync(reviewFilePath).mtimeMs > prevMtimeMs) {
+      const diskContent = cleanReviewMarkdownOutput(fs.readFileSync(reviewFilePath, 'utf8'));
+      if (diskContent) {
+        md = `${diskContent}\n`;
       }
-
-      const md = fs.readFileSync(reviewFilePath, 'utf8');
-      const findings = parseFindingsFromMarkdown(md, pr.repo);
-      const summary = summarizeFindings(findings);
-      const verdict = inferVerdictFromFindings(findings, md);
-
-      const defaultSyncScript = path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh');
-      if (
-        cfg.syncScript &&
-        path.resolve(cfg.syncScript) !== path.resolve(defaultSyncScript) &&
-        fs.existsSync(cfg.syncScript)
-      ) {
-        await execFileAsync(cfg.syncScript, [
-          'record',
-          pr.repo,
-          String(pr.number),
-          headSha,
-          verdict,
-          summary,
-          jiraKey,
-          reviewFileName,
-        ]).catch(() => {});
-      } else {
-        try {
-          recordPrReview({
-            cfg,
-            repo: pr.repo,
-            number: Number(pr.number),
-            headSha,
-            reviewStatus: verdict,
-            findingsSummary: summary,
-            jiraKey,
-            reviewFile: reviewFileName,
-          });
-        } catch {
-          // ignore state update error
-        }
-      }
-
-      job.phase = 'Completed';
-      job.status = 'completed';
-      job.finishedAt = new Date().toISOString();
-    } catch (err) {
-      job.phase = 'Failed';
-      job.status = 'failed';
-      job.error = err.message || String(err);
-      job.finishedAt = new Date().toISOString();
     }
-  })();
+
+    if (!md) {
+      throw new Error(
+        'AI CLI finished without producing a Markdown review report. Check your AGY / Gemini / Claude CLI authentication.'
+      );
+    }
+
+    const findings = parseFindingsFromMarkdown(md, pr.repo);
+    const summary = summarizeFindings(findings);
+    const verdict = inferVerdictFromFindings(findings, md);
+
+    saveReviewArtifact({
+      cfg,
+      repo: pr.repo,
+      number: Number(pr.number),
+      headSha,
+      teamProfile: activeTeam?.id || cfg.teamProfile,
+      scope: normalizedScope,
+      markdown: md,
+      verdict,
+      findingsSummary: summary,
+      jiraKey,
+      reviewedBy: cfg.githubUser || 'worker',
+    });
+
+    const defaultSyncScript = path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh');
+    if (
+      cfg.syncScript &&
+      path.resolve(cfg.syncScript) !== path.resolve(defaultSyncScript) &&
+      fs.existsSync(cfg.syncScript)
+    ) {
+      await execFileAsync(cfg.syncScript, [
+        'record',
+        pr.repo,
+        String(pr.number),
+        headSha,
+        verdict,
+        summary,
+        jiraKey,
+        reviewFileName,
+      ]).catch(() => {});
+    }
+
+    if (normalizedScope === 'shared' && cfg.sharedStoreRepo) {
+      job.phase = 'Pushing shared review artifact…';
+      await pushSharedStore(
+        cfg,
+        `chore(ReviewHub): N/A - Store shared review for ${pr.repo}#${pr.number} (${String(headSha).slice(0, 7)})`
+      );
+    }
+
+    job.phase = 'Completed';
+    job.status = 'completed';
+    job.finishedAt = new Date().toISOString();
+    return job;
+  } catch (err) {
+    job.phase = 'Failed';
+    job.status = 'failed';
+    job.error = err.message || String(err);
+    job.finishedAt = new Date().toISOString();
+    throw err;
+  }
+}
+
+export function triggerPrReview({ cfg, pr, scope = 'shared' }) {
+  const prKey = `${pr.repo}#${pr.number}`;
+  const normalizedScope = scope === 'personal' ? 'personal' : 'shared';
+  const existing = [...activeJobs.values()].find(
+    (j) =>
+      j.prKey === prKey &&
+      j.type === 'review' &&
+      j.scope === normalizedScope &&
+      (j.status === 'running' || j.status === 'queued')
+  );
+  if (existing) return existing;
+
+  const job = createQueuedReviewJob({ pr, scope: normalizedScope });
+  job.status = 'running';
+  job.phase = 'Fetching PR diff and metadata from GitHub…';
+
+  runPrReviewJob({ cfg, pr, scope: normalizedScope, existingJob: job }).catch(() => {
+    // job.status and job.error already populated by runPrReviewJob
+  });
 
   return job;
 }
@@ -856,13 +1085,22 @@ export function dismissFindingAsFalsePositive({
   pr,
   finding,
   reason = '',
+  scope = 'team',
+  actor = '',
   uiStateFile,
 }) {
-  const refPaths = getReferencePaths();
-  const fpPath = process.env.REVIEW_HUB_FP_FILE || refPaths.fpPath;
+  const refPaths = getReferencePaths(cfg?.teamProfile || '');
+  const usePersonalFp = Boolean(process.env.REVIEW_HUB_FP_FILE) || scope === 'personal';
+  const fpPath = process.env.REVIEW_HUB_FP_FILE
+    ? process.env.REVIEW_HUB_FP_FILE
+    : usePersonalFp
+    ? refPaths.fpPath
+    : refPaths.teamFpPath;
+
   const cleanReason =
     String(reason || '').trim() ||
     `Dismissed from PR Review Hub on ${pr.repo}#${pr.number} as intentional / non-issue.`;
+  const cleanActor = String(actor || cfg?.githubUser || 'reviewer').trim();
   const dateStr = new Date().toISOString().slice(0, 10);
 
   const block = [
@@ -873,10 +1111,18 @@ export function dismissFindingAsFalsePositive({
     `  - *Rule:* Do not flag this pattern in future reviews.`,
   ].join('\n');
 
-  if (fs.existsSync(fpPath)) {
-    fs.appendFileSync(fpPath, `${block}\n`, 'utf8');
-    syncCombinedReferenceFiles();
+  if (!fs.existsSync(fpPath)) {
+    fs.mkdirSync(path.dirname(fpPath), { recursive: true });
+    const header = usePersonalFp
+      ? '# Known False Positives & Exceptions\n\n---\n'
+      : `# Team False Positives & Intentional Exceptions — ${refPaths.activeTeam?.name || 'Team'}\n\n---\n`;
+    fs.writeFileSync(fpPath, header, 'utf8');
   }
+  fs.appendFileSync(fpPath, `${block}\n`, 'utf8');
+  syncCombinedReferenceFiles(cfg?.teamProfile || '');
+
+  const cid = finding.cid || `${pr.repo}#${pr.number}::${finding.id}`;
+  const nowIso = new Date().toISOString();
 
   if (uiStateFile) {
     let uiState = { comments: {} };
@@ -888,21 +1134,40 @@ export function dismissFindingAsFalsePositive({
       // ignore
     }
     if (!uiState.comments) uiState.comments = {};
-    const cid = finding.cid || `${pr.repo}#${pr.number}::${finding.id}`;
     uiState.comments[cid] = {
       ...(uiState.comments[cid] || {}),
       dismissed: true,
-      dismissedAt: new Date().toISOString(),
+      dismissedBy: cleanActor,
+      dismissedAt: nowIso,
       dismissReason: cleanReason,
     };
     fs.writeFileSync(uiStateFile, JSON.stringify(uiState, null, 2), 'utf8');
   }
 
+  if (cfg && scope !== 'personal') {
+    recordSharedFindingAction({
+      cfg,
+      cid,
+      action: 'dismissed',
+      actor: cleanActor,
+      reason: cleanReason,
+    });
+    if (cfg.sharedStoreRepo) {
+      pushSharedStore(
+        cfg,
+        `chore(ReviewHub): N/A - Dismiss finding ${cid} by ${cleanActor}`
+      ).catch(() => {});
+    }
+  }
+
+  const targetLabel = usePersonalFp
+    ? 'references/false-positives.local.md'
+    : `references/teams/${refPaths.activeTeam?.id || 'team'}/false-positives.md`;
   appendPrChatMessage(cfg.reviewsDir, pr.repo, pr.number, {
     role: 'assistant',
-    text: `Finding ${finding.id} marked as false positive and added to references/false-positives.md (${cleanReason}).`,
+    text: `Finding ${finding.id} marked as false positive by @${cleanActor} and added to ${targetLabel} (${cleanReason}).`,
     findingId: finding.id,
   });
 
-  return { ok: true, fpPath };
+  return { ok: true, fpPath, scope: usePersonalFp ? 'personal' : 'team', dismissedBy: cleanActor };
 }

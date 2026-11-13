@@ -67,6 +67,18 @@ import {
   formatRexMarkdownReport,
 } from './lib/doctor.mjs';
 import { scanPrQueue } from './lib/sync.mjs';
+import { AutoReviewScheduler } from './lib/scheduler.mjs';
+import {
+  getReviewArtifact,
+  readSharedFindingsState,
+  recordSharedFindingAction,
+  mergeCollaborativeAndLocalFindingState,
+  pullSharedStore,
+  pushSharedStore,
+  hydrateLocalStateFromSharedStore,
+  resolveGithubActor,
+  buildGithubExecEnv,
+} from './lib/store.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -591,11 +603,12 @@ function warmOpenPrCachesInBackground(prs, cfg) {
 
 const _findingsFileCache = new Map();
 
-export function buildStateResponse() {
+export function buildStateResponse(schedulerInstance = null) {
   const { cfg, reviewsDir, archiveDir, cacheDir, stateFile, uiStateFile } = getPaths();
   const projectsDir = getProjectsDir(cfg);
   const state = readJsonSafe(stateFile, { prs: {} });
   const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
+  const sharedFindings = readSharedFindingsState(cfg).findings || {};
   const prsMap = state.prs || {};
   const jobs = getAgentJobs();
   const teamMembersMap = loadTeamMembersMap(cacheDir, cfg.githubOrg);
@@ -631,8 +644,12 @@ export function buildStateResponse() {
         findingsCount = parsed.length;
         for (const f of parsed) {
           const cid = `${key}::${f.id}`;
-          if (uiState.comments?.[cid]?.posted) postedCount++;
-          if (uiState.comments?.[cid]?.dismissed) dismissedCount++;
+          const merged = mergeCollaborativeAndLocalFindingState({
+            sharedEntry: sharedFindings[cid],
+            localEntry: uiState.comments?.[cid],
+          });
+          if (merged.posted) postedCount++;
+          if (merged.dismissed) dismissedCount++;
         }
       } catch {
         // ignore read error
@@ -653,7 +670,9 @@ export function buildStateResponse() {
     const ciStatus = normalizeCiState(pr.ciState);
     const wtPath = getWorktreePath(projectsDir, pr.repo, pr.number);
     const worktreeMounted = fs.existsSync(wtPath);
-    const runningJob = jobs.find((j) => j.prKey === key && j.status === 'running') || null;
+    const runningJob =
+      jobs.find((j) => j.prKey === key && (j.status === 'running' || j.status === 'queued')) ||
+      null;
     const lastFailedJob =
       jobs.find((j) => j.prKey === key && j.status === 'failed') || null;
 
@@ -735,6 +754,7 @@ export function buildStateResponse() {
     uiState,
     config: cfg,
     jobs,
+    scheduler: schedulerInstance ? schedulerInstance.getStatus() : null,
     version: getAppVersion(),
     neverSynced: !fs.existsSync(stateFile),
   };
@@ -765,7 +785,7 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-export function createHubServer() {
+export function createHubServer(options = {}) {
   try {
     ensureConfigBootstrapped();
   } catch {
@@ -774,10 +794,14 @@ export function createHubServer() {
   try {
     const initialCfg = loadConfig();
     syncCombinedReferenceFiles(initialCfg.teamProfile);
+    hydrateLocalStateFromSharedStore(initialCfg);
   } catch {
     // ignore startup sync error
   }
-  return http.createServer(async (req, res) => {
+
+  const scheduler = options.scheduler || new AutoReviewScheduler(options.schedulerOptions || {});
+
+  const server = http.createServer(async (req, res) => {
     try {
       const urlObj = new URL(req.url, 'http://localhost');
       const pathname = urlObj.pathname;
@@ -785,13 +809,29 @@ export function createHubServer() {
       const projectsDir = getProjectsDir(cfg);
 
       if (req.method === 'GET' && pathname === '/api/state') {
-        const statePayload = buildStateResponse();
+        const statePayload = buildStateResponse(scheduler);
         warmOpenPrCachesInBackground(statePayload.prs, cfg);
         return sendJson(res, 200, statePayload);
       }
 
+      if (req.method === 'GET' && pathname === '/api/scheduler/status') {
+        return sendJson(res, 200, scheduler.getStatus());
+      }
+
+      if (req.method === 'POST' && pathname === '/api/scheduler/run-now') {
+        const cycle = await scheduler.runSyncCycle({ manual: true });
+        return sendJson(res, 200, {
+          ...cycle,
+          state: buildStateResponse(scheduler),
+        });
+      }
+
       if (req.method === 'GET' && pathname === '/api/config') {
-        return sendJson(res, 200, { config: cfg, version: getAppVersion() });
+        return sendJson(res, 200, {
+          config: cfg,
+          scheduler: scheduler.getStatus(),
+          version: getAppVersion(),
+        });
       }
 
       if (req.method === 'GET' && pathname === '/api/models') {
@@ -841,10 +881,15 @@ export function createHubServer() {
         const updated = saveConfig(body);
         try {
           syncCombinedReferenceFiles(updated.teamProfile);
+          hydrateLocalStateFromSharedStore(updated);
         } catch {
           // ignore
         }
-        return sendJson(res, 200, { ok: true, config: updated });
+        if (updated.sharedStoreRepo) {
+          pullSharedStore(updated).catch(() => {});
+        }
+        const schedulerStatus = scheduler.reconfigure();
+        return sendJson(res, 200, { ok: true, config: updated, scheduler: schedulerStatus });
       }
 
       if (req.method === 'GET' && pathname === '/api/doctor') {
@@ -976,11 +1021,13 @@ export function createHubServer() {
       if (req.method === 'GET' && pathname === '/api/review') {
         const file = urlObj.searchParams.get('file') || '';
         const prKey = urlObj.searchParams.get('key') || '';
+        const shaParam = urlObj.searchParams.get('sha') || '';
         if (file && (file.includes('..') || file.includes('/'))) {
           return sendJson(res, 400, { error: 'Invalid review file name' });
         }
 
         const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
+        const sharedFindings = readSharedFindingsState(cfg).findings || {};
         const manualRaw = Array.isArray(uiState.manualComments?.[prKey])
           ? uiState.manualComments[prKey]
           : [];
@@ -990,9 +1037,11 @@ export function createHubServer() {
             ...m,
             isManual: true,
             posted: Boolean(saved.posted ?? m.posted),
+            postedBy: saved.postedBy || m.postedBy || null,
             postedAt: saved.postedAt || m.postedAt || null,
             postedUrl: saved.postedUrl || m.postedUrl || null,
             dismissed: Boolean(saved.dismissed ?? m.dismissed),
+            dismissedBy: saved.dismissedBy || m.dismissedBy || null,
             dismissReason: saved.dismissReason || m.dismissReason || null,
             customComment: saved.customComment ?? m.customComment ?? m.comment,
           };
@@ -1004,7 +1053,28 @@ export function createHubServer() {
           fullPath = path.join(archiveDir, file);
           archived = true;
         }
-        if (!file || !fs.existsSync(fullPath)) {
+
+        let markdown = '';
+        let reviewMetadata = null;
+        if (file && fs.existsSync(fullPath)) {
+          markdown = fs.readFileSync(fullPath, 'utf8');
+        } else if (prKey && prKey.includes('#')) {
+          const [prRepo, prNumStr] = prKey.split('#');
+          const sharedArtifact = getReviewArtifact({
+            cfg,
+            repo: prRepo,
+            number: Number(prNumStr),
+            headSha: shaParam,
+            teamProfile: cfg.teamProfile,
+            fallbackFile: file,
+          });
+          if (sharedArtifact?.markdown) {
+            markdown = sharedArtifact.markdown;
+            reviewMetadata = sharedArtifact.metadata || null;
+          }
+        }
+
+        if (!markdown) {
           if (manualFindings.length > 0) {
             return sendJson(res, 200, {
               file: file || null,
@@ -1016,27 +1086,26 @@ export function createHubServer() {
           return sendJson(res, 404, { error: 'Review file not found' });
         }
 
-        const markdown = fs.readFileSync(fullPath, 'utf8');
         const rawFindings = parseFindingsFromMarkdown(markdown);
 
         const aiFindings = rawFindings.map((f) => {
           const cid = `${prKey}::${f.id}`;
-          const saved = uiState.comments?.[cid] || {};
+          const mergedState = mergeCollaborativeAndLocalFindingState({
+            sharedEntry: sharedFindings[cid],
+            localEntry: uiState.comments?.[cid],
+            defaultComment: f.comment,
+          });
           return {
             ...f,
             cid,
-            posted: Boolean(saved.posted),
-            postedAt: saved.postedAt || null,
-            postedUrl: saved.postedUrl || null,
-            dismissed: Boolean(saved.dismissed),
-            dismissReason: saved.dismissReason || null,
-            customComment: saved.customComment ?? f.comment,
+            ...mergedState,
           };
         });
 
         return sendJson(res, 200, {
           file,
           archived,
+          metadata: reviewMetadata,
           markdown,
           findings: [...aiFindings, ...manualFindings],
         });
@@ -1055,24 +1124,38 @@ export function createHubServer() {
 
         const files = await fetchPrDiffFiles(repo, number, sha);
         const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
+        const sharedFindings = readSharedFindingsState(cfg).findings || {};
         let resolvedFindings = [];
 
         if (reviewFile && !reviewFile.includes('..')) {
           let fullPath = path.join(reviewsDir, reviewFile);
           if (!fs.existsSync(fullPath)) fullPath = path.join(archiveDir, reviewFile);
-          if (fs.existsSync(fullPath)) {
-            const md = fs.readFileSync(fullPath, 'utf8');
+          let md = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf8') : '';
+          if (!md) {
+            const sharedArt = getReviewArtifact({
+              cfg,
+              repo,
+              number: Number(number),
+              headSha: sha !== 'latest' ? sha : '',
+              teamProfile: cfg.teamProfile,
+              fallbackFile: reviewFile,
+            });
+            if (sharedArt?.markdown) md = sharedArt.markdown;
+          }
+          if (md) {
             resolvedFindings = parseFindingsFromMarkdown(md).map((f) => {
               const cid = `${prKey}::${f.id}`;
-              const saved = uiState.comments?.[cid] || {};
+              const mergedState = mergeCollaborativeAndLocalFindingState({
+                sharedEntry: sharedFindings[cid],
+                localEntry: uiState.comments?.[cid],
+                defaultComment: f.comment,
+              });
               const resolution = resolveFindingAgainstDiff(f, files);
               return {
                 ...f,
                 ...resolution,
                 cid,
-                posted: Boolean(saved.posted),
-                dismissed: Boolean(saved.dismissed),
-                customComment: saved.customComment ?? f.comment,
+                ...mergedState,
               };
             });
           }
@@ -1381,17 +1464,35 @@ export function createHubServer() {
         if (!pr || !pr.repo || !pr.number) {
           return sendJson(res, 400, { error: 'PR not found or missing repo/number' });
         }
-        const job = triggerPrReview({ cfg, pr });
-        return sendJson(res, 200, { ok: true, job });
+        const scope = body.scope === 'personal' ? 'personal' : 'shared';
+        const force = body.force !== undefined ? Boolean(body.force) : true;
+        const enq = scheduler.enqueuePrReview(pr, {
+          priority: true,
+          scope,
+          force,
+        });
+        return sendJson(res, 200, {
+          ok: true,
+          skipped: Boolean(enq.skipped),
+          reason: enq.reason || null,
+          deduplicated: Boolean(enq.deduplicated),
+          job: enq.job,
+          scheduler: scheduler.getStatus(),
+        });
       }
 
       if (req.method === 'POST' && pathname === '/api/agent/review-all-pending') {
-        const state = buildStateResponse();
-        const pending = state.prs.filter(
-          (p) => !p.isArchived && (p.syncStatus === 'NEEDS_REVIEW' || p.syncStatus === 'NEEDS_UPDATE')
-        );
-        const startedJobs = pending.map((pr) => triggerPrReview({ cfg, pr }));
-        return sendJson(res, 200, { ok: true, count: startedJobs.length, jobs: startedJobs });
+        const body = await readRequestBody(req).catch(() => ({}));
+        const { enqueuedJobs, skippedCount } = scheduler.enqueuePendingFromLocalState({
+          force: Boolean(body.force),
+        });
+        return sendJson(res, 200, {
+          ok: true,
+          count: enqueuedJobs.length,
+          skippedCount,
+          jobs: enqueuedJobs,
+          scheduler: scheduler.getStatus(),
+        });
       }
 
       if (req.method === 'GET' && pathname === '/api/agent/chat') {
@@ -1434,10 +1535,11 @@ export function createHubServer() {
 
       if (req.method === 'POST' && pathname === '/api/agent/dismiss') {
         const body = await readRequestBody(req);
-        const { repo, number, finding, reason = '' } = body;
+        const { repo, number, finding, reason = '', scope = 'team' } = body;
         if (!repo || !number || !finding) {
           return sendJson(res, 400, { error: 'Missing repo, number, or finding' });
         }
+        const actor = resolveGithubActor(req, cfg);
         const state = readJsonSafe(stateFile, { prs: {} });
         const pr = state.prs?.[`${repo}#${number}`] || { repo, number };
         const result = dismissFindingAsFalsePositive({
@@ -1445,6 +1547,8 @@ export function createHubServer() {
           pr,
           finding,
           reason,
+          scope,
+          actor: actor.login,
           uiStateFile,
         });
         return sendJson(res, 200, result);
@@ -1563,20 +1667,68 @@ export function createHubServer() {
         const { cid, posted, dismissed, dismissReason, customComment, postedUrl } = body;
         if (!cid) return sendJson(res, 400, { error: 'Missing cid' });
 
+        const actor = resolveGithubActor(req, cfg);
+        const nowIso = new Date().toISOString();
+
         uiState.comments[cid] = {
           ...(uiState.comments[cid] || {}),
-          ...(typeof posted === 'boolean' ? { posted, postedAt: posted ? new Date().toISOString() : null } : {}),
-          ...(typeof dismissed === 'boolean' ? { dismissed } : {}),
+          ...(typeof posted === 'boolean'
+            ? {
+                posted,
+                postedBy: posted ? actor.login : null,
+                postedAt: posted ? nowIso : null,
+              }
+            : {}),
+          ...(typeof dismissed === 'boolean'
+            ? {
+                dismissed,
+                dismissedBy: dismissed ? actor.login : null,
+                dismissedAt: dismissed ? nowIso : null,
+              }
+            : {}),
           ...(typeof dismissReason === 'string' ? { dismissReason } : {}),
           ...(typeof customComment === 'string' ? { customComment } : {}),
           ...(postedUrl ? { postedUrl } : {}),
         };
 
         writeJsonSafe(uiStateFile, uiState);
+
+        // Share collaborative posted / dismissed status across teammates (never customComment)
+        if (!cid.includes('::#M')) {
+          let sharedChanged = false;
+          if (typeof posted === 'boolean') {
+            recordSharedFindingAction({
+              cfg,
+              cid,
+              action: posted ? 'posted' : 'unposted',
+              actor: actor.login,
+              url: postedUrl || '',
+            });
+            sharedChanged = true;
+          }
+          if (typeof dismissed === 'boolean') {
+            recordSharedFindingAction({
+              cfg,
+              cid,
+              action: dismissed ? 'dismissed' : 'undismissed',
+              actor: actor.login,
+              reason: dismissReason || '',
+            });
+            sharedChanged = true;
+          }
+          if (sharedChanged && cfg.sharedStoreRepo) {
+            pushSharedStore(
+              cfg,
+              `chore(ReviewHub): N/A - Update finding state ${cid} by ${actor.login}`
+            ).catch(() => {});
+          }
+        }
+
         return sendJson(res, 200, { ok: true, entry: uiState.comments[cid] });
       }
 
       if (req.method === 'POST' && pathname === '/api/sync') {
+        await pullSharedStore(cfg).catch(() => {});
         const defaultSyncScript = path.join(SKILL_ROOT_DIR, 'scripts', 'sync-queue.sh');
         let scanResult;
         if (
@@ -1592,10 +1744,16 @@ export function createHubServer() {
         } else {
           scanResult = await scanPrQueue(cfg);
         }
+        hydrateLocalStateFromSharedStore(cfg);
+        let autoEnqueued = 0;
+        if (cfg.hubRole === 'worker' && cfg.autoReviewEnabled) {
+          autoEnqueued = scheduler.enqueuePendingFromLocalState({ force: false }).enqueuedJobs.length;
+        }
         return sendJson(res, 200, {
           ok: true,
           scanResult,
-          state: buildStateResponse(),
+          autoEnqueued,
+          state: buildStateResponse(scheduler),
         });
       }
 
@@ -1619,6 +1777,8 @@ export function createHubServer() {
           return sendJson(res, 400, { error: 'Missing repo, number, or commentBody' });
         }
 
+        const actor = resolveGithubActor(req, cfg);
+        const ghExecEnv = buildGithubExecEnv(actor);
         let resultData = null;
 
         if (mode === 'inline' && filePath && headSha) {
@@ -1646,14 +1806,18 @@ export function createHubServer() {
             };
             const payload = JSON.stringify(payloadObj);
 
-            const proc = execFile('gh', [
-              'api',
-              `repos/${cfg.githubOrg}/${repo}/pulls/${number}/comments`,
-              '--method',
-              'POST',
-              '--input',
-              '-',
-            ]);
+            const proc = execFile(
+              'gh',
+              [
+                'api',
+                `repos/${cfg.githubOrg}/${repo}/pulls/${number}/comments`,
+                '--method',
+                'POST',
+                '--input',
+                '-',
+              ],
+              { env: ghExecEnv }
+            );
             proc.stdin.write(payload);
             proc.stdin.end();
 
@@ -1672,14 +1836,18 @@ export function createHubServer() {
           }
         } else {
           const payload = JSON.stringify({ body: commentBody });
-          const proc = execFile('gh', [
-            'api',
-            `repos/${cfg.githubOrg}/${repo}/issues/${number}/comments`,
-            '--method',
-            'POST',
-            '--input',
-            '-',
-          ]);
+          const proc = execFile(
+            'gh',
+            [
+              'api',
+              `repos/${cfg.githubOrg}/${repo}/issues/${number}/comments`,
+              '--method',
+              'POST',
+              '--input',
+              '-',
+            ],
+            { env: ghExecEnv }
+          );
           proc.stdin.write(payload);
           proc.stdin.end();
 
@@ -1699,15 +1867,32 @@ export function createHubServer() {
           uiState.comments[cid] = {
             ...(uiState.comments[cid] || {}),
             posted: true,
+            postedBy: actor.login,
             postedAt: new Date().toISOString(),
             postedUrl: resultData?.html_url || null,
             customComment: commentBody,
           };
           writeJsonSafe(uiStateFile, uiState);
+
+          if (!cid.includes('::#M')) {
+            recordSharedFindingAction({
+              cfg,
+              cid,
+              action: 'posted',
+              actor: actor.login,
+              url: resultData?.html_url || '',
+            });
+            if (cfg.sharedStoreRepo) {
+              pushSharedStore(
+                cfg,
+                `chore(ReviewHub): N/A - Mark ${cid} posted by ${actor.login}`
+              ).catch(() => {});
+            }
+          }
         }
 
         invalidatePrOverviewCache(repo, number);
-        return sendJson(res, 200, { ok: true, githubResponse: resultData });
+        return sendJson(res, 200, { ok: true, postedBy: actor.login, githubResponse: resultData });
       }
 
       // Explicit User Action: Submit a GitHub Review (APPROVE, COMMENT, REQUEST_CHANGES, or PENDING draft)
@@ -1719,6 +1904,8 @@ export function createHubServer() {
           return sendJson(res, 400, { error: 'Missing repo or number' });
         }
 
+        const actor = resolveGithubActor(req, cfg);
+        const ghExecEnv = buildGithubExecEnv(actor);
         const reviewComments = [];
         const fallbackGeneralBodies = [];
 
@@ -1759,14 +1946,18 @@ export function createHubServer() {
           ...(reviewComments.length > 0 ? { comments: reviewComments } : {}),
         };
 
-        const proc = execFile('gh', [
-          'api',
-          `repos/${cfg.githubOrg}/${repo}/pulls/${number}/reviews`,
-          '--method',
-          'POST',
-          '--input',
-          '-',
-        ]);
+        const proc = execFile(
+          'gh',
+          [
+            'api',
+            `repos/${cfg.githubOrg}/${repo}/pulls/${number}/reviews`,
+            '--method',
+            'POST',
+            '--input',
+            '-',
+          ],
+          { env: ghExecEnv }
+        );
         proc.stdin.write(JSON.stringify(reviewPayload));
         proc.stdin.end();
 
@@ -1783,22 +1974,40 @@ export function createHubServer() {
         if (Array.isArray(inlineComments) && inlineComments.length > 0) {
           const uiState = readJsonSafe(uiStateFile, { comments: {} });
           if (!uiState.comments) uiState.comments = {};
+          let sharedMarked = false;
           for (const item of inlineComments) {
             if (item.cid) {
               uiState.comments[item.cid] = {
                 ...(uiState.comments[item.cid] || {}),
                 posted: true,
+                postedBy: actor.login,
                 postedAt: new Date().toISOString(),
                 postedUrl: resultData?.html_url || null,
                 customComment: item.body,
               };
+              if (!item.cid.includes('::#M')) {
+                recordSharedFindingAction({
+                  cfg,
+                  cid: item.cid,
+                  action: 'posted',
+                  actor: actor.login,
+                  url: resultData?.html_url || '',
+                });
+                sharedMarked = true;
+              }
             }
           }
           writeJsonSafe(uiStateFile, uiState);
+          if (sharedMarked && cfg.sharedStoreRepo) {
+            pushSharedStore(
+              cfg,
+              `chore(ReviewHub): N/A - Mark batch review comments posted by ${actor.login}`
+            ).catch(() => {});
+          }
         }
 
         invalidatePrOverviewCache(repo, number);
-        return sendJson(res, 200, { ok: true, githubResponse: resultData });
+        return sendJson(res, 200, { ok: true, postedBy: actor.login, githubResponse: resultData });
       }
 
       if (req.method === 'GET' && pathname === '/api/github/overview') {
@@ -1819,6 +2028,7 @@ export function createHubServer() {
         if (!repo || !number || !threadId || !commentBody) {
           return sendJson(res, 400, { error: 'Missing repo, number, threadId, or commentBody' });
         }
+        const actor = resolveGithubActor(req, cfg);
         if (customOverviewHandlerForTests) {
           const mockRes = await customOverviewHandlerForTests({
             action: 'reply',
@@ -1828,6 +2038,7 @@ export function createHubServer() {
             threadId,
             body: commentBody,
             commentBody,
+            actor: actor.login,
           });
           invalidatePrOverviewCache(repo, number);
           return sendJson(res, 200, mockRes);
@@ -1850,16 +2061,20 @@ export function createHubServer() {
             }
           }
         `;
-        const { stdout } = await execFileAsync('gh', [
-          'api',
-          'graphql',
-          '-f',
-          `query=${mutation}`,
-          '-F',
-          `threadId=${threadId}`,
-          '-F',
-          `body=${commentBody.trim()}`,
-        ]);
+        const { stdout } = await execFileAsync(
+          'gh',
+          [
+            'api',
+            'graphql',
+            '-f',
+            `query=${mutation}`,
+            '-F',
+            `threadId=${threadId}`,
+            '-F',
+            `body=${commentBody.trim()}`,
+          ],
+          { env: buildGithubExecEnv(actor) }
+        );
         const parsed = JSON.parse(stdout);
         const rawComment = parsed?.data?.addPullRequestReviewThreadReply?.comment;
         invalidatePrOverviewCache(repo, number);
@@ -1888,6 +2103,7 @@ export function createHubServer() {
         if (!repo || !number || !threadId) {
           return sendJson(res, 400, { error: 'Missing repo, number, or threadId' });
         }
+        const actor = resolveGithubActor(req, cfg);
         if (customOverviewHandlerForTests) {
           const mockRes = await customOverviewHandlerForTests({
             action: 'resolve',
@@ -1896,6 +2112,7 @@ export function createHubServer() {
             number,
             threadId,
             resolve: Boolean(resolve),
+            actor: actor.login,
           });
           invalidatePrOverviewCache(repo, number);
           return sendJson(res, 200, mockRes);
@@ -1912,14 +2129,18 @@ export function createHubServer() {
             }
           }
         `;
-        const { stdout } = await execFileAsync('gh', [
-          'api',
-          'graphql',
-          '-f',
-          `query=${mutation}`,
-          '-F',
-          `threadId=${threadId}`,
-        ]);
+        const { stdout } = await execFileAsync(
+          'gh',
+          [
+            'api',
+            'graphql',
+            '-f',
+            `query=${mutation}`,
+            '-F',
+            `threadId=${threadId}`,
+          ],
+          { env: buildGithubExecEnv(actor) }
+        );
         const parsed = JSON.parse(stdout);
         const updatedThread = parsed?.data?.[mutationField]?.thread;
         invalidatePrOverviewCache(repo, number);
@@ -1958,6 +2179,19 @@ export function createHubServer() {
       sendJson(res, 500, { error: err.message || String(err) });
     }
   });
+
+  server.scheduler = scheduler;
+  server.on('close', () => {
+    scheduler.stop();
+  });
+
+  if (options.enableScheduler) {
+    scheduler.start({
+      runImmediately: options.runSchedulerImmediately !== false,
+    });
+  }
+
+  return server;
 }
 
 const isDirectEntry = (() => {
@@ -1972,7 +2206,7 @@ const isDirectEntry = (() => {
 if (isDirectEntry) {
   const bootCfg = ensureConfigBootstrapped();
   const PORT = Number(process.env.PORT || bootCfg.port || 4242);
-  const server = createHubServer();
+  const server = createHubServer({ enableScheduler: true });
   server.listen(PORT, '127.0.0.1', () => {
     const url = `http://localhost:${PORT}`;
     console.log('');
@@ -1981,8 +2215,12 @@ if (isDirectEntry) {
     console.log('============================================================');
     console.log(`  • GitHub User   : @${bootCfg.githubUser || 'auto'} (${bootCfg.githubOrg || 'ubitransports'})`);
     console.log(`  • Team Profile  : ${bootCfg.teamProfile || 'popcorn-back'}`);
+    console.log(`  • Hub Role      : ${bootCfg.hubRole || 'worker'} (Auto-review: ${bootCfg.autoReviewEnabled ? `every ${bootCfg.autoSyncIntervalSec || 300}s` : 'paused'})`);
     console.log(`  • AI Agent CLI  : ${bootCfg.agentCli || 'agy'}`);
     console.log(`  • Reviews Cache : ${bootCfg.reviewsDir}`);
+    if (bootCfg.sharedStoreRepo) {
+      console.log(`  • Shared Store  : ${bootCfg.sharedStoreRepo} (${bootCfg.sharedStoreBranch || 'reviews-store'})`);
+    }
     console.log('============================================================');
     console.log('');
     if (process.env.NO_OPEN !== '1' && process.env.NODE_ENV !== 'test') {

@@ -620,14 +620,55 @@ function isActionablePr(pr) {
 let jobPollTimer = null;
 const notifiedJobIds = new Set();
 
+function isJobActive(j) {
+  return Boolean(j && (j.status === 'running' || j.status === 'queued'));
+}
+
+function renderSchedulerStatusBadge() {
+  const badgeEl = document.getElementById('schedulerStatusBadge');
+  if (!badgeEl) return;
+  const sched = state.scheduler;
+  const cfg = state.config || {};
+  const role = sched?.hubRole || cfg.hubRole || 'worker';
+  const autoEnabled = sched ? sched.autoReviewEnabled : cfg.autoReviewEnabled !== false;
+  const intervalMin = Math.max(1, Math.round((sched?.autoSyncIntervalSec || cfg.autoSyncIntervalSec || 300) / 60));
+
+  if (sched?.activeJob) {
+    const qSuffix = sched.queueLength > 0 ? ` (+${sched.queueLength} queued)` : '';
+    badgeEl.textContent = `Worker: Reviewing ${sched.activeJob.prKey}${qSuffix}`;
+    badgeEl.title = `${sched.activeJob.phase || 'Running review…'} — Click to configure`;
+    return;
+  }
+  if (sched?.syncInFlight) {
+    badgeEl.textContent = role === 'reader' ? 'Reader: Syncing…' : 'Worker: Syncing…';
+    badgeEl.title = 'Synchronizing PR queue and shared review artifacts…';
+    return;
+  }
+  if (role === 'reader') {
+    badgeEl.textContent = cfg.sharedStoreRepo ? 'Reader Mode (Shared Git)' : 'Reader Mode';
+    badgeEl.title = 'Consumes shared reviews without running background AI jobs. Click to configure.';
+    return;
+  }
+  if (!autoEnabled) {
+    badgeEl.textContent = 'Worker: Auto-Review Paused';
+    badgeEl.title = 'Automatic background reviews are paused. Click to enable in Settings.';
+    return;
+  }
+  const qSuffix = sched?.queueLength > 0 ? ` · ${sched.queueLength} queued` : '';
+  badgeEl.textContent = `Worker: Auto (${intervalMin}m)${qSuffix}`;
+  badgeEl.title = `Dedicated Worker active — checks & reviews non-Draft PRs every ${intervalMin} min.${sched?.lastSyncAt ? ` Last sync: ${sched.lastSyncAt}` : ''}`;
+}
+
 function scheduleJobPollingIfNeeded() {
-  const hasRunning = (state.jobs || []).some((j) => j.status === 'running');
+  const hasRunning =
+    (state.jobs || []).some((j) => isJobActive(j)) || Boolean(state.scheduler?.syncInFlight);
   if (hasRunning && !jobPollTimer) {
     jobPollTimer = setInterval(async () => {
       await loadState(true);
-      const stillRunning = (state.jobs || []).some((j) => j.status === 'running');
+      const stillRunning =
+        (state.jobs || []).some((j) => isJobActive(j)) || Boolean(state.scheduler?.syncInFlight);
       for (const j of state.jobs || []) {
-        if (j.status !== 'running' && j.id && !notifiedJobIds.has(j.id)) {
+        if (!isJobActive(j) && j.id && !notifiedJobIds.has(j.id)) {
           notifiedJobIds.add(j.id);
           if (j.status === 'failed') {
             showToast(
@@ -650,6 +691,12 @@ function scheduleJobPollingIfNeeded() {
   }
 }
 
+setInterval(() => {
+  if (typeof document !== 'undefined' && !document.hidden && !jobPollTimer) {
+    loadState(true).catch(() => {});
+  }
+}, 30000);
+
 async function loadState(preserveSelection = true) {
   const res = await fetch('/api/state');
   const data = await res.json();
@@ -657,12 +704,14 @@ async function loadState(preserveSelection = true) {
   state.uiState = data.uiState || {};
   state.config = data.config || {};
   state.jobs = data.jobs || [];
+  state.scheduler = data.scheduler || null;
   state.appVersion = data.version || '1.1.0';
 
   const versionBadgeEl = document.getElementById('appVersionBadge');
   if (versionBadgeEl) {
     versionBadgeEl.textContent = `v${state.appVersion}`;
   }
+  renderSchedulerStatusBadge();
 
   const subtitleEl = document.getElementById('brandSubtitle');
   if (subtitleEl && state.config.githubUser) {
@@ -2587,7 +2636,7 @@ function renderFindingsTab() {
               <span class="finding-id">${escapeHtml(f.id)}</span>
               ${f.category ? `<span class="finding-cat-pill">${formatInlineCodeHtml(f.category)}</span>` : ''}
               <span class="finding-title">${formatInlineCodeHtml(f.title)}</span>
-              ${f.dismissed ? `<span class="badge">FALSE POSITIVE</span>` : ''}
+              ${f.dismissed ? `<span class="badge">FALSE POSITIVE${f.dismissedBy ? ` · @${escapeHtml(f.dismissedBy)}` : ''}</span>` : ''}
             </div>
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
               ${
@@ -2597,7 +2646,7 @@ function renderFindingsTab() {
               }
               <label class="checkbox-label">
                 <input type="checkbox" class="finding-posted-cb" data-cid="${escapeHtml(f.cid)}" ${f.posted ? 'checked' : ''} />
-                <span>Posted</span>
+                <span>Posted${f.posted && f.postedBy ? ` (@${escapeHtml(f.postedBy)})` : ''}</span>
               </label>
             </div>
           </div>
@@ -4715,17 +4764,22 @@ if (syncChannel) {
 // =============================================================================
 // Manual Review Trigger, Agent Q&A & Mode 2 Debrief
 // =============================================================================
-async function triggerManualReviewForKey(prKey) {
+async function triggerManualReviewForKey(prKey, { scope = 'shared', force = true } = {}) {
   if (!prKey) return;
   try {
     const res = await fetch('/api/agent/review', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key: prKey }),
+      body: JSON.stringify({ key: prKey, scope, force }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Unable to start review');
-    showToast(`AI review started for ${prKey}...`);
+    if (data.skipped) {
+      showToast(`Shared review already up to date for ${prKey}.`);
+    } else {
+      const label = scope === 'personal' ? 'Personal (.local) AI pass' : 'Shared AI review';
+      showToast(`${label} prioritized in worker queue for ${prKey}…`);
+    }
     await loadState(true);
   } catch (err) {
     showToast(`Error: ${err.message}`, 4500);
@@ -4733,7 +4787,11 @@ async function triggerManualReviewForKey(prKey) {
 }
 
 document.getElementById('triggerReviewBtn')?.addEventListener('click', () => {
-  if (state.selectedPrKey) triggerManualReviewForKey(state.selectedPrKey);
+  if (state.selectedPrKey) triggerManualReviewForKey(state.selectedPrKey, { scope: 'shared', force: true });
+});
+
+document.getElementById('triggerPersonalReviewBtn')?.addEventListener('click', () => {
+  if (state.selectedPrKey) triggerManualReviewForKey(state.selectedPrKey, { scope: 'personal', force: true });
 });
 
 document.getElementById('reviewAllPendingBtn')?.addEventListener('click', async () => {
@@ -4741,7 +4799,8 @@ document.getElementById('reviewAllPendingBtn')?.addEventListener('click', async 
     const res = await fetch('/api/agent/review-all-pending', { method: 'POST' });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Batch launch error');
-    showToast(`${data.count || 0} AI review(s) started in background.`);
+    const skippedSuffix = data.skippedCount ? ` (${data.skippedCount} already reviewed)` : '';
+    showToast(`${data.count || 0} non-Draft PR(s) queued sequentially in worker${skippedSuffix}.`);
     await loadState(true);
   } catch (err) {
     showToast(`Error: ${err.message}`, 4500);
@@ -5604,6 +5663,38 @@ async function openSettingsModal() {
           <input type="text" id="cfgJiraPrefixes" class="search-input" value="${escapeHtml((cfg.jiraPrefixes || ['PRD', 'HYB', 'WAN', 'POP', 'OPS', 'SEC']).join(', '))}" />
         </div>
       </div>
+      <div style="border-top:1px solid var(--border-color);padding-top:10px;margin-top:2px;display:flex;flex-direction:column;gap:8px;">
+        <strong style="font-size:0.84rem;">Shared Review Hub &amp; Auto-Review Worker (Write-Once, Read-Many)</strong>
+        <div style="display:grid;grid-template-columns:1.2fr 0.8fr 1fr;gap:10px;align-items:end;">
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px;">Node Role:</label>
+            <select id="cfgHubRole" class="search-input">
+              <option value="worker" ${(cfg.hubRole || 'worker') === 'worker' ? 'selected' : ''}>Dedicated Worker (Sync &amp; Auto-Review)</option>
+              <option value="reader" ${cfg.hubRole === 'reader' ? 'selected' : ''}>Reader Only (Consume Shared Reviews)</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px;">Sync Interval (sec):</label>
+            <input type="number" id="cfgAutoSyncIntervalSec" class="search-input" min="30" step="30" value="${Number(cfg.autoSyncIntervalSec || 300)}" />
+          </div>
+          <div style="padding-bottom:6px;">
+            <label class="checkbox-label">
+              <input type="checkbox" id="cfgAutoReviewEnabled" ${cfg.autoReviewEnabled !== false ? 'checked' : ''} />
+              <span>Enable background auto-review (non-Draft PRs)</span>
+            </label>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1.5fr 0.8fr;gap:10px;">
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px;">Shared Store Git Repo (optional, e.g. owner/repo or local path):</label>
+            <input type="text" id="cfgSharedStoreRepo" class="search-input" value="${escapeHtml(cfg.sharedStoreRepo || '')}" placeholder="e.g. ubitransports/pr-review-store (leave empty for local-only)" />
+          </div>
+          <div>
+            <label style="display:block;font-weight:500;margin-bottom:4px;">Shared Store Branch:</label>
+            <input type="text" id="cfgSharedStoreBranch" class="search-input" value="${escapeHtml(cfg.sharedStoreBranch || 'reviews-store')}" placeholder="reviews-store" />
+          </div>
+        </div>
+      </div>
       <div style="border-top:1px solid var(--border-color);padding-top:10px;margin-top:4px;">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
           <strong style="font-size:0.84rem;">System Health Check (Environment Doctor)</strong>
@@ -5756,6 +5847,15 @@ async function openSettingsModal() {
       .value.split(',')
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean);
+    const hubRole = document.getElementById('cfgHubRole')?.value === 'reader' ? 'reader' : 'worker';
+    const autoReviewEnabled = Boolean(document.getElementById('cfgAutoReviewEnabled')?.checked);
+    const autoSyncIntervalSec = Math.max(
+      30,
+      Number(document.getElementById('cfgAutoSyncIntervalSec')?.value) || 300
+    );
+    const sharedStoreRepo = document.getElementById('cfgSharedStoreRepo')?.value.trim() || '';
+    const sharedStoreBranch =
+      document.getElementById('cfgSharedStoreBranch')?.value.trim() || 'reviews-store';
 
     confirmBtn.disabled = true;
     try {
@@ -5774,12 +5874,18 @@ async function openSettingsModal() {
           reviewsDir,
           jiraBaseUrl,
           jiraPrefixes,
+          hubRole,
+          autoReviewEnabled,
+          autoSyncIntervalSec,
+          sharedStoreRepo,
+          sharedStoreBranch,
           onboardingCompleted: true,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Error saving settings');
       state.config = data.config;
+      if (data.scheduler) state.scheduler = data.scheduler;
       modal.classList.add('hidden');
       await loadState(true);
       await loadRules();
@@ -5794,6 +5900,7 @@ async function openSettingsModal() {
 }
 
 document.getElementById('settingsBtn')?.addEventListener('click', openSettingsModal);
+document.getElementById('schedulerStatusBadge')?.addEventListener('click', openSettingsModal);
 
 async function openDoctorModal() {
   const modal = document.getElementById('githubModal');

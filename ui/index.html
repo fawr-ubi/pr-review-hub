@@ -21,6 +21,7 @@
             <div style="display:flex;align-items:baseline;gap:10px;min-width:0;flex-wrap:wrap;">
               <h1>PR Review Hub</h1>
               <span id="appVersionBadge" class="badge badge-mono" style="font-size:0.7rem;">v1.1.0</span>
+              <span id="schedulerStatusBadge" class="badge badge-mono" style="font-size:0.7rem;cursor:pointer;" title="Auto-Review Worker &amp; Shared Hub status (click to open Settings)">Worker: Ready</span>
               <button id="appUpdateBtn" class="btn btn-primary btn-xs hidden" title="Pull latest PR Review Hub update from GitHub">
                 ⬆ Update Available
               </button>
@@ -136,9 +137,12 @@
           </div>
 
           <div class="pr-topbar-actions">
-            <button id="triggerReviewBtn" class="btn btn-secondary btn-sm" title="Run or re-run AI review now (shortcut: r)">
+            <button id="triggerReviewBtn" class="btn btn-secondary btn-sm" title="Run or re-run shared AI review now (shortcut: r)">
               <span id="reviewJobSpinner" class="spinner hidden"></span>
               <span id="triggerReviewLabel">Run Review (r)</span>
+            </button>
+            <button id="triggerPersonalReviewBtn" class="btn btn-ghost btn-sm" title="Run a personal local pass including your .local.md rules without overwriting shared Hub artifacts">
+              Personal Pass (.local)
             </button>
             <button id="toggleSplitViewBtn" class="btn btn-secondary btn-sm" title="Side-by-side Report + Code mode (shortcut: s)">
               Split (s)
@@ -351,7 +355,7 @@
   <!-- Toast notification -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script type="module" src="/app.js?v=20261112-2"></script>
+  <script type="module" src="/app.js?v=20261113-1"></script>
 
   <!-- Debug Console Drawer -->
   <div id="debugConsoleDrawer" style="position:fixed;bottom:0;left:0;right:0;height:40vh;background:var(--bg-surface);border-top:1px solid var(--border-color);z-index:10000;display:flex;flex-direction:column;transform:translateY(100%);transition:transform 0.2s ease-out;box-shadow:0 -5px 15px rgba(0,0,0,0.1);">
