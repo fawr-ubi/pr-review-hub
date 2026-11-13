@@ -178,7 +178,7 @@ async function _runCliPromptInternal({
   cwd,
   agentCli = 'agy',
   approvalMode = 'yolo',
-  timeoutMs = 240000,
+  timeoutMs = 420000,
   fastChatMode = false,
   includeDirs = [],
   onStreamUpdate = null,
@@ -646,7 +646,7 @@ export function triggerPrReview({ cfg, pr }) {
         cwd: repoPath,
         agentCli: cfg.agentCli || 'agy',
         approvalMode: 'yolo',
-        timeoutMs: 120000,
+        timeoutMs: 420000,
         includeDirs: [SKILL_ROOT, cfg.reviewsDir, repoPath],
         model: cfg.model || '',
         onStreamUpdate: ({ phase }) => {
