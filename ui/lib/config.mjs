@@ -303,6 +303,46 @@ export function ensureSkillSymlinks() {
   return results;
 }
 
+const DEFAULT_DOMAIN_AGENTS_CONFIG = {
+  security: { enabled: true, weight: 25 },
+  product: { enabled: true, weight: 20 },
+  quality: { enabled: true, weight: 25 },
+  performance: { enabled: true, weight: 15 },
+  testing: { enabled: true, weight: 15 },
+};
+
+function normalizeDomainAgentsField(rawAgents, fallback = DEFAULT_DOMAIN_AGENTS_CONFIG) {
+  const out = {};
+  for (const [id, def] of Object.entries(DEFAULT_DOMAIN_AGENTS_CONFIG)) {
+    const base = fallback?.[id] || def;
+    const incoming = rawAgents && typeof rawAgents === 'object' ? rawAgents[id] : null;
+    if (incoming && typeof incoming === 'object') {
+      const w = Number(incoming.weight);
+      out[id] = {
+        enabled: incoming.enabled !== undefined ? Boolean(incoming.enabled) : Boolean(base.enabled),
+        weight: Number.isFinite(w) && w >= 0 && w <= 100 ? Math.round(w) : base.weight,
+      };
+    } else {
+      out[id] = { enabled: Boolean(base.enabled), weight: base.weight };
+    }
+  }
+  return out;
+}
+
+function detectLocalWanreviewRepo(projectsDir = '') {
+  if (process.env.REVIEW_HUB_WANREVIEW_DIR) {
+    return expandHome(process.env.REVIEW_HUB_WANREVIEW_DIR);
+  }
+  const candidates = [
+    projectsDir ? path.join(projectsDir, 'wanreview') : '',
+    path.join(os.homedir(), '.config', 'pr-review-hub', 'wanreview'),
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, 'rules'))) return dir;
+  }
+  return '';
+}
+
 export function getDefaultConfig() {
   const defaultProjectsDir = detectLocalProjectsDir();
   const defaultReviewsDir =
@@ -316,6 +356,8 @@ export function getDefaultConfig() {
     agentCli: detectInstalledAgentCli(),
     projectsDir: defaultProjectsDir,
     reviewsDir: defaultReviewsDir,
+    wanreviewRepoPath: detectLocalWanreviewRepo(defaultProjectsDir),
+    domainAgents: { ...DEFAULT_DOMAIN_AGENTS_CONFIG },
     jiraBaseUrl: 'https://ubitransport.atlassian.net/browse',
     jiraPrefixes: ['PRD', 'HYB', 'WAN', 'POP', 'OPS', 'SEC', 'SUP', 'DEV'],
     syncScript: path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh'),
@@ -396,6 +438,10 @@ export function loadConfig(customConfigFile = '') {
       delete merged.model;
       merged.projectsDir = expandHome(merged.projectsDir || defaults.projectsDir);
       merged.reviewsDir = expandHome(merged.reviewsDir || defaults.reviewsDir);
+      merged.wanreviewRepoPath = expandHome(
+        merged.wanreviewRepoPath ?? defaults.wanreviewRepoPath ?? ''
+      );
+      merged.domainAgents = normalizeDomainAgentsField(saved.domainAgents, defaults.domainAgents);
       return merged;
     }
   } catch {
@@ -414,6 +460,10 @@ export function saveConfig(partialConfig, customConfigFile = '') {
   const updated = {
     ...rawUpdated,
     ...normalizeSharedHubFields(rawUpdated, current),
+    domainAgents: normalizeDomainAgentsField(
+      partialConfig?.domainAgents ?? current.domainAgents,
+      current.domainAgents
+    ),
   };
   delete updated.model;
   if (typeof updated.githubTeams === 'string') {
@@ -430,6 +480,9 @@ export function saveConfig(partialConfig, customConfigFile = '') {
   }
   if (updated.projectsDir) updated.projectsDir = expandHome(updated.projectsDir);
   if (updated.reviewsDir) updated.reviewsDir = expandHome(updated.reviewsDir);
+  if (updated.wanreviewRepoPath) {
+    updated.wanreviewRepoPath = expandHome(String(updated.wanreviewRepoPath).trim());
+  }
 
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
   fs.writeFileSync(configFile, JSON.stringify(updated, null, 2) + '\n', 'utf8');

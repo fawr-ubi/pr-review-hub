@@ -59,7 +59,25 @@ import {
   decideCandidateRule,
   approveAllCandidateRules,
   syncCombinedReferenceFiles,
+  buildRulesLookupMap,
 } from './lib/rules.mjs';
+import {
+  loadDomainAgentCatalog,
+  normalizeDomainId,
+  normalizeDomainAgentsConfig,
+  inferDomainForFinding,
+  computeBoundedScorecard,
+  parseScorecardBlockFromMarkdown,
+} from './lib/scoring.mjs';
+import {
+  resolveProductContextForPr,
+  saveManualProductContextNote,
+  getManualProductContextNote,
+} from './lib/jira.mjs';
+import {
+  mapHubTeamToWanreview,
+  exportRulesToWanreviewDirectory,
+} from './lib/wanreview.mjs';
 import { bootstrapTeamCandidateRules } from './lib/onboarding.mjs';
 import {
   runDoctor,
@@ -1018,7 +1036,10 @@ export function createHubServer(options = {}) {
         let reviewMetadata = null;
         if (file && fs.existsSync(fullPath)) {
           markdown = fs.readFileSync(fullPath, 'utf8');
-        } else if (prKey && prKey.includes('#')) {
+          const sidecarMetaPath = fullPath.replace(/\.md$/i, '.meta.json');
+          reviewMetadata = readJsonSafe(sidecarMetaPath, null);
+        }
+        if ((!markdown || !reviewMetadata) && prKey && prKey.includes('#')) {
           const [prRepo, prNumStr] = prKey.split('#');
           const sharedArtifact = getReviewArtifact({
             cfg,
@@ -1028,8 +1049,10 @@ export function createHubServer(options = {}) {
             teamProfile: cfg.teamProfile,
             fallbackFile: file,
           });
-          if (sharedArtifact?.markdown) {
+          if (!markdown && sharedArtifact?.markdown) {
             markdown = sharedArtifact.markdown;
+          }
+          if (!reviewMetadata && sharedArtifact?.metadata) {
             reviewMetadata = sharedArtifact.metadata || null;
           }
         }
@@ -1040,6 +1063,8 @@ export function createHubServer(options = {}) {
               file: file || null,
               archived: false,
               markdown: '',
+              scorecard: null,
+              productContext: null,
               findings: manualFindings,
             });
           }
@@ -1057,15 +1082,45 @@ export function createHubServer(options = {}) {
           });
           return {
             ...f,
+            domain: inferDomainForFinding(f),
             cid,
             ...mergedState,
           };
         });
 
+        const parsedMdScorecard = parseScorecardBlockFromMarkdown(markdown);
+        const storedScorecard = reviewMetadata?.scorecard || parsedMdScorecard || null;
+        const rulesLookup = buildRulesLookupMap(cfg.teamProfile);
+        const liveScorecard = computeBoundedScorecard({
+          rawDomains: storedScorecard?.domains || {},
+          findings: aiFindings,
+          agentsConfig: cfg.domainAgents,
+          rulesById: rulesLookup,
+          previousScorecard: storedScorecard,
+        });
+
+        let productContextMeta = reviewMetadata?.productContext || null;
+        if (prKey && prKey.includes('#')) {
+          const [prRepo, prNumStr] = prKey.split('#');
+          const liveNote = getManualProductContextNote({
+            cfg,
+            repo: prRepo,
+            number: Number(prNumStr),
+          });
+          if (liveNote || productContextMeta) {
+            productContextMeta = {
+              ...(productContextMeta || {}),
+              manualNote: liveNote,
+            };
+          }
+        }
+
         return sendJson(res, 200, {
           file,
           archived,
           metadata: reviewMetadata,
+          scorecard: liveScorecard,
+          productContext: productContextMeta,
           markdown,
           findings: [...aiFindings, ...manualFindings],
         });
@@ -1444,11 +1499,16 @@ export function createHubServer(options = {}) {
           return sendJson(res, 400, { error: 'PR not found or missing repo/number' });
         }
         const scope = body.scope === 'personal' ? 'personal' : 'shared';
+        const domain = body.domain ? normalizeDomainId(body.domain) || '' : '';
+        if (body.domain && !domain) {
+          return sendJson(res, 400, { error: `Unknown domain agent "${body.domain}"` });
+        }
         const force = body.force !== undefined ? Boolean(body.force) : true;
         const enq = scheduler.enqueuePrReview(pr, {
           priority: true,
           scope,
           force,
+          domain,
         });
         return sendJson(res, 200, {
           ok: true,
@@ -1531,6 +1591,148 @@ export function createHubServer(options = {}) {
           uiStateFile,
         });
         return sendJson(res, 200, result);
+      }
+
+      // =========================================================================
+      // Multi-Domain Scoring Agents, Product/Jira Context & wanreview Export
+      // =========================================================================
+      if (req.method === 'GET' && pathname === '/api/agents') {
+        const teamParam = urlObj.searchParams.get('teamProfile') || cfg.teamProfile || '';
+        const catalog = loadDomainAgentCatalog();
+        const agentsConfig = normalizeDomainAgentsConfig(cfg.domainAgents);
+        const rulesState = listAllRules(teamParam);
+        const allRules = [
+          ...(rulesState.wanreviewRules || []),
+          ...(rulesState.commonRules || []),
+          ...(rulesState.teamRules || []),
+          ...(rulesState.dnaRules || []),
+          ...(rulesState.candidateRules || []),
+        ];
+        const agents = catalog.map((agent) => {
+          const boundRules = allRules.filter((r) => r.domain === agent.id);
+          return {
+            ...agent,
+            enabled: Boolean(agentsConfig[agent.id]?.enabled ?? true),
+            weight: Number(agentsConfig[agent.id]?.weight ?? agent.defaultWeight),
+            boundRulesCount: boundRules.length,
+            boundRules: boundRules.map((r) => ({
+              id: r.id,
+              wanreviewId: r.wanreviewId || null,
+              title: r.title,
+              layer: r.layer || 'team',
+              source: r.source,
+              status: r.status || 'enforced',
+              severity: r.severity || 'medium',
+              locked: Boolean(r.locked),
+            })),
+          };
+        });
+        return sendJson(res, 200, {
+          agents,
+          domainAgents: agentsConfig,
+          wanreview: rulesState.wanreview,
+          wanreviewMapping: mapHubTeamToWanreview(rulesState.activeTeamProfile?.id || teamParam),
+        });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/agents/config') {
+        const reqBody = await readRequestBody(req);
+        const partial = {};
+        if (reqBody.domainAgents && typeof reqBody.domainAgents === 'object') {
+          partial.domainAgents = normalizeDomainAgentsConfig(reqBody.domainAgents);
+        }
+        if (reqBody.wanreviewRepoPath !== undefined) {
+          partial.wanreviewRepoPath = String(reqBody.wanreviewRepoPath || '').trim();
+        }
+        const updatedCfg = saveConfig(partial);
+        return sendJson(res, 200, {
+          ok: true,
+          domainAgents: updatedCfg.domainAgents,
+          wanreviewRepoPath: updatedCfg.wanreviewRepoPath,
+          config: updatedCfg,
+        });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/pr/product-context') {
+        const repo = urlObj.searchParams.get('repo') || '';
+        const number = Number(urlObj.searchParams.get('number'));
+        const forceRefresh = urlObj.searchParams.get('refresh') === '1';
+        if (!repo || !number) {
+          return sendJson(res, 400, { error: 'Missing repo or number' });
+        }
+        const state = readJsonSafe(stateFile, { prs: {} });
+        const pr = state.prs?.[`${repo}#${number}`] || { repo, number };
+        const ctx = await resolveProductContextForPr({
+          cfg,
+          pr,
+          forceRefresh,
+        });
+        return sendJson(res, 200, { ok: true, productContext: ctx });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/pr/product-context') {
+        const reqBody = await readRequestBody(req);
+        const { repo = '', number = 0, note = '' } = reqBody;
+        if (!repo || !number) {
+          return sendJson(res, 400, { error: 'Missing repo or number' });
+        }
+        const saved = saveManualProductContextNote({
+          cfg,
+          repo,
+          number: Number(number),
+          note,
+        });
+        const state = readJsonSafe(stateFile, { prs: {} });
+        const pr = state.prs?.[`${repo}#${Number(number)}`] || { repo, number: Number(number) };
+        const ctx = await resolveProductContextForPr({ cfg, pr });
+        return sendJson(res, 200, { ok: true, saved, productContext: ctx });
+      }
+
+      if (
+        req.method === 'POST' &&
+        (pathname === '/api/wanreview/preview-export' || pathname === '/api/wanreview/export')
+      ) {
+        const reqBody = await readRequestBody(req);
+        const writeToDisk = pathname === '/api/wanreview/export';
+        const teamParam = reqBody.teamProfile || cfg.teamProfile || '';
+        const rulesState = listAllRules(teamParam);
+        const mapped = mapHubTeamToWanreview(rulesState.activeTeamProfile?.id || teamParam);
+        const pool = [
+          ...(rulesState.commonRules || []),
+          ...(rulesState.teamRules || []),
+          ...(rulesState.dnaRules || []),
+          ...(rulesState.candidateRules || []),
+        ];
+        const requestedIds = Array.isArray(reqBody.ruleIds) ? new Set(reqBody.ruleIds) : null;
+        const selectedRules = requestedIds
+          ? pool.filter((r) => requestedIds.has(r.id))
+          : pool.filter((r) => r.source === 'common' || r.source === 'team');
+
+        const targetRootDir = String(reqBody.targetRootDir || cfg.wanreviewRepoPath || '').trim();
+        if (writeToDisk && !targetRootDir) {
+          return sendJson(res, 400, {
+            error:
+              'Missing targetRootDir (provide the local path to your ubitransports/wanreview clone).',
+          });
+        }
+
+        const result = exportRulesToWanreviewDirectory({
+          rules: selectedRules,
+          targetRootDir,
+          layer: reqBody.layer || '',
+          vertical: reqBody.vertical || mapped.vertical || 'wfwp-backend',
+          team: reqBody.team || mapped.team || 'ubi-eng-popcorn',
+          statusOverride: reqBody.statusOverride || '',
+          allowPersonalPromotion: Boolean(reqBody.allowPersonalPromotion),
+          writeToDisk,
+        });
+
+        return sendJson(res, 200, {
+          ok: true,
+          wroteToDisk: writeToDisk,
+          targetRootDir: writeToDisk ? targetRootDir : targetRootDir || null,
+          ...result,
+        });
       }
 
       // =========================================================================

@@ -120,17 +120,21 @@ export class AutoReviewScheduler {
     });
   }
 
-  enqueuePrReview(pr, { priority = false, scope = 'shared', force = false } = {}) {
+  enqueuePrReview(
+    pr,
+    { priority = false, scope = 'shared', force = false, domain = '' } = {}
+  ) {
     if (!pr || !pr.repo || !pr.number) {
       throw new Error('Valid PR { repo, number } is required');
     }
     const cfg = this.loadConfigFn();
     const normalizedScope = scope === 'personal' ? 'personal' : 'shared';
+    const targetDomain = String(domain || '').trim().toLowerCase();
     const prKey = `${pr.repo}#${Number(pr.number)}`;
     const headSha = pr.headRefOid || pr.headSha || '';
-    const cooldownKey = `${prKey}:${headSha || 'HEAD'}:${normalizedScope}`;
+    const cooldownKey = `${prKey}:${headSha || 'HEAD'}:${normalizedScope}:${targetDomain || 'all'}`;
 
-    if (!priority && !force) {
+    if (!priority && !force && !targetDomain) {
       const lastFailedAt = this.failedCooldowns.get(cooldownKey);
       if (lastFailedAt && Date.now() - lastFailedAt < this.failureCooldownMs) {
         return { skipped: true, reason: 'failure_cooldown', job: null };
@@ -143,6 +147,7 @@ export class AutoReviewScheduler {
     if (
       normalizedScope === 'shared' &&
       !force &&
+      !targetDomain &&
       headSha &&
       hasReviewArtifact({
         cfg,
@@ -158,13 +163,17 @@ export class AutoReviewScheduler {
     if (
       this.activeItem &&
       this.activeItem.prKey === prKey &&
-      this.activeItem.scope === normalizedScope
+      this.activeItem.scope === normalizedScope &&
+      (this.activeItem.domain || '') === targetDomain
     ) {
       return { skipped: false, deduplicated: true, job: this.activeItem.job };
     }
 
     const existingIdx = this.queue.findIndex(
-      (q) => q.prKey === prKey && q.scope === normalizedScope
+      (q) =>
+        q.prKey === prKey &&
+        q.scope === normalizedScope &&
+        (q.domain || '') === targetDomain
     );
     if (existingIdx !== -1) {
       const existingItem = this.queue[existingIdx];
@@ -177,12 +186,13 @@ export class AutoReviewScheduler {
       return { skipped: false, deduplicated: true, job: existingItem.job };
     }
 
-    const job = createQueuedReviewJob({ pr, scope: normalizedScope });
+    const job = createQueuedReviewJob({ pr, scope: normalizedScope, domain: targetDomain });
     const queueItem = {
       prKey,
       pr,
       scope: normalizedScope,
-      force: Boolean(force),
+      domain: targetDomain,
+      force: Boolean(force || targetDomain),
       priority: Boolean(priority),
       job,
     };
@@ -264,11 +274,12 @@ export class AutoReviewScheduler {
         this._refreshQueuePositionLabels();
         const cfg = this.loadConfigFn();
         const headSha = item.pr.headRefOid || item.pr.headSha || '';
-        const cooldownKey = `${item.prKey}:${headSha || 'HEAD'}:${item.scope}`;
+        const cooldownKey = `${item.prKey}:${headSha || 'HEAD'}:${item.scope}:${item.domain || 'all'}`;
 
         if (
           item.scope === 'shared' &&
           !item.force &&
+          !item.domain &&
           headSha &&
           hasReviewArtifact({
             cfg,
@@ -290,6 +301,7 @@ export class AutoReviewScheduler {
             cfg,
             pr: item.pr,
             scope: item.scope,
+            targetDomain: item.domain || '',
             existingJob: item.job,
           });
           this.authRequired = false;

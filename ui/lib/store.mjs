@@ -134,6 +134,8 @@ export function saveReviewArtifact({
   findingsSummary = '0 findings',
   jiraKey = '—',
   reviewedBy = '',
+  scorecard = null,
+  productContext = null,
 }) {
   const effectiveCfg = cfg || loadConfig();
   const prNum = Number(number);
@@ -147,6 +149,10 @@ export function saveReviewArtifact({
   fs.mkdirSync(effectiveCfg.reviewsDir, { recursive: true });
   const reviewFileName = `review-${safeRepoSegment(repo)}-${prNum}.md`;
   const legacyReviewPath = path.join(effectiveCfg.reviewsDir, reviewFileName);
+  const legacyMetaPath = path.join(
+    effectiveCfg.reviewsDir,
+    `review-${safeRepoSegment(repo)}-${prNum}.meta.json`
+  );
   fs.writeFileSync(legacyReviewPath, cleanMd, 'utf8');
 
   let artifactPath = legacyReviewPath;
@@ -162,7 +168,10 @@ export function saveReviewArtifact({
     jiraKey: jiraKey || '—',
     reviewedBy: reviewedBy || effectiveCfg.githubUser || 'worker',
     reviewedAt: nowIso,
+    scorecard: scorecard || null,
+    productContext: productContext || null,
   };
+  writeJsonAtomic(legacyMetaPath, metadata);
 
   if (normalizedScope === 'shared') {
     const { prDir, mdPath, metaPath, latestMetaPath } = getSharedArtifactPaths({
@@ -290,9 +299,10 @@ export function getReviewArtifact({
       ? archivePath
       : null;
     if (resolved) {
+      const sidecarMetaPath = resolved.replace(/\.md$/i, '.meta.json');
       return {
         markdown: fs.readFileSync(resolved, 'utf8'),
-        metadata: null,
+        metadata: readJsonSafe(sidecarMetaPath, null),
         source: 'local',
         filePath: resolved,
       };

@@ -50,6 +50,10 @@ const state = {
   fpSections: [],
   rulesFilter: 'all',
   rulesSearch: '',
+  activeDomainFilter: null,
+  domainAgentsCatalog: [],
+  wanreviewInfo: null,
+  wanreviewMapping: null,
   // Full-Page PR Selection Queue, Modified Files Tree, and Full-Screen Focus Diff state
   prQueueFullPage: !initialUrlPrKey && !isPopoutWindow,
   prSidebarCollapsed: true,
@@ -674,18 +678,28 @@ function scheduleJobPollingIfNeeded() {
   if (hasRunning && !jobPollTimer) {
     jobPollTimer = setInterval(async () => {
       await loadState(true);
+      renderPrScorecardPanel();
       const stillRunning =
         (state.jobs || []).some((j) => isJobActive(j)) || Boolean(state.scheduler?.syncInFlight);
       for (const j of state.jobs || []) {
         if (!isJobActive(j) && j.id && !notifiedJobIds.has(j.id)) {
           notifiedJobIds.add(j.id);
+          if (j.prKey) {
+            for (const k of Object.keys(state.prReviewCache)) {
+              if (k.startsWith(`${j.prKey}::`)) delete state.prReviewCache[k];
+            }
+          }
           if (j.status === 'failed') {
             showToast(
               `AI review failed for ${j.prKey}: ${j.error || 'Unknown error'} (check Doctor for CLI status)`,
               7000
             );
           } else if (j.status === 'completed') {
-            showToast(`AI review completed for ${j.prKey}.`, 3500);
+            const domSuffix = j.domain ? ` (${j.domain} deep pass)` : '';
+            showToast(`AI review${domSuffix} completed for ${j.prKey}.`, 3500);
+            if (state.selectedPrKey && j.prKey === state.selectedPrKey) {
+              selectPr(state.selectedPrKey, false);
+            }
           }
         }
       }
@@ -1405,6 +1419,9 @@ function renderWorktreeStatusBar(pr) {
 }
 
 async function selectPr(prKey, broadcast = true) {
+  if (state.selectedPrKey !== prKey) {
+    state.activeDomainFilter = null;
+  }
   state.selectedPrKey = prKey;
   state.overviewFilter = 'all';
   state.selectedDiffFile = null;
@@ -1455,9 +1472,12 @@ async function selectPr(prKey, broadcast = true) {
     state.selectedCommentCids = new Set(
       (state.currentReview.findings || []).filter((f) => !f.posted && !f.dismissed).map((f) => f.cid)
     );
+    renderPrScorecardPanel();
     renderReportFindingsQuickBar();
     renderMarkdownReport(state.currentReview.markdown);
     renderFindingsTab();
+  } else {
+    renderPrScorecardPanel();
   }
 
   if (pr.reviewFile) {
@@ -1472,12 +1492,14 @@ async function selectPr(prKey, broadcast = true) {
       state.selectedCommentCids = new Set(
         state.currentReview.findings.filter((f) => !f.posted && !f.dismissed).map((f) => f.cid)
       );
+      renderPrScorecardPanel();
       renderReportFindingsQuickBar();
       renderMarkdownReport(state.currentReview.markdown);
       renderFindingsTab();
     } else if (state.selectedPrKey !== pr.key) {
       return;
     } else if (!state.currentReview) {
+      renderPrScorecardPanel();
       document.getElementById('reportExecutiveHeader')?.classList.add('hidden');
       document.getElementById('reportFindingsQuickBar')?.classList.add('hidden');
       document.getElementById('markdownContainer').innerHTML = `<div class="empty-state meta-text">Review file not found (${escapeHtml(pr.reviewFile)}).</div>`;
@@ -1548,8 +1570,10 @@ async function selectPr(prKey, broadcast = true) {
             .filter((f) => !f.posted && !f.dismissed)
             .map((f) => f.cid)
         );
+        renderPrScorecardPanel();
         renderFindingsTab();
       } else {
+        renderPrScorecardPanel();
         document.getElementById('findingsList').innerHTML = '';
         document.getElementById('tabFindingsCount').textContent = '0';
       }
@@ -2707,28 +2731,69 @@ function renderFindingsTab() {
   const dismissedCount = findings.filter((f) => f.dismissed).length;
   document.getElementById('commentsSummaryStats').textContent =
     `${postedCount}/${findings.length} posted` +
-    (dismissedCount > 0 ? ` · ${dismissedCount} false positive(s)` : '');
+    (dismissedCount > 0 ? ` · ${dismissedCount} false positive(s)` : '') +
+    (state.activeDomainFilter ? ` · Filtered: ${state.activeDomainFilter}` : '');
+
+  const activeFilterBanner = state.activeDomainFilter
+    ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;margin-bottom:10px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--accent, #6366f1);">
+        <div style="display:flex;align-items:center;gap:8px;font-size:12.5px;">
+          <span>Showing findings for domain agent:</span>
+          <span class="domain-pill domain-pill-${escapeHtml(state.activeDomainFilter)}">${escapeHtml(state.activeDomainFilter)}</span>
+        </div>
+        <button type="button" id="clearDomainFilterBannerBtn" class="btn btn-secondary btn-xs">Show All Domains &times;</button>
+      </div>`
+    : '';
 
   if (findings.length === 0) {
-    listEl.innerHTML = `<div class="empty-card" style="margin:32px auto;"><p>No AI comment proposals or manual drafts for this PR. Click or drag on line numbers in <strong>3. Git Diff</strong> to write a comment on one or more lines.</p></div>`;
+    listEl.innerHTML =
+      activeFilterBanner +
+      `<div class="empty-card" style="margin:32px auto;"><p>No AI comment proposals or manual drafts for this PR. Click or drag on line numbers in <strong>3. Git Diff</strong> to write a comment on one or more lines.</p></div>`;
+    document.getElementById('clearDomainFilterBannerBtn')?.addEventListener('click', () => {
+      state.activeDomainFilter = null;
+      renderPrScorecardPanel();
+      renderFindingsTab();
+    });
     return;
   }
 
-  listEl.innerHTML = findings
-    .map((f, idx) => {
-      const isSelected = state.selectedCommentCids.has(f.cid);
-      const sev = getSeverityMeta(f.severity);
-      const lineRangeLabel =
-        f.startLine && f.endLine && Number(f.endLine) > Number(f.startLine)
-          ? `:${f.startLine}-${f.endLine}`
-          : f.startLine
-          ? `:${f.startLine}`
-          : '';
-      const fullLocation = f.filePath
-        ? `${f.filePath}${lineRangeLabel}`
-        : 'General PR comment';
+  const indexedFindings = findings
+    .map((f, idx) => ({ f, idx }))
+    .filter(({ f }) => {
+      if (!state.activeDomainFilter) return true;
+      if (f.isManual) return false;
+      return (f.domain || 'quality') === state.activeDomainFilter;
+    });
 
-      return `
+  if (indexedFindings.length === 0) {
+    listEl.innerHTML =
+      activeFilterBanner +
+      `<div class="empty-card" style="margin:24px auto;"><p>No findings raised by the <strong>${escapeHtml(state.activeDomainFilter)}</strong> agent on this PR.</p></div>`;
+    document.getElementById('clearDomainFilterBannerBtn')?.addEventListener('click', () => {
+      state.activeDomainFilter = null;
+      renderPrScorecardPanel();
+      renderFindingsTab();
+    });
+    return;
+  }
+
+  listEl.innerHTML =
+    activeFilterBanner +
+    indexedFindings
+      .map(({ f, idx }) => {
+        const isSelected = state.selectedCommentCids.has(f.cid);
+        const sev = getSeverityMeta(f.severity);
+        const lineRangeLabel =
+          f.startLine && f.endLine && Number(f.endLine) > Number(f.startLine)
+            ? `:${f.startLine}-${f.endLine}`
+            : f.startLine
+            ? `:${f.startLine}`
+            : '';
+        const fullLocation = f.filePath
+          ? `${f.filePath}${lineRangeLabel}`
+          : 'General PR comment';
+        const domainId = !f.isManual ? f.domain || 'quality' : '';
+
+        return `
         <div class="finding-card ${sev.cardClass} ${f.posted ? 'posted' : ''}" data-cid="${escapeHtml(f.cid)}" data-idx="${idx}" style="${f.dismissed ? 'opacity:0.5;' : ''}">
           <div class="finding-card-header">
             <div class="finding-header-left">
@@ -2740,6 +2805,7 @@ function renderFindingsTab() {
                 title="Include in batch review submission"
               />
               <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
+              ${domainId ? `<span class="domain-pill domain-pill-${escapeHtml(domainId)}" title="Domain Agent: ${escapeHtml(domainId)}">${escapeHtml(domainId)}</span>` : ''}
               <span class="finding-id">${escapeHtml(f.id)}</span>
               ${f.category ? `<span class="finding-cat-pill">${formatInlineCodeHtml(f.category)}</span>` : ''}
               <span class="finding-title">${formatInlineCodeHtml(f.title)}</span>
@@ -2893,6 +2959,12 @@ function renderFindingsTab() {
       const f = findings[Number(btn.dataset.idx)];
       if (f) promptDismissFinding(f);
     });
+  });
+
+  document.getElementById('clearDomainFilterBannerBtn')?.addEventListener('click', () => {
+    state.activeDomainFilter = null;
+    renderPrScorecardPanel();
+    renderFindingsTab();
   });
 
   listEl.querySelectorAll('.reset-comment-btn').forEach((btn) => {
@@ -4880,23 +4952,29 @@ if (syncChannel) {
 // =============================================================================
 // Manual Review Trigger, Agent Q&A & Mode 2 Debrief
 // =============================================================================
-async function triggerManualReviewForKey(prKey, { scope = 'shared', force = true } = {}) {
+async function triggerManualReviewForKey(
+  prKey,
+  { scope = 'shared', force = true, domain = '' } = {}
+) {
   if (!prKey) return;
   try {
     const res = await fetch('/api/agent/review', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key: prKey, scope, force }),
+      body: JSON.stringify({ key: prKey, scope, force, ...(domain ? { domain } : {}) }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Unable to start review');
     if (data.skipped) {
       showToast(`Shared review already up to date for ${prKey}.`);
+    } else if (domain) {
+      showToast(`Running Deep Pass for "${domain}" agent on ${prKey}…`);
     } else {
       const label = scope === 'personal' ? 'Personal (.local) AI pass' : 'Shared AI review';
       showToast(`${label} prioritized in worker queue for ${prKey}…`);
     }
     await loadState(true);
+    renderPrScorecardPanel();
   } catch (err) {
     showToast(`Error: ${err.message}`, 4500);
   }
@@ -5218,11 +5296,16 @@ async function promptDismissFinding(finding) {
       finding.dismissed = true;
       state.selectedCommentCids.delete(finding.cid);
       modal.classList.add('hidden');
+      for (const k of Object.keys(state.prReviewCache)) {
+        if (k.startsWith(`${pr.key}::`)) delete state.prReviewCache[k];
+      }
+      await refreshActivePrScorecardSilently(pr);
+      renderPrScorecardPanel();
       renderReportFindingsQuickBar();
       renderFindingsTab();
       renderDiffTree();
       loadRules();
-      showToast(`${finding.id} added to false positives.`);
+      showToast(`${finding.id} added to false positives — Scorecard updated.`);
     } catch (err) {
       showToast(`Error: ${err.message}`, 4500);
     } finally {
@@ -6626,9 +6709,18 @@ document.getElementById('cancelModalBtn')?.addEventListener('click', () => {
 // =============================================================================
 async function loadRules() {
   try {
-    const res = await fetch('/api/rules');
+    const [res, agentsRes] = await Promise.all([
+      fetch('/api/rules'),
+      fetch('/api/agents').catch(() => null),
+    ]);
     if (!res.ok) return;
     const data = await res.json();
+    if (agentsRes && agentsRes.ok) {
+      const agentsData = await agentsRes.json();
+      state.domainAgentsCatalog = agentsData.agents || [];
+      state.wanreviewInfo = agentsData.wanreview || null;
+      state.wanreviewMapping = agentsData.wanreviewMapping || null;
+    }
     state.teamProfiles = data.teamProfiles || [];
     state.activeTeamProfile = data.activeTeamProfile || null;
     state.rules = data.rules || [];
@@ -6640,6 +6732,18 @@ async function loadRules() {
 
     const countEl = document.getElementById('tabRulesCount');
     if (countEl) countEl.textContent = String(state.rules.length + state.candidateRules.length);
+
+    const agentsCountEl = document.getElementById('rulesAgentsCount');
+    if (agentsCountEl && state.domainAgentsCatalog.length > 0) {
+      agentsCountEl.textContent = String(state.domainAgentsCatalog.length);
+    }
+
+    const wanreviewCountEl = document.getElementById('rulesWanreviewCount');
+    if (wanreviewCountEl) {
+      wanreviewCountEl.textContent = String(
+        state.rules.filter((r) => r.target === 'wanreview').length
+      );
+    }
 
     const candCountEl = document.getElementById('rulesCandidateCount');
     if (candCountEl) candCountEl.textContent = String(state.candidateRules.length);
@@ -6717,6 +6821,13 @@ function renderRulesTab() {
       }
     </div>
   `;
+
+  if (state.rulesFilter === 'agents') {
+    listEl.innerHTML = teamProfileBannerHtml + renderDomainAgentsInlineConfigHtml();
+    bindTeamProfileBannerEvents();
+    bindDomainAgentsInlineConfigEvents(listEl);
+    return;
+  }
 
   const candidateItems = (state.candidateRules || []).map((c) => ({
     ...c,
@@ -6800,7 +6911,9 @@ function renderRulesTab() {
       }
 
       const badgeLabel =
-        r.target === 'common'
+        r.target === 'wanreview'
+          ? `WANREVIEW (${String(r.layer || 'org').toUpperCase()})`
+          : r.target === 'common'
           ? 'COMMON DNA'
           : r.target === 'team'
           ? `TEAM DNA (${activeProfile.id.toUpperCase()})`
@@ -6808,7 +6921,9 @@ function renderRulesTab() {
           ? 'LOCAL DNA'
           : 'FALSE POSITIVE';
       const badgeClass =
-        r.target === 'common'
+        r.target === 'wanreview'
+          ? 'badge-pass'
+          : r.target === 'common'
           ? 'badge-severity-nit'
           : r.target === 'team'
           ? 'badge-peer'
@@ -6821,13 +6936,20 @@ function renderRulesTab() {
           <div class="rule-card-header">
             <div class="rule-card-title-group">
               <span class="badge ${badgeClass}">${escapeHtml(badgeLabel)}</span>
+              ${r.domain ? `<span class="domain-pill domain-pill-${escapeHtml(r.domain)}">${escapeHtml(r.domain)}</span>` : ''}
+              ${r.locked ? `<span class="badge badge-severity-blocker" title="Immutable locked organization rule">LOCKED</span>` : ''}
+              ${r.status && r.status !== 'enforced' ? `<span class="badge badge-mono">${escapeHtml(r.status)}</span>` : ''}
               <span class="rule-section-pill">${escapeHtml(r.section)}</span>
               <span class="rule-card-title">${escapeHtml(r.title)}</span>
             </div>
             <div style="display:flex;gap:6px;align-items:center;">
               ${r.startLine ? `<span class="meta-text">L${r.startLine}</span>` : ''}
-              <button class="btn btn-ghost btn-xs edit-rule-btn" data-idx="${idx}">Edit</button>
-              <button class="btn btn-ghost btn-xs delete-rule-btn" data-idx="${idx}">Remove</button>
+              ${
+                r.readOnly
+                  ? `<span class="meta-text" title="${escapeHtml(r.filePath || '')}">Synced from wanreview</span>`
+                  : `<button class="btn btn-ghost btn-xs edit-rule-btn" data-idx="${idx}">Edit</button>
+                     <button class="btn btn-ghost btn-xs delete-rule-btn" data-idx="${idx}">Remove</button>`
+              }
             </div>
           </div>
           <div class="rule-card-body">${escapeHtml(r.body)}</div>
@@ -7768,6 +7890,696 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault();
     openKeyboardShortcutsModal();
   }
+});
+
+// =============================================================================
+// Multi-Domain PR Scorecard, Product/Jira Context, Agent Config & wanreview Export
+// =============================================================================
+const DOMAIN_DISPLAY_ORDER = ['security', 'product', 'quality', 'performance', 'testing'];
+
+function scoreTierClassSuffix(score) {
+  if (score === null || score === undefined || !Number.isFinite(Number(score))) return 'na';
+  const n = Number(score);
+  if (n >= 90) return 'excellent';
+  if (n >= 80) return 'good';
+  if (n >= 65) return 'fair';
+  if (n >= 50) return 'warning';
+  return 'critical';
+}
+
+async function refreshActivePrScorecardSilently(pr) {
+  if (!pr || !pr.key) return;
+  try {
+    const query = pr.reviewFile
+      ? `/api/review?file=${encodeURIComponent(pr.reviewFile)}&key=${encodeURIComponent(pr.key)}`
+      : `/api/review?key=${encodeURIComponent(pr.key)}`;
+    const res = await fetch(query);
+    if (!res.ok) return;
+    const data = await res.json();
+    const cacheKey = getPrClientCacheKey(pr);
+    state.prReviewCache[cacheKey] = data;
+    if (state.selectedPrKey === pr.key) {
+      state.currentReview = data;
+    }
+  } catch {
+    // ignore transient errors
+  }
+}
+
+function renderPrScorecardPanel() {
+  const panelEl = document.getElementById('prScorecardPanel');
+  if (!panelEl) return;
+
+  const pr = state.prs.find((p) => p.key === state.selectedPrKey);
+  const scorecard = state.currentReview?.scorecard;
+
+  if (!pr || !scorecard || !scorecard.domains) {
+    panelEl.classList.add('hidden');
+    panelEl.innerHTML = '';
+    return;
+  }
+
+  panelEl.classList.remove('hidden');
+
+  const globalTierCls = scoreTierClassSuffix(scorecard.globalScore);
+  const globalScoreLabel =
+    scorecard.globalScore !== null && scorecard.globalScore !== undefined
+      ? String(scorecard.globalScore)
+      : 'N/A';
+
+  const activeJobsForPr = (state.jobs || []).filter(
+    (j) => j.prKey === pr.key && isJobActive(j)
+  );
+
+  const productMeta = state.currentReview?.productContext || null;
+  const productChipLabel = (() => {
+    if (productMeta?.manualNote) {
+      return productMeta.jiraKey ? `Jira ${productMeta.jiraKey} + Note` : 'Manual Note';
+    }
+    if (productMeta?.jiraAvailable && productMeta?.jiraKey) {
+      return `Jira ${productMeta.jiraKey}`;
+    }
+    if (pr.jiraKey && pr.jiraKey !== '—') {
+      return `${pr.jiraKey} · Context`;
+    }
+    return '+ Context';
+  })();
+
+  const domainCardsHtml = DOMAIN_DISPLAY_ORDER.map((domainId) => {
+    const dom = scorecard.domains[domainId];
+    if (!dom) return '';
+    const isRunningDomain = activeJobsForPr.some((j) => j.domain === domainId);
+    const isSelectedFilter = state.activeDomainFilter === domainId;
+    const hasNumericScore = dom.enabled && dom.applicable && dom.score !== null && dom.score !== undefined;
+    const domTierCls = hasNumericScore ? scoreTierClassSuffix(dom.score) : 'na';
+    const meterPct = hasNumericScore ? Math.max(4, Math.min(100, Number(dom.score))) : 0;
+    const scoreBadgeText = !dom.enabled
+      ? 'OFF'
+      : !dom.applicable || !hasNumericScore
+      ? 'N/A'
+      : `${dom.score}/100`;
+
+    const findingsLabel = !dom.enabled
+      ? 'Disabled'
+      : !dom.applicable
+      ? 'Excluded from avg'
+      : dom.findingsCount > 0
+      ? `${dom.findingsCount} finding${dom.findingsCount > 1 ? 's' : ''}`
+      : 'Clean';
+
+    const weightTag =
+      dom.enabled && dom.applicable && dom.effectiveWeightPct
+        ? `${dom.effectiveWeightPct}%`
+        : `${dom.weight ?? 0}%`;
+
+    return `
+      <div
+        class="scorecard-domain-card ${isSelectedFilter ? 'is-active-filter' : ''} ${!dom.enabled ? 'is-disabled' : !dom.applicable ? 'is-na' : ''}"
+        data-domain="${escapeHtml(domainId)}"
+        title="${escapeHtml(`${dom.title}: ${dom.summary || ''} (Click to filter findings by ${dom.shortLabel})`)}"
+      >
+        <div class="scorecard-domain-header">
+          <div class="scorecard-domain-title-wrap">
+            <span class="scorecard-domain-name">${escapeHtml(dom.shortLabel || dom.title)}</span>
+            <span class="scorecard-weight-tag" title="Normalized domain weight">${escapeHtml(weightTag)}</span>
+          </div>
+          <div class="scorecard-domain-right">
+            <span class="scorecard-domain-score scorecard-tier-${domTierCls}">${escapeHtml(scoreBadgeText)}</span>
+            <button
+              type="button"
+              class="scorecard-rerun-btn scorecard-domain-rerun-btn"
+              data-domain="${escapeHtml(domainId)}"
+              title="Run isolated Deep Pass for ${escapeHtml(dom.title)} only"
+              ${isRunningDomain ? 'disabled' : ''}
+            >${isRunningDomain ? '<span class="spinner" style="width:11px;height:11px;"></span>' : '&#8635;'}</button>
+          </div>
+        </div>
+        <div class="scorecard-meter">
+          <div class="scorecard-meter-fill tier-${domTierCls}" style="width:${meterPct}%;"></div>
+        </div>
+        <div class="scorecard-domain-summary">${escapeHtml(dom.summary || '')}</div>
+        <div class="scorecard-domain-footer">
+          <span>${escapeHtml(findingsLabel)}${dom.lastRunMode === 'deep' ? ' · Deep' : ''}</span>
+          ${
+            domainId === 'product'
+              ? `<button type="button" class="scorecard-context-chip scorecard-product-context-btn" title="Inspect Jira acceptance criteria or set manual business context for the Product agent">${escapeHtml(productChipLabel)}</button>`
+              : dom.capped
+              ? `<span style="color:var(--sev-blocker);font-weight:700;">Capped</span>`
+              : ''
+          }
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  panelEl.innerHTML = `
+    <div class="scorecard-global-card">
+      <div class="scorecard-global-top">
+        <span class="scorecard-kicker">PR Score</span>
+        <div style="display:flex;gap:4px;align-items:center;">
+          ${
+            state.activeDomainFilter
+              ? `<button type="button" id="scorecardClearDomainFilterBtn" class="btn btn-ghost btn-xs" title="Clear domain filter">${escapeHtml(state.activeDomainFilter)} &times;</button>`
+              : ''
+          }
+          <button type="button" id="scorecardConfigureAgentsBtn" class="btn btn-secondary btn-xs" title="Configure domain agents, weights, and bound rules">Agents</button>
+        </div>
+      </div>
+      <div class="scorecard-global-main">
+        <span class="scorecard-score-pill scorecard-tier-${globalTierCls}">${escapeHtml(globalScoreLabel)}${globalScoreLabel !== 'N/A' ? '<span class="scorecard-score-denom">/100</span>' : ''}</span>
+      </div>
+      ${
+        scorecard.capped && scorecard.capReason
+          ? `<div class="scorecard-cap-alert" title="Score automatically capped at 59/100 due to critical/locked violation">${escapeHtml(`Capped at 59 · ${scorecard.capReason}`)}</div>`
+          : `<div class="meta-text" style="font-size:10.5px;">${scorecard.activeDomainsCount || 0}/5 active domains</div>`
+      }
+    </div>
+    <div class="scorecard-domains-grid">
+      ${domainCardsHtml}
+    </div>
+  `;
+
+  panelEl.querySelector('#scorecardConfigureAgentsBtn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openDomainAgentsConfigModal();
+  });
+
+  panelEl.querySelector('#scorecardClearDomainFilterBtn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    state.activeDomainFilter = null;
+    renderPrScorecardPanel();
+    renderFindingsTab();
+  });
+
+  panelEl.querySelectorAll('.scorecard-domain-rerun-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const domId = btn.dataset.domain || '';
+      if (domId && state.selectedPrKey) {
+        triggerManualReviewForKey(state.selectedPrKey, {
+          scope: 'shared',
+          force: true,
+          domain: domId,
+        });
+      }
+    });
+  });
+
+  panelEl.querySelectorAll('.scorecard-product-context-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openProductContextModal(pr);
+    });
+  });
+
+  panelEl.querySelectorAll('.scorecard-domain-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      const domId = card.dataset.domain || '';
+      if (!domId) return;
+      if (state.activeDomainFilter === domId) {
+        state.activeDomainFilter = null;
+      } else {
+        state.activeDomainFilter = domId;
+        if (!state.splitMode && state.activeTab !== 'comments') {
+          switchTab('comments');
+        }
+      }
+      renderPrScorecardPanel();
+      renderFindingsTab();
+    });
+  });
+}
+
+async function openProductContextModal(pr) {
+  if (!pr) return;
+  const modal = document.getElementById('githubModal');
+  const titleEl = document.getElementById('modalTitle');
+  const bodyEl = document.getElementById('modalBody');
+  const confirmBtn = document.getElementById('confirmModalBtn');
+
+  titleEl.textContent = `Product & Scope Context — ${pr.repo}#${pr.number}`;
+  confirmBtn.textContent = 'Save Context Note';
+  bodyEl.innerHTML = `<div class="meta-text" style="padding:12px 0;">Loading Jira &amp; PR business context…</div>`;
+  modal.classList.remove('hidden');
+
+  let ctx = null;
+  try {
+    const res = await fetch(
+      `/api/pr/product-context?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}`
+    );
+    if (res.ok) {
+      const data = await res.json();
+      ctx = data.productContext || null;
+    }
+  } catch {
+    // fallback
+  }
+
+  const jiraStatusHtml = ctx?.jiraAvailable
+    ? `<div style="padding:10px 12px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--border-subtle);margin-bottom:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;">
+          <strong>Jira ${escapeHtml(ctx.jiraKey)}: ${escapeHtml(ctx.ticketSummary || '')}</strong>
+          <button type="button" id="refreshJiraContextModalBtn" class="btn btn-secondary btn-xs">Refresh Jira</button>
+        </div>
+        <div class="wanreview-preview-code" style="max-height:160px;">${escapeHtml(ctx.ticketDescription || 'No description body on Jira ticket.')}</div>
+      </div>`
+    : `<div style="padding:10px 12px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--border-subtle);margin-bottom:10px;font-size:12px;">
+        <strong>Jira Source:</strong> ${escapeHtml(ctx?.jiraKey ? `${ctx.jiraKey} (fallback to PR description — ${ctx.fallbackReason || 'acli unavailable'})` : 'No Jira key detected (using PR description + commits)')}
+      </div>`;
+
+  bodyEl.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      ${jiraStatusHtml}
+      <label style="font-weight:600;font-size:12.5px;">Manual Product / Acceptance Criteria Note (optional):</label>
+      <p class="meta-text" style="margin:0;font-size:11.5px;">
+        Injected directly into the <strong>Product &amp; Scope</strong> agent prompt when evaluating functional compliance or edge cases on this PR.
+      </p>
+      <textarea id="manualProductContextTextarea" class="finding-textarea" style="min-height:110px;" placeholder="E.g.: Must reject disabled passenger tags with 422 and emit CARD_INVALIDATION event only once...">${escapeHtml(ctx?.manualNote || '')}</textarea>
+      <div style="display:flex;justify-content:flex-end;margin-top:4px;">
+        <button type="button" id="saveAndRerunProductAgentBtn" class="btn btn-ai btn-sm">Save &amp; Re-run Product Agent</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('refreshJiraContextModalBtn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('refreshJiraContextModalBtn');
+    if (btn) btn.disabled = true;
+    await fetch(
+      `/api/pr/product-context?repo=${encodeURIComponent(pr.repo)}&number=${encodeURIComponent(pr.number)}&refresh=1`
+    ).catch(() => {});
+    openProductContextModal(pr);
+  });
+
+  const persistNote = async () => {
+    const note = document.getElementById('manualProductContextTextarea')?.value || '';
+    const res = await fetch('/api/pr/product-context', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo: pr.repo, number: pr.number, note }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to save product context');
+    }
+    await refreshActivePrScorecardSilently(pr);
+    renderPrScorecardPanel();
+  };
+
+  document.getElementById('saveAndRerunProductAgentBtn')?.addEventListener('click', async () => {
+    try {
+      await persistNote();
+      modal.classList.add('hidden');
+      await triggerManualReviewForKey(pr.key, { scope: 'shared', force: true, domain: 'product' });
+    } catch (err) {
+      showToast(`Error: ${err.message}`, 4500);
+    }
+  });
+
+  confirmBtn.onclick = async () => {
+    confirmBtn.disabled = true;
+    try {
+      await persistNote();
+      modal.classList.add('hidden');
+      showToast('Product context saved.');
+    } catch (err) {
+      showToast(`Error: ${err.message}`, 4500);
+    } finally {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Confirm';
+    }
+  };
+}
+
+function buildDomainAgentsConfigFormHtml(agents = [], wanreviewRepoPath = '') {
+  const rowsHtml = agents
+    .map((a) => {
+      const boundHtml =
+        Array.isArray(a.boundRules) && a.boundRules.length > 0
+          ? `<details style="margin-top:8px;">
+              <summary class="meta-text" style="cursor:pointer;font-weight:600;">Bound Rules (${a.boundRules.length}) — org / vertical / team / local</summary>
+              <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;padding-left:8px;border-left:2px solid var(--border-subtle);">
+                ${a.boundRules
+                  .map(
+                    (r) =>
+                      `<div style="display:flex;align-items:center;gap:6px;font-size:11.5px;flex-wrap:wrap;">
+                        <span class="badge badge-mono">${escapeHtml(r.layer || 'team')}</span>
+                        <span class="badge badge-mono">${escapeHtml(r.status || 'enforced')}</span>
+                        ${r.locked ? `<span class="badge badge-severity-blocker">LOCKED</span>` : ''}
+                        <span>${escapeHtml(r.title)}</span>
+                      </div>`
+                  )
+                  .join('')}
+              </div>
+            </details>`
+          : `<div class="meta-text" style="margin-top:6px;font-size:11px;">Evaluated using built-in ${escapeHtml(a.shortLabel)} rubric (no extra custom rules bound yet).</div>`;
+
+      return `
+        <div class="agent-config-card" data-agent-config-id="${escapeHtml(a.id)}">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <label class="checkbox-label" style="font-weight:700;">
+                <input type="checkbox" class="agent-cfg-enabled-cb" data-agent-id="${escapeHtml(a.id)}" ${a.enabled !== false ? 'checked' : ''} />
+                <span class="domain-pill domain-pill-${escapeHtml(a.id)}">${escapeHtml(a.shortLabel || a.id)}</span>
+                <span>${escapeHtml(a.title)}</span>
+              </label>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span class="meta-text" style="font-size:11.5px;">Weight:</span>
+              <input type="range" min="0" max="100" step="5" value="${Number(a.weight ?? a.defaultWeight)}" class="agent-cfg-weight-range" data-agent-id="${escapeHtml(a.id)}" style="width:110px;" />
+              <input type="number" min="0" max="100" value="${Number(a.weight ?? a.defaultWeight)}" class="search-input agent-cfg-weight-num" data-agent-id="${escapeHtml(a.id)}" style="width:62px;padding:3px 6px;text-align:right;font-family:var(--font-mono);" />
+              <span class="meta-text">%</span>
+            </div>
+          </div>
+          <div class="meta-text" style="margin-top:4px;font-size:12px;">${escapeHtml(a.summary || a.mission || '')}</div>
+          ${boundHtml}
+        </div>
+      `;
+    })
+    .join('');
+
+  return `
+    <div class="domain-agents-config-root">
+      <div class="agent-config-card" style="border-left:3px solid var(--accent);">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+          <div>
+            <strong>Shared Company Rules Clone (<code>ubitransports/wanreview</code>)</strong>
+            <div class="meta-text" style="font-size:11.5px;">Optional local clone path to auto-ingest <code>rules/org</code>, <code>rules/verticals</code>, and <code>rules/teams</code> and export surgical rule PRs.</div>
+          </div>
+        </div>
+        <input
+          type="text"
+          id="agentCfgWanreviewPathInput"
+          class="search-input"
+          style="width:100%;margin-top:8px;font-family:var(--font-mono);font-size:12px;"
+          placeholder="~/Ubitransport/projects/wanreview"
+          value="${escapeHtml(wanreviewRepoPath || '')}"
+        />
+      </div>
+      ${rowsHtml}
+    </div>
+  `;
+}
+
+function renderDomainAgentsInlineConfigHtml() {
+  const agents = state.domainAgentsCatalog || [];
+  const wanPath = state.config?.wanreviewRepoPath || '';
+  return `
+    ${buildDomainAgentsConfigFormHtml(agents, wanPath)}
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px;">
+      <button type="button" id="saveInlineDomainAgentsBtn" class="btn btn-primary btn-sm">Save Domain Agents Configuration</button>
+    </div>
+  `;
+}
+
+function collectDomainAgentsFormPayload(containerEl) {
+  const domainAgents = {};
+  containerEl.querySelectorAll('[data-agent-config-id]').forEach((card) => {
+    const id = card.dataset.agentConfigId;
+    const enabled = Boolean(card.querySelector('.agent-cfg-enabled-cb')?.checked);
+    const weight = Number(card.querySelector('.agent-cfg-weight-num')?.value ?? 15);
+    domainAgents[id] = {
+      enabled,
+      weight: Number.isFinite(weight) ? Math.max(0, Math.min(100, Math.round(weight))) : 15,
+    };
+  });
+  const wanreviewRepoPath =
+    containerEl.querySelector('#agentCfgWanreviewPathInput')?.value?.trim() || '';
+  return { domainAgents, wanreviewRepoPath };
+}
+
+function wireDomainAgentsWeightSync(containerEl) {
+  containerEl.querySelectorAll('.agent-cfg-weight-range').forEach((rangeEl) => {
+    rangeEl.addEventListener('input', () => {
+      const id = rangeEl.dataset.agentId;
+      const numEl = containerEl.querySelector(`.agent-cfg-weight-num[data-agent-id="${id}"]`);
+      if (numEl) numEl.value = rangeEl.value;
+    });
+  });
+  containerEl.querySelectorAll('.agent-cfg-weight-num').forEach((numEl) => {
+    numEl.addEventListener('input', () => {
+      const id = numEl.dataset.agentId;
+      const rangeEl = containerEl.querySelector(`.agent-cfg-weight-range[data-agent-id="${id}"]`);
+      if (rangeEl) rangeEl.value = numEl.value;
+    });
+  });
+}
+
+async function persistDomainAgentsPayload(payload) {
+  const res = await fetch('/api/agents/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to save agent configuration');
+  state.config = data.config || state.config;
+  await loadRules();
+  const pr = state.prs.find((p) => p.key === state.selectedPrKey);
+  if (pr) {
+    await refreshActivePrScorecardSilently(pr);
+    renderPrScorecardPanel();
+  }
+}
+
+function bindDomainAgentsInlineConfigEvents(containerEl) {
+  wireDomainAgentsWeightSync(containerEl);
+  containerEl.querySelector('#saveInlineDomainAgentsBtn')?.addEventListener('click', async () => {
+    try {
+      const payload = collectDomainAgentsFormPayload(containerEl);
+      await persistDomainAgentsPayload(payload);
+      showToast('Domain Agents configuration saved — Scorecard updated.');
+    } catch (err) {
+      showToast(`Error: ${err.message}`, 4500);
+    }
+  });
+}
+
+async function openDomainAgentsConfigModal() {
+  if (!state.domainAgentsCatalog || state.domainAgentsCatalog.length === 0) {
+    await loadRules();
+  }
+  const modal = document.getElementById('githubModal');
+  const titleEl = document.getElementById('modalTitle');
+  const bodyEl = document.getElementById('modalBody');
+  const confirmBtn = document.getElementById('confirmModalBtn');
+
+  titleEl.textContent = 'Configure Multi-Domain Scoring Agents';
+  confirmBtn.textContent = 'Save Agents Config';
+  bodyEl.innerHTML = buildDomainAgentsConfigFormHtml(
+    state.domainAgentsCatalog || [],
+    state.config?.wanreviewRepoPath || ''
+  );
+  wireDomainAgentsWeightSync(bodyEl);
+  modal.classList.remove('hidden');
+
+  confirmBtn.onclick = async () => {
+    confirmBtn.disabled = true;
+    try {
+      const payload = collectDomainAgentsFormPayload(bodyEl);
+      await persistDomainAgentsPayload(payload);
+      modal.classList.add('hidden');
+      showToast('Domain Agents configuration saved — Scorecard updated.');
+    } catch (err) {
+      showToast(`Error: ${err.message}`, 4500);
+    } finally {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Confirm';
+    }
+  };
+}
+
+async function openWanreviewExportModal() {
+  if (!state.rules || state.rules.length === 0) {
+    await loadRules();
+  }
+  const modal = document.getElementById('githubModal');
+  const titleEl = document.getElementById('modalTitle');
+  const bodyEl = document.getElementById('modalBody');
+  const confirmBtn = document.getElementById('confirmModalBtn');
+
+  const mapping = state.wanreviewMapping || {
+    vertical: 'wfwp-backend',
+    team: 'ubi-eng-popcorn',
+  };
+  const exportableRules = (state.rules || []).filter(
+    (r) => r.target === 'common' || r.target === 'team' || r.target === 'dna'
+  );
+
+  titleEl.textContent = 'Surgical Rule Export to ubitransports/wanreview';
+  confirmBtn.textContent = 'Write Selected .md Files to Clone';
+
+  bodyEl.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <p class="meta-text" style="margin:0;font-size:12px;">
+        Generates strictly <code>tools/resolve.py</code>-compliant atomic rule files (<code>id</code>, <code>title</code>, <code>severity</code>, <code>status</code> + <code>## Flag</code> / <code>## Accept</code>) so you can open a clean, rules-only PR on <code>ubitransports/wanreview</code> without pushing any Hub code or personal preferences.
+      </p>
+      <div style="display:grid;grid-template-columns:repeat(4, minmax(0, 1fr));gap:8px;">
+        <label style="font-size:11.5px;font-weight:600;">Target Layer
+          <select id="wanExportLayerSelect" class="search-input" style="width:100%;margin-top:4px;">
+            <option value="">Auto (Common->vertical, Team->team)</option>
+            <option value="team">team (rules/teams/...)</option>
+            <option value="vertical">vertical (rules/verticals/...)</option>
+            <option value="org">org (rules/org/...)</option>
+          </select>
+        </label>
+        <label style="font-size:11.5px;font-weight:600;">Vertical Slug
+          <input type="text" id="wanExportVerticalInput" class="search-input" style="width:100%;margin-top:4px;" value="${escapeHtml(mapping.vertical || 'wfwp-backend')}" />
+        </label>
+        <label style="font-size:11.5px;font-weight:600;">Team Slug
+          <input type="text" id="wanExportTeamInput" class="search-input" style="width:100%;margin-top:4px;" value="${escapeHtml(mapping.team || 'ubi-eng-popcorn')}" />
+        </label>
+        <label style="font-size:11.5px;font-weight:600;">Rule Status
+          <select id="wanExportStatusSelect" class="search-input" style="width:100%;margin-top:4px;">
+            <option value="proposed">proposed (safe for new PR)</option>
+            <option value="advisory">advisory</option>
+            <option value="enforced">enforced</option>
+          </select>
+        </label>
+      </div>
+      <label style="font-size:11.5px;font-weight:600;">Local <code>ubitransports/wanreview</code> Clone Directory
+        <input type="text" id="wanExportTargetDirInput" class="search-input" style="width:100%;margin-top:4px;font-family:var(--font-mono);" placeholder="~/Ubitransport/projects/wanreview" value="${escapeHtml(state.config?.wanreviewRepoPath || '')}" />
+      </label>
+      <div style="max-height:165px;overflow:auto;border:1px solid var(--border-subtle);border-radius:6px;padding:8px;background:var(--bg-elevated);display:flex;flex-direction:column;gap:5px;">
+        ${exportableRules
+          .map((r) => {
+            const isShared = r.target === 'common' || r.target === 'team';
+            return `
+              <label class="checkbox-label" style="font-size:12px;justify-content:space-between;gap:8px;">
+                <span style="display:flex;align-items:center;gap:6px;min-width:0;">
+                  <input type="checkbox" class="wan-export-rule-cb" value="${escapeHtml(r.id)}" data-personal="${isShared ? '0' : '1'}" ${isShared ? 'checked' : ''} />
+                  <span class="badge badge-mono">${escapeHtml(r.target === 'common' ? 'vertical' : r.target === 'team' ? 'team' : 'local-only')}</span>
+                  ${r.domain ? `<span class="domain-pill domain-pill-${escapeHtml(r.domain)}">${escapeHtml(r.domain)}</span>` : ''}
+                  <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(r.title)}</span>
+                </span>
+              </label>
+            `;
+          })
+          .join('')}
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <span id="wanExportPreviewMeta" class="meta-text" style="font-size:11.5px;">Generating preview…</span>
+        <button type="button" id="wanCopyPreviewBtn" class="btn btn-secondary btn-xs">Copy Generated Markdown</button>
+      </div>
+      <div id="wanExportPreviewBox" class="wanreview-preview-code">Loading resolve.py preview…</div>
+    </div>
+  `;
+
+  modal.classList.remove('hidden');
+  let latestPreviewFiles = [];
+
+  const refreshPreview = async () => {
+    const selectedCbs = [...bodyEl.querySelectorAll('.wan-export-rule-cb:checked')];
+    const ruleIds = selectedCbs.map((cb) => cb.value);
+    const hasPersonalChecked = selectedCbs.some((cb) => cb.dataset.personal === '1');
+    const payload = {
+      ruleIds,
+      layer: bodyEl.querySelector('#wanExportLayerSelect')?.value || '',
+      vertical: bodyEl.querySelector('#wanExportVerticalInput')?.value?.trim() || 'wfwp-backend',
+      team: bodyEl.querySelector('#wanExportTeamInput')?.value?.trim() || 'ubi-eng-popcorn',
+      statusOverride: bodyEl.querySelector('#wanExportStatusSelect')?.value || 'proposed',
+      allowPersonalPromotion: hasPersonalChecked,
+    };
+    const metaEl = bodyEl.querySelector('#wanExportPreviewMeta');
+    const previewEl = bodyEl.querySelector('#wanExportPreviewBox');
+    if (ruleIds.length === 0) {
+      latestPreviewFiles = [];
+      if (metaEl) metaEl.textContent = '0 rules selected.';
+      if (previewEl) previewEl.textContent = 'Select at least one rule above to preview.';
+      return;
+    }
+    try {
+      const res = await fetch('/api/wanreview/preview-export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Preview failed');
+      latestPreviewFiles = data.files || [];
+      if (metaEl) {
+        metaEl.textContent = `✓ ${latestPreviewFiles.length} atomic file(s) validated against tools/resolve.py schema`;
+      }
+      if (previewEl) {
+        previewEl.textContent = latestPreviewFiles
+          .map((f) => `# FILE: ${f.relativePath}\n${f.markdown}`)
+          .join('\n\n');
+      }
+    } catch (err) {
+      if (metaEl) metaEl.textContent = `Validation error: ${err.message}`;
+    }
+  };
+
+  bodyEl
+    .querySelectorAll(
+      '#wanExportLayerSelect, #wanExportVerticalInput, #wanExportTeamInput, #wanExportStatusSelect, .wan-export-rule-cb'
+    )
+    .forEach((el) => {
+      el.addEventListener('change', refreshPreview);
+      if (el.tagName === 'INPUT' && el.type === 'text') {
+        el.addEventListener('input', refreshPreview);
+      }
+    });
+
+  bodyEl.querySelector('#wanCopyPreviewBtn')?.addEventListener('click', async () => {
+    const text = latestPreviewFiles
+      .map((f) => `# FILE: ${f.relativePath}\n${f.markdown}`)
+      .join('\n\n');
+    if (text) {
+      await navigator.clipboard?.writeText(text).catch(() => {});
+      showToast(`Copied ${latestPreviewFiles.length} wanreview Markdown file(s).`);
+    }
+  });
+
+  await refreshPreview();
+
+  confirmBtn.onclick = async () => {
+    const selectedCbs = [...bodyEl.querySelectorAll('.wan-export-rule-cb:checked')];
+    const ruleIds = selectedCbs.map((cb) => cb.value);
+    const hasPersonalChecked = selectedCbs.some((cb) => cb.dataset.personal === '1');
+    const targetRootDir = bodyEl.querySelector('#wanExportTargetDirInput')?.value?.trim() || '';
+    if (!targetRootDir) {
+      showToast('Enter your local ubitransports/wanreview clone path first (or use Copy Markdown).', 4500);
+      return;
+    }
+    confirmBtn.disabled = true;
+    try {
+      const res = await fetch('/api/wanreview/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ruleIds,
+          targetRootDir,
+          layer: bodyEl.querySelector('#wanExportLayerSelect')?.value || '',
+          vertical: bodyEl.querySelector('#wanExportVerticalInput')?.value?.trim() || 'wfwp-backend',
+          team: bodyEl.querySelector('#wanExportTeamInput')?.value?.trim() || 'ubi-eng-popcorn',
+          statusOverride: bodyEl.querySelector('#wanExportStatusSelect')?.value || 'proposed',
+          allowPersonalPromotion: hasPersonalChecked,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Export failed');
+      await fetch('/api/agents/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wanreviewRepoPath: targetRootDir }),
+      }).catch(() => {});
+      modal.classList.add('hidden');
+      await loadRules();
+      showToast(
+        `Wrote ${(data.files || []).length} resolve.py-compliant rule file(s) into ${targetRootDir}.`,
+        4500
+      );
+    } catch (err) {
+      showToast(`Export error: ${err.message}`, 4500);
+    } finally {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Confirm';
+    }
+  };
+}
+
+document.getElementById('exportWanreviewBtn')?.addEventListener('click', () => {
+  openWanreviewExportModal();
 });
 
 // Initial load

@@ -3961,3 +3961,361 @@ tr.comment-range-selected td.blob-line-num {
   font-style: italic;
 }
 
+/* ==========================================================================
+   Multi-Domain PR Scorecard, Domain Agent Cards & wanreview Surgical Export
+   ========================================================================== */
+.pr-scorecard-panel {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  padding: 10px 18px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.pr-scorecard-panel.hidden {
+  display: none !important;
+}
+
+.scorecard-global-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-width: 176px;
+  max-width: 210px;
+  padding: 9px 12px;
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.scorecard-global-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.scorecard-kicker {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.scorecard-global-main {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.scorecard-score-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  font-weight: 800;
+  font-size: 19px;
+  font-family: var(--font-mono);
+  line-height: 1;
+  border: 1px solid transparent;
+}
+
+.scorecard-tier-excellent {
+  background: rgba(16, 185, 129, 0.16);
+  color: #10b981;
+  border-color: rgba(16, 185, 129, 0.38);
+}
+
+.scorecard-tier-good {
+  background: rgba(59, 130, 246, 0.16);
+  color: #3b82f6;
+  border-color: rgba(59, 130, 246, 0.38);
+}
+
+.scorecard-tier-fair {
+  background: rgba(245, 158, 11, 0.16);
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.38);
+}
+
+.scorecard-tier-warning {
+  background: rgba(249, 115, 22, 0.18);
+  color: #f97316;
+  border-color: rgba(249, 115, 22, 0.42);
+}
+
+.scorecard-tier-critical {
+  background: rgba(239, 68, 68, 0.18);
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.45);
+}
+
+.scorecard-tier-na {
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--text-muted);
+  border-color: var(--border-subtle);
+}
+
+[data-theme="light"] .scorecard-tier-excellent {
+  color: #047857;
+  background: rgba(16, 185, 129, 0.14);
+}
+[data-theme="light"] .scorecard-tier-good {
+  color: #1d4ed8;
+  background: rgba(59, 130, 246, 0.13);
+}
+[data-theme="light"] .scorecard-tier-fair {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.15);
+}
+[data-theme="light"] .scorecard-tier-warning {
+  color: #c2410c;
+  background: rgba(249, 115, 22, 0.15);
+}
+[data-theme="light"] .scorecard-tier-critical {
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.14);
+}
+
+.scorecard-score-num {
+  font-size: 20px;
+  font-weight: 800;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  line-height: 1;
+}
+
+.scorecard-score-denom {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.scorecard-cap-alert {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--sev-blocker, #ef4444);
+  background: var(--sev-blocker-bg, rgba(239, 68, 68, 0.1));
+  border: 1px solid var(--sev-blocker-border, rgba(239, 68, 68, 0.32));
+  border-radius: 5px;
+  padding: 3px 6px;
+  line-height: 1.25;
+}
+
+.scorecard-domains-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(175px, 1fr));
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.scorecard-domain-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 5px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease, transform 0.1s ease;
+  min-width: 0;
+}
+
+.scorecard-domain-card:hover {
+  border-color: var(--accent, #6366f1);
+}
+
+.scorecard-domain-card.is-active-filter {
+  border-color: var(--accent, #6366f1);
+  box-shadow: 0 0 0 1px var(--accent, #6366f1);
+}
+
+.scorecard-domain-card.is-disabled,
+.scorecard-domain-card.is-na {
+  opacity: 0.72;
+}
+
+.scorecard-domain-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.scorecard-domain-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.scorecard-domain-name {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.scorecard-weight-tag {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+}
+
+.scorecard-domain-right {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.scorecard-domain-score {
+  font-size: 12.5px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  padding: 2px 6px;
+  border-radius: 5px;
+}
+
+.scorecard-rerun-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 5px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.scorecard-rerun-btn:hover:not(:disabled) {
+  border-color: var(--accent, #6366f1);
+  color: var(--text-primary);
+}
+
+.scorecard-meter {
+  height: 4px;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.scorecard-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.scorecard-meter-fill.tier-excellent { background: #10b981; }
+.scorecard-meter-fill.tier-good { background: #3b82f6; }
+.scorecard-meter-fill.tier-fair { background: #f59e0b; }
+.scorecard-meter-fill.tier-warning { background: #f97316; }
+.scorecard-meter-fill.tier-critical { background: #ef4444; }
+
+.scorecard-domain-summary {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.3;
+}
+
+.scorecard-domain-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.scorecard-context-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.scorecard-context-chip:hover {
+  border-color: var(--accent, #6366f1);
+  color: var(--text-primary);
+}
+
+.domain-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+}
+
+.domain-pill-security { color: #ef4444; border-color: rgba(239, 68, 68, 0.35); }
+.domain-pill-product { color: #8b5cf6; border-color: rgba(139, 92, 246, 0.35); }
+.domain-pill-quality { color: #3b82f6; border-color: rgba(59, 130, 246, 0.35); }
+.domain-pill-performance { color: #f59e0b; border-color: rgba(245, 158, 11, 0.35); }
+.domain-pill-testing { color: #10b981; border-color: rgba(16, 185, 129, 0.35); }
+
+[data-theme="light"] .domain-pill-security { color: #b91c1c; }
+[data-theme="light"] .domain-pill-product { color: #6d28d9; }
+[data-theme="light"] .domain-pill-quality { color: #1d4ed8; }
+[data-theme="light"] .domain-pill-performance { color: #b45309; }
+[data-theme="light"] .domain-pill-testing { color: #047857; }
+
+.agent-config-card {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-elevated);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.wanreview-preview-code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 10px 12px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+

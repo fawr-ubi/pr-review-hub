@@ -193,15 +193,35 @@ export function parseFindingsFromMarkdown(markdown, repoHint = '') {
     }
 
     const bodyCategoryMatch = rawBody.match(/^- \*\*Category:\*\*\s*(.+)$/im);
+    const bodyDomainMatch = rawBody.match(/^- \*\*Domain:\*\*\s*([a-zA-Z0-9_-]+)/im);
+    const bodyRuleMatch = rawBody.match(/^- \*\*Rule(?:\s+ID)?:\*\*\s*`?([a-zA-Z0-9_-]+)`?/im);
     const category =
       (bodyCategoryMatch ? bodyCategoryMatch[1].trim() : null) ||
       currentFinding.category ||
       null;
 
+    let explicitDomain = bodyDomainMatch ? bodyDomainMatch[1].trim().toLowerCase() : null;
+    let explicitRuleId = bodyRuleMatch ? bodyRuleMatch[1].trim() : null;
+    if (category) {
+      const catParts = category.split(/[:/·|]/).map((s) => s.trim()).filter(Boolean);
+      const firstToken = (catParts[0] || '').toLowerCase();
+      if (
+        !explicitDomain &&
+        ['security', 'product', 'quality', 'performance', 'testing'].includes(firstToken)
+      ) {
+        explicitDomain = firstToken;
+        if (!explicitRuleId && catParts[1] && /^[a-z0-9-]+$/.test(catParts[1])) {
+          explicitRuleId = catParts[1];
+        }
+      }
+    }
+
     findings.push({
       id: currentFinding.id,
       title: sanitizeFindingTitle(currentFinding.title) || currentFinding.title,
       category,
+      domain: explicitDomain || null,
+      ruleId: explicitRuleId || null,
       severity: currentFinding.severity,
       filePath: currentFinding.filePath,
       startLine: currentFinding.startLine,

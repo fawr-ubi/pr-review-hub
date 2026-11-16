@@ -38,6 +38,22 @@ import {
 } from '../lib/agent.mjs';
 import { AutoReviewScheduler } from '../lib/scheduler.mjs';
 import {
+  loadDomainAgentCatalog,
+  computeBoundedScorecard,
+  parseScorecardBlockFromMarkdown,
+} from '../lib/scoring.mjs';
+import {
+  validateWanreviewRuleMarkdown,
+  convertHubRuleToWanreview,
+  exportRulesToWanreviewDirectory,
+  loadWanreviewRulesFromRepo,
+} from '../lib/wanreview.mjs';
+import {
+  resolveProductContextForPr,
+  saveManualProductContextNote,
+  isPureTechnicalNonProductPr,
+} from '../lib/jira.mjs';
+import {
   hasReviewArtifact,
   saveReviewArtifact,
   pullSharedStore,
@@ -2195,6 +2211,484 @@ describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
       assert.ok(js.includes('Post to GitHub') && js.includes('View in Diff'), 'Finding cards must highlight Post to GitHub & View in Diff');
     } finally {
       await new Promise((r) => srv.close(r));
+    }
+  });
+});
+
+describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Export', () => {
+  test('Bounded Hybrid Scoring: loads 5 agents, handles N/A weight redistribution, respects proposed/advisory/enforced statuses, caps Blockers at 59/100, and lifts cap on Dismiss', () => {
+    const catalog = loadDomainAgentCatalog();
+    assert.deepEqual(
+      catalog.map((a) => a.id),
+      ['security', 'product', 'quality', 'performance', 'testing']
+    );
+
+    const rulesById = new Map([
+      ['tenant-isolation', { id: 'tenant-isolation', status: 'enforced', locked: true }],
+      ['style-hint', { id: 'style-hint', status: 'advisory', locked: false }],
+      ['experimental-check', { id: 'experimental-check', status: 'proposed', locked: false }],
+    ]);
+
+    const rawDomains = {
+      security: { applicable: true, rawScore: 80, summary: 'Cross-tenant query missing customer filter.' },
+      product: { applicable: false, rawScore: null, summary: 'Technical chore PR — N/A.' },
+      quality: { applicable: true, rawScore: 96, summary: 'Clean SOLID processor.' },
+      performance: { applicable: true, rawScore: 94, summary: 'Queries properly indexed.' },
+      testing: { applicable: true, rawScore: 92, summary: 'Nominal and error paths covered.' },
+    };
+
+    const findings = [
+      {
+        id: '#1',
+        domain: 'security',
+        ruleId: 'tenant-isolation',
+        severity: '🔴',
+        title: 'Missing customer filter on repository query',
+        dismissed: false,
+      },
+      {
+        id: '#2',
+        domain: 'quality',
+        ruleId: 'style-hint',
+        severity: '🟠',
+        title: 'Advisory naming suggestion',
+        dismissed: false,
+      },
+      {
+        id: '#3',
+        domain: 'testing',
+        ruleId: 'experimental-check',
+        severity: '🟠',
+        title: 'Proposed candidate rule should inflict zero penalty',
+        dismissed: false,
+      },
+    ];
+
+    const cappedCard = computeBoundedScorecard({
+      rawDomains,
+      findings,
+      rulesById,
+    });
+
+    // Product is N/A and excluded from denominator
+    assert.equal(cappedCard.domains.product.applicable, false);
+    assert.equal(cappedCard.domains.product.score, null);
+    assert.equal(cappedCard.domains.product.tier, 'na');
+    assert.equal(cappedCard.activeDomainsCount, 4);
+
+    // Proposed rule inflicts 0 penalty -> testing keeps its 92 rawScore
+    assert.equal(cappedCard.domains.testing.score, 92);
+
+    // Advisory Major inflicts 35% of 15 (~5 pts -> ceiling 95), capping 96 -> 95
+    assert.equal(cappedCard.domains.quality.score, 95);
+
+    // Locked / Blocker rule in security caps security domain at 45 and global PR score at 59/100
+    assert.equal(cappedCard.domains.security.score, 45);
+    assert.equal(cappedCard.domains.security.capped, true);
+    assert.equal(cappedCard.capped, true);
+    assert.equal(cappedCard.globalScore, 59);
+    assert.equal(cappedCard.tier, 'warning');
+
+    // Dismissing the False Positive Blocker immediately lifts both domain & global caps!
+    const afterDismiss = computeBoundedScorecard({
+      rawDomains,
+      findings: findings.map((f) => (f.id === '#1' ? { ...f, dismissed: true } : f)),
+      rulesById,
+    });
+    assert.equal(afterDismiss.capped, false);
+    assert.ok(afterDismiss.domains.security.score >= 80, 'Dismissed blocker restores security score');
+    assert.ok(afterDismiss.globalScore >= 88, 'Global score recovers to B/A once false positive blocker is dismissed');
+  });
+
+  test('Product & Scope Jira Context: marks chore/N/A PRs non-applicable, caches ADF Jira tickets via acli, and falls back gracefully', async () => {
+    const tmpReviewsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-jira-test-'));
+    try {
+      const cfg = { reviewsDir: tmpReviewsDir, jiraPrefixes: ['PRD'] };
+
+      // 1. Pure technical chore PR without Jira key -> applicableHint: false
+      const chorePr = {
+        repo: '2cloud-services',
+        number: 5800,
+        title: 'chore(2CS): N/A - Bump phpstan baseline',
+        headRefName: 'chore/bump-phpstan',
+      };
+      assert.equal(isPureTechnicalNonProductPr(chorePr), true);
+      const choreCtx = await resolveProductContextForPr({ cfg, pr: chorePr });
+      assert.equal(choreCtx.applicableHint, false);
+      assert.equal(choreCtx.source, 'technical_na');
+
+      // 2. Feature PR with Jira ticket fetched via mock acli (ADF JSON) + cached on second call
+      let acliCalls = 0;
+      const mockExec = async () => {
+        acliCalls += 1;
+        return {
+          stdout: JSON.stringify({
+            fields: {
+              summary: 'Invalidate passenger card on tag disable',
+              status: { name: 'In Review' },
+              issuetype: { name: 'Story' },
+              description: {
+                type: 'doc',
+                content: [
+                  {
+                    type: 'paragraph',
+                    content: [{ type: 'text', text: 'When a passenger tag is disabled, create CARD_INVALIDATION.' }],
+                  },
+                ],
+              },
+            },
+          }),
+        };
+      };
+
+      const featPr = {
+        repo: '2cloud-services',
+        number: 5704,
+        title: 'feat(MA): PRD-17484 - Create CARD_INVALIDATION on tag disable',
+        headRefName: 'feat/PRD-17484-card-invalidation',
+      };
+      saveManualProductContextNote({
+        cfg,
+        repo: featPr.repo,
+        number: featPr.number,
+        note: 'Verify idempotency if already disabled.',
+      });
+
+      const ctx1 = await resolveProductContextForPr({ cfg, pr: featPr, execFn: mockExec });
+      const ctx2 = await resolveProductContextForPr({ cfg, pr: featPr, execFn: mockExec });
+      assert.equal(acliCalls, 1, 'Second call must use 1h disk cache');
+      assert.equal(ctx1.applicableHint, true);
+      assert.equal(ctx1.jiraAvailable, true);
+      assert.equal(ctx2.jiraKey, 'PRD-17484');
+      assert.ok(ctx1.ticketDescription.includes('CARD_INVALIDATION'));
+      assert.ok(ctx1.formattedPromptBlock.includes('Verify idempotency if already disabled.'));
+
+      // 3. Graceful fallback when acli throws / is unauthenticated
+      const failingExec = async () => {
+        throw new Error('acli not authenticated');
+      };
+      const uncachedPr = {
+        repo: '2cloud-services',
+        number: 5705,
+        title: 'feat(PIF): PRD-99999 - Add fare export',
+        body: 'Exports fare CSV for active networks.',
+      };
+      const fallbackCtx = await resolveProductContextForPr({
+        cfg,
+        pr: uncachedPr,
+        execFn: failingExec,
+      });
+      assert.equal(fallbackCtx.jiraAvailable, false);
+      assert.equal(fallbackCtx.source, 'pr_description');
+      assert.ok(fallbackCtx.formattedPromptBlock.includes('Exports fare CSV'));
+    } finally {
+      fs.rmSync(tmpReviewsDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Hybrid Orchestrated Review + Isolated Single-Agent Deep Pass preserves other domains while updating target domain', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-multiagent-'));
+    const cfg = {
+      githubOrg: 'ubitransports',
+      githubUser: 'fawr-ubi',
+      teamProfile: 'popcorn-back',
+      agentCli: 'agy',
+      projectsDir: tmpRoot,
+      reviewsDir: path.join(tmpRoot, 'reviews'),
+      domainAgents: {
+        security: { enabled: true, weight: 25 },
+        product: { enabled: true, weight: 20 },
+        quality: { enabled: true, weight: 25 },
+        performance: { enabled: true, weight: 15 },
+        testing: { enabled: true, weight: 15 },
+      },
+    };
+
+    const pr = {
+      repo: '2cloud-services',
+      number: 5912,
+      title: 'chore(MA): N/A - Optimize tag lookup',
+      author: 'colleague-ubi',
+      headRefOid: 'abcdef1234567890',
+    };
+
+    let capturedPrompts = [];
+    setCustomAgentRunnerForTests(async ({ prompt }) => {
+      capturedPrompts.push(prompt);
+      if (prompt.includes('SINGLE-DOMAIN DEEP AUDIT')) {
+        return [
+          '# Performance & Scalability Deep Audit: 2cloud-services#5912',
+          '',
+          '## 2. Review Findings',
+          '',
+          '### 🟠 Architecture, Security & Major Issues',
+          '',
+          '#### `#1` — [Await inside foreach loop](projects/services/ma/src/Handler.php#L42-L46)',
+          '- **Domain:** performance',
+          '- **Why it matters:** Sequential HTTP awaits inside a loop degrade latency.',
+          '- **Ready-to-paste GitHub comment:**',
+          '````markdown',
+          'Move `$this->asyncManager->await()` outside the loop please 🙏',
+          '````',
+          '',
+          '<!-- SCORECARD_JSON',
+          JSON.stringify({
+            domains: {
+              performance: {
+                applicable: true,
+                rawScore: 76,
+                summary: 'Found unbatched async await inside foreach loop.',
+              },
+            },
+          }),
+          '-->',
+        ].join('\n');
+      }
+
+      return [
+        '# Code Review: 2cloud-services#5912 — Optimize tag lookup',
+        '',
+        '## 1. Task Summary & Functional Problem Solved',
+        '- **Business & Functional Problem Solved:** Tag lookup optimization.',
+        '',
+        '## 2. Review Findings',
+        '',
+        '### 🟠 Architecture, Security & Major Issues',
+        '',
+        '#### `#1` — [Return 404 instead of 403 in Voter](projects/services/ma/src/Security/TagVoter.php#L30-L33)',
+        '- **Domain:** security',
+        '- **Why it matters:** Avoid cross-tenant enumeration.',
+        '- **Ready-to-paste GitHub comment:**',
+        '````markdown',
+        'Return 404 Not Found to prevent cross-tenant enumeration.',
+        '````',
+        '',
+        '### 🟡 Clean Code, Strong Typing & Testing',
+        '',
+        '#### `#2` — [Use Response::HTTP_OK constant](projects/services/ma/src/Controller/TagController.php#L19-L19)',
+        '- **Domain:** quality',
+        '- **Why it matters:** Avoid magic HTTP numbers.',
+        '- **Ready-to-paste GitHub comment:**',
+        '````markdown',
+        'Can you use `Response::HTTP_OK` here please 🙏',
+        '````',
+        '',
+        '<!-- SCORECARD_JSON',
+        JSON.stringify({
+          domains: {
+            security: { applicable: true, rawScore: 80, summary: 'Voter returns 403 instead of 404.' },
+            product: { applicable: false, rawScore: null, summary: 'Technical chore PR.' },
+            quality: { applicable: true, rawScore: 92, summary: 'Minor HTTP constant nit.' },
+            performance: { applicable: true, rawScore: 95, summary: 'Initial pass looked clean.' },
+            testing: { applicable: true, rawScore: 90, summary: 'Unit tests present.' },
+          },
+        }),
+        '-->',
+      ].join('\n');
+    });
+
+    try {
+      // 1. Initial orchestrated multi-domain pass
+      await runPrReviewJob({ cfg, pr, scope: 'shared' });
+      const reviewMdPath = path.join(cfg.reviewsDir, 'review-2cloud-services-5912.md');
+      const metaPath = path.join(cfg.reviewsDir, 'review-2cloud-services-5912.meta.json');
+      assert.equal(fs.existsSync(reviewMdPath), true);
+      const initialMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      assert.equal(initialMeta.scorecard.domains.performance.score, 95);
+      assert.equal(initialMeta.scorecard.domains.security.score, 80);
+      assert.equal(initialMeta.scorecard.domains.product.applicable, false);
+
+      // 2. Granular single-agent Deep Re-run ONLY on `performance`
+      await runPrReviewJob({ cfg, pr, scope: 'shared', targetDomain: 'performance' });
+      assert.equal(capturedPrompts.length, 2);
+
+      const mergedMd = fs.readFileSync(reviewMdPath, 'utf8');
+      const mergedFindings = parseFindingsFromMarkdown(mergedMd, pr.repo);
+      const mergedMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+
+      // Security & Quality findings from initial pass MUST still be intact + new Performance finding added!
+      assert.equal(mergedFindings.length, 3);
+      assert.ok(mergedFindings.some((f) => f.domain === 'security' && f.title.includes('Voter')));
+      assert.ok(mergedFindings.some((f) => f.domain === 'quality' && f.title.includes('HTTP_OK')));
+      assert.ok(
+        mergedFindings.some((f) => f.domain === 'performance' && f.title.includes('Await inside foreach'))
+      );
+
+      // Security score stays 80 while Performance updated to 76 (`lastRunMode: 'deep'`)
+      assert.equal(mergedMeta.scorecard.domains.security.score, 80);
+      assert.equal(mergedMeta.scorecard.domains.performance.score, 76);
+      assert.equal(mergedMeta.scorecard.domains.performance.lastRunMode, 'deep');
+    } finally {
+      setCustomAgentRunnerForTests(null);
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('wanreview 4-layer ingestion + 100% resolve.py-compliant surgical export + UI Scorecard without PR Queue clutter', async () => {
+    const tmpWanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-wanreview-'));
+    const tmpExportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-wanexport-'));
+    const prevCfgEnv = process.env.REVIEW_HUB_CONFIG;
+    const tmpCfgPath = path.join(tmpWanDir, 'hub-config.json');
+    process.env.REVIEW_HUB_CONFIG = tmpCfgPath;
+
+    try {
+      // Build a mock ubitransports/wanreview repository with org locked rule + vertical + team _layer.md
+      fs.mkdirSync(path.join(tmpWanDir, 'rules', 'org'), { recursive: true });
+      fs.mkdirSync(path.join(tmpWanDir, 'rules', 'verticals', 'wfwp-backend'), { recursive: true });
+      fs.mkdirSync(path.join(tmpWanDir, 'rules', 'teams', 'ubi-eng-popcorn'), { recursive: true });
+
+      fs.writeFileSync(
+        path.join(tmpWanDir, 'rules', 'org', 'no-secrets.md'),
+        [
+          '---',
+          'id: no-secrets',
+          'title: Never commit secrets or credentials',
+          'severity: high',
+          'status: enforced',
+          'locked: true',
+          '---',
+          '',
+          'Never hardcode credentials.',
+          '',
+          '## Flag',
+          '- Committed tokens or passwords.',
+          '',
+          '## Accept',
+          '- Environment variables.',
+          '',
+        ].join('\n'),
+        'utf8'
+      );
+
+      // Team tries to disable locked rule `no-secrets` and non-locked rule `noisy-vertical-rule`
+      fs.writeFileSync(
+        path.join(tmpWanDir, 'rules', 'verticals', 'wfwp-backend', 'noisy-vertical-rule.md'),
+        [
+          '---',
+          'id: noisy-vertical-rule',
+          'title: Optional vertical check',
+          'severity: low',
+          'status: advisory',
+          '---',
+          '',
+          'Optional check.',
+          '',
+          '## Flag',
+          '- Foo.',
+          '',
+          '## Accept',
+          '- Bar.',
+          '',
+        ].join('\n'),
+        'utf8'
+      );
+
+      fs.writeFileSync(
+        path.join(tmpWanDir, 'rules', 'teams', 'ubi-eng-popcorn', '_layer.md'),
+        ['---', 'vertical: wfwp-backend', 'disable:', '  - no-secrets', '  - noisy-vertical-rule', '---', ''].join(
+          '\n'
+        ),
+        'utf8'
+      );
+
+      const loaded = loadWanreviewRulesFromRepo(tmpWanDir, 'popcorn-back');
+      assert.equal(loaded.available, true);
+      assert.equal(loaded.rules.length, 1, 'noisy-vertical-rule is disabled, but locked org rule no-secrets MUST survive');
+      assert.equal(loaded.rules[0].wanreviewId, 'no-secrets');
+      assert.equal(loaded.rules[0].locked, true);
+      assert.equal(loaded.rules[0].domain, 'security');
+
+      // Test surgical export: personal .local.md rules excluded by default, shared rules 100% resolve.py valid
+      const sampleRules = [
+        {
+          id: 'team-1',
+          source: 'team',
+          title: 'Deprecated getCustomUuid() Ban',
+          body: '- Never introduce or use getCustomUuid().\n- Use NeedLegacyConversion attributes or Uuid::buildFromCustomerAndId().',
+        },
+        {
+          id: 'dna-1',
+          source: 'dna',
+          title: 'Personal friendly tone',
+          body: '- Use polite suggestions.',
+        },
+      ];
+
+      const exportRes = exportRulesToWanreviewDirectory({
+        rules: sampleRules,
+        targetRootDir: tmpExportDir,
+        vertical: 'wfwp-backend',
+        team: 'ubi-eng-popcorn',
+        statusOverride: 'proposed',
+        allowPersonalPromotion: false,
+        writeToDisk: true,
+      });
+
+      assert.equal(exportRes.files.length, 1);
+      assert.equal(exportRes.skippedPersonal.length, 1, 'Personal .local.md rule must be skipped by default');
+      const writtenFile = exportRes.files[0];
+      assert.equal(
+        writtenFile.relativePath,
+        'rules/teams/ubi-eng-popcorn/deprecated-getcustomuuid-ban.md'
+      );
+      assert.equal(fs.existsSync(writtenFile.absolutePath), true);
+
+      const diskCheck = validateWanreviewRuleMarkdown(
+        fs.readFileSync(writtenFile.absolutePath, 'utf8'),
+        'deprecated-getcustomuuid-ban'
+      );
+      assert.equal(diskCheck.valid, true, `Exported markdown must pass resolve.py validation: ${diskCheck.errors.join(', ')}`);
+
+      // Verify HTTP endpoints (/api/agents, /api/wanreview/preview-export) and clean PR Queue UI
+      saveConfig({ wanreviewRepoPath: tmpWanDir }, tmpCfgPath);
+      const srv = createHubServer();
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+      const baseUrl = `http://127.0.0.1:${srv.address().port}`;
+      try {
+        const [agentsRes, htmlRes, jsRes] = await Promise.all([
+          fetch(`${baseUrl}/api/agents`),
+          fetch(`${baseUrl}/`),
+          fetch(`${baseUrl}/app.js`),
+        ]);
+        assert.equal(agentsRes.status, 200);
+        const agentsJson = await agentsRes.json();
+        assert.equal(agentsJson.agents.length, 5);
+        assert.equal(agentsJson.wanreview.available, true);
+
+        const previewRes = await fetch(`${baseUrl}/api/wanreview/preview-export`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ statusOverride: 'proposed' }),
+        });
+        assert.equal(previewRes.status, 200);
+        const previewJson = await previewRes.json();
+        assert.ok(previewJson.files.length > 0, 'Preview export must return converted shared rules');
+        for (const f of previewJson.files) {
+          assert.equal(f.valid, true);
+        }
+
+        const [html, js] = await Promise.all([htmlRes.text(), jsRes.text()]);
+        assert.ok(html.includes('id="prScorecardPanel"'), 'PR detail view must include #prScorecardPanel');
+        assert.ok(html.includes('id="exportWanreviewBtn"'), 'Rules tab must include Export to wanreview button');
+        assert.ok(js.includes('function renderPrScorecardPanel()'), 'app.js must define renderPrScorecardPanel');
+        // Ensure PR Queue card rendering was NOT cluttered with score badges
+        const prListSlice = js.slice(js.indexOf('function renderPrList()'), js.indexOf('function renderPrList()') + 3500);
+        assert.equal(
+          prListSlice.includes('scorecard-score-pill'),
+          false,
+          'PR Queue cards must remain clean without score badges'
+        );
+      } finally {
+        await new Promise((r) => srv.close(r));
+      }
+    } finally {
+      if (prevCfgEnv !== undefined) {
+        process.env.REVIEW_HUB_CONFIG = prevCfgEnv;
+      } else {
+        delete process.env.REVIEW_HUB_CONFIG;
+      }
+      fs.rmSync(tmpWanDir, { recursive: true, force: true });
+      fs.rmSync(tmpExportDir, { recursive: true, force: true });
     }
   });
 });

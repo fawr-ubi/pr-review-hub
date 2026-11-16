@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PR Review Hub</title>
-  <link rel="stylesheet" href="/styles.css?v=20261116-3" />
+  <link rel="stylesheet" href="/styles.css?v=20261116-5" />
   <link id="hljsThemeLink" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -186,6 +186,9 @@
           </div>
         </header>
 
+        <!-- Multi-Domain PR Scorecard Panel (PR Detail only — Queue stays clean) -->
+        <section id="prScorecardPanel" class="pr-scorecard-panel hidden" aria-label="Multi-Domain PR Scorecard"></section>
+
         <!-- Navigation Tabs -->
         <nav class="view-tabs">
           <div class="view-tabs-left">
@@ -297,6 +300,8 @@
                 <div class="comments-toolbar-left">
                   <div class="filter-tabs" id="rulesTargetFilterTabs">
                     <button class="filter-tab active" data-rule-target="all">All</button>
+                    <button class="filter-tab" data-rule-target="agents">Domain Agents <span id="rulesAgentsCount" class="count-pill">5</span></button>
+                    <button class="filter-tab" data-rule-target="wanreview">wanreview <span id="rulesWanreviewCount" class="count-pill">0</span></button>
                     <button class="filter-tab" data-rule-target="candidate">Candidates <span id="rulesCandidateCount" class="count-pill">0</span></button>
                     <button class="filter-tab" data-rule-target="common">Common DNA <span id="rulesCommonCount" class="count-pill">0</span></button>
                     <button class="filter-tab" data-rule-target="team">Team DNA <span id="rulesTeamCount" class="count-pill">0</span></button>
@@ -312,6 +317,7 @@
                   />
                 </div>
                 <div class="comments-toolbar-right">
+                  <button id="exportWanreviewBtn" class="btn btn-secondary btn-sm" title="Preview and surgically export selected atomic rules to ubitransports/wanreview (100% resolve.py compliant)">Export to wanreview &#8599;</button>
                   <button id="bootstrapTeamRulesBtn" class="btn btn-secondary btn-sm" title="Analyze 1 year of team review comments on GitHub and propose candidate rules to validate">Scan Team PRs (1y)</button>
                   <button id="addDnaRuleBtn" class="btn btn-primary btn-sm">+ Add DNA Rule</button>
                   <button id="addFpRuleBtn" class="btn btn-secondary btn-sm">+ Add False Positive</button>
@@ -376,7 +382,7 @@
   <!-- Toast notification -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script type="module" src="/app.js?v=20261116-3"></script>
+  <script type="module" src="/app.js?v=20261116-5"></script>
 
   <!-- Debug Console Drawer -->
   <div id="debugConsoleDrawer" style="position:fixed;bottom:0;left:0;right:0;height:40vh;background:var(--bg-surface);border-top:1px solid var(--border-color);z-index:10000;display:flex;flex-direction:column;transform:translateY(100%);transition:transform 0.2s ease-out;box-shadow:0 -5px 15px rgba(0,0,0,0.1);">

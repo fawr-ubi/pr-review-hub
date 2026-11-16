@@ -34,6 +34,6 @@ Apply this checklist systematically on every Pull Request diff in addition to th
 ---
 
 ## 5. Testing & Quality Assurance
-- **Unit & Functional Coverage:** Every new business branch, validator, or bug fix should be covered by targeted unit and/or functional (Behat / Cypress / E2E) tests.
+- **Right-Sized Coverage (No Under-Testing, No Over-Testing):** Cover every non-trivial business branch, Voter, or bug fix (nominal + error/404 paths), while flagging redundant test permutations, zero-value tests on trivial DTOs/getters/framework internals, or slow E2E/Behat duplication of edge cases better suited for unit tests.
 - **Test Cleanliness:** Use declarative fixture/DTO construction; clean up or isolate test data so tests are deterministic and order-independent.
 - **Assertions:** Verify that tests assert not only HTTP status codes (`200`, `400`, `422`), but also the specific error messages or response payload state.

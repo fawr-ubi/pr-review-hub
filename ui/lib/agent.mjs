@@ -12,12 +12,24 @@ import {
   getSharedReviewRulesBundle,
   getPersonalReviewRulesBundle,
   syncCombinedReferenceFiles,
+  buildRulesLookupMap,
 } from './rules.mjs';
 import {
   saveReviewArtifact,
+  getReviewArtifact,
   recordSharedFindingAction,
   pushSharedStore,
 } from './store.mjs';
+import {
+  loadDomainAgentCatalog,
+  normalizeDomainId,
+  normalizeDomainAgentsConfig,
+  inferDomainForFinding,
+  computeBoundedScorecard,
+  parseScorecardBlockFromMarkdown,
+  upsertScorecardInMarkdown,
+} from './scoring.mjs';
+import { resolveProductContextForPr } from './jira.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -1003,28 +1015,131 @@ async function fetchPrContextFromGithub(cfg, pr, repoPath = '') {
   };
 }
 
-export function createQueuedReviewJob({ pr, scope = 'shared' }) {
+function formatFindingMarkdownBlock(finding, index) {
+  const numId = `#${index + 1}`;
+  const dom = inferDomainForFinding(finding);
+  const title = String(finding.title || 'Finding').trim();
+  const pathRef = finding.filePath
+    ? finding.startLine
+      ? `${finding.filePath}#L${finding.startLine}${
+          finding.endLine && finding.endLine !== finding.startLine ? `-L${finding.endLine}` : ''
+        }`
+      : finding.filePath
+    : '';
+  const heading = pathRef
+    ? `#### \`${numId}\` — [${title}](${pathRef})`
+    : `#### \`${numId}\` — ${title}`;
+
+  const cleanExplanation = String(finding.explanation || '')
+    .replace(/^- \*\*Domain:\*\*\s*.+$/gim, '')
+    .replace(/^- \*\*Rule(?:\s+ID)?:\*\*\s*.+$/gim, '')
+    .replace(/\*\*Ready-to-paste GitHub comment[\s\S]*$/i, '')
+    .replace(/#{3,4}\s*Ready-to-paste GitHub comment[\s\S]*$/i, '')
+    .trim();
+
+  const lines = [heading, `- **Domain:** ${dom}`];
+  if (finding.ruleId) {
+    lines.push(`- **Rule:** \`${finding.ruleId}\``);
+  }
+  if (cleanExplanation) {
+    if (/^- \*\*/.test(cleanExplanation)) {
+      lines.push(cleanExplanation);
+    } else {
+      lines.push(`- **Why it matters:** ${cleanExplanation}`);
+    }
+  }
+  if (finding.comment) {
+    lines.push(`- **Ready-to-paste GitHub comment:**`);
+    lines.push('````markdown');
+    lines.push(String(finding.comment).trim());
+    lines.push('````');
+  }
+  return lines.join('\n');
+}
+
+function rebuildReviewFindingsSection(baseMarkdown = '', mergedFindings = []) {
+  const groups = [
+    { emoji: '🔴', heading: '### 🔴 Blockers, Bugs & Functional Gaps', items: [] },
+    { emoji: '🟠', heading: '### 🟠 Architecture, Security & Major Issues', items: [] },
+    { emoji: '🟡', heading: '### 🟡 Clean Code, Strong Typing & Testing', items: [] },
+    { emoji: '🔵', heading: '### 🔵 Nitpicks & Micro-Optimizations', items: [] },
+    { emoji: '❓', heading: '### ❓ Domain / Edge-Case Questions', items: [] },
+  ];
+  const groupByEmoji = new Map(groups.map((g) => [g.emoji, g]));
+
+  mergedFindings.forEach((f, idx) => {
+    const sev = groupByEmoji.has(f.severity) ? f.severity : '🟡';
+    groupByEmoji.get(sev).items.push(formatFindingMarkdownBlock(f, idx));
+  });
+
+  const nonEmptySections = groups
+    .filter((g) => g.items.length > 0)
+    .map((g) => `${g.heading}\n\n${g.items.join('\n\n---\n\n')}`);
+
+  const replacementBody =
+    nonEmptySections.length > 0
+      ? `## 2. Review Findings\n\n${nonEmptySections.join('\n\n---\n\n')}\n`
+      : `## 2. Review Findings\n\nNo findings detected across active domain agents.\n`;
+
+  const cleanBase = String(baseMarkdown || '')
+    .replace(/<!--\s*SCORECARD_JSON\s*[\s\S]*?\s*-->\r?\n?/gi, '')
+    .trim();
+
+  const hasSection2 = /^##\s+(?:2\.\s*)?(?:Review Findings|Detailed Findings)\b/im.test(cleanBase);
+  if (hasSection2) {
+    const lines = cleanBase.split(/\r?\n/);
+    const out = [];
+    let inSec2 = false;
+    let replaced = false;
+    for (const line of lines) {
+      if (!replaced && /^##\s+(?:2\.\s*)?(?:Review Findings|Detailed Findings)\b/i.test(line)) {
+        inSec2 = true;
+        replaced = true;
+        out.push(replacementBody.trim());
+        continue;
+      }
+      if (inSec2 && /^##\s+(?:[3-9]\.|Debrief|Positives|Summary)\b/i.test(line)) {
+        inSec2 = false;
+        out.push('', line);
+        continue;
+      }
+      if (!inSec2) {
+        out.push(line);
+      }
+    }
+    return `${out.join('\n').trim()}\n`;
+  }
+
+  return `${cleanBase}\n\n---\n\n${replacementBody}\n`;
+}
+
+export function createQueuedReviewJob({ pr, scope = 'shared', domain = '' }) {
   const prKey = `${pr.repo}#${pr.number}`;
   const normalizedScope = scope === 'personal' ? 'personal' : 'shared';
+  const targetDomain = normalizeDomainId(domain) || '';
   const existing = [...activeJobs.values()].find(
     (j) =>
       j.prKey === prKey &&
       j.type === 'review' &&
       j.scope === normalizedScope &&
+      (j.domain || '') === targetDomain &&
       (j.status === 'running' || j.status === 'queued')
   );
   if (existing) return existing;
 
-  const jobId = `review-${pr.repo}-${pr.number}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const jobId = `review-${pr.repo}-${pr.number}-${targetDomain || 'all'}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const job = {
     id: jobId,
     prKey,
     repo: pr.repo,
     number: Number(pr.number),
     scope: normalizedScope,
+    domain: targetDomain || null,
     type: 'review',
     status: 'queued',
-    phase: 'Queued in worker (waiting for active review)…',
+    phase: targetDomain
+      ? `Queued (${targetDomain} agent deep pass)…`
+      : 'Queued in worker (waiting for active review)…',
     startedAt: new Date().toISOString(),
     finishedAt: null,
     error: null,
@@ -1033,12 +1148,24 @@ export function createQueuedReviewJob({ pr, scope = 'shared' }) {
   return job;
 }
 
-export async function runPrReviewJob({ cfg, pr, scope = 'shared', existingJob = null }) {
+export async function runPrReviewJob({
+  cfg,
+  pr,
+  scope = 'shared',
+  targetDomain = '',
+  existingJob = null,
+}) {
   const normalizedScope = scope === 'personal' ? 'personal' : 'shared';
-  const job = existingJob || createQueuedReviewJob({ pr, scope: normalizedScope });
+  const singleDomainId = normalizeDomainId(targetDomain) || '';
+  const job =
+    existingJob ||
+    createQueuedReviewJob({ pr, scope: normalizedScope, domain: singleDomainId });
+  job.domain = singleDomainId || null;
   job.status = 'running';
   job.startedAt = new Date().toISOString();
-  job.phase = 'Fetching PR diff and metadata from GitHub…';
+  job.phase = singleDomainId
+    ? `Fetching PR diff for ${singleDomainId} deep pass…`
+    : 'Fetching PR diff and metadata from GitHub…';
   job.error = null;
 
   try {
@@ -1076,32 +1203,102 @@ export async function runPrReviewJob({ cfg, pr, scope = 'shared', existingJob = 
         ? `${diffText.slice(0, maxDiffChars)}\n\n[... Diff truncated at ${maxDiffChars} characters ...]`
         : diffText;
 
-    const prompt = [
-      `Execute a Mode 1 code review for PR ${cfg.githubOrg}/${pr.repo}#${pr.number} ("${pr.title || ''}", author: ${pr.author || 'unknown'}, head SHA: ${headSha}).`,
-      teamContextLine,
-      `FAST ZERO-WASTE MODE (CRITICAL):`,
-      `1. All active review rules, false positives, review checklist, output template, PR description, and the full unified Git diff are ALREADY embedded inline below.`,
-      `2. DO NOT read SKILL.md, DO NOT read reference rule files from disk, DO NOT run \`gh\`, \`git\`, \`docker\`, tests, or ANY shell command (\`run_command\` is FORBIDDEN), and DO NOT call file-writing tools.`,
-      `3. LOCAL BRANCH WARNING: The local workspace directory is checked out on the developer's own working branch, NOT on this PR's head commit (${headSha}). Newly added or modified files in this PR will NOT match on disk — rely directly on the inline Unified Git Diff below.`,
-      `4. STRICT TOOL BUDGET (HARD MAX: 3 READ-ONLY CALLS TOTAL): Only read an existing unchanged base class/interface on disk if strictly required to confirm a Blocker/Major contract bug, and NEVER exceed 3 file reads total. Synthesize and return your complete Markdown review immediately.`,
-      `Output the complete Markdown review report in 100% English directly as your response text, starting with "# Code Review: ${pr.repo}#${pr.number} — ${pr.title || ''}" and "## 1. Task Summary & Functional Problem Solved" (Business & Functional Problem Solved, Technical & Feature Solution, Jira & Scope Compliance), and providing a single English "Ready-to-paste GitHub comment:" block per finding.`,
-      `Never publish any comment to GitHub.`,
-      templateText ? `\n--- Output Markdown Template ---\n${templateText}` : '',
-      combinedRulesText
-        ? `\n--- Active ${normalizedScope === 'personal' ? 'Personal & Team' : 'Shared Team'} DNA Rules ---\n${combinedRulesText.slice(0, 18000)}`
-        : '',
-      fpRulesText
-        ? `\n--- Known False Positives (DO NOT FLAG THESE) ---\n${fpRulesText.slice(0, 8000)}`
-        : '',
-      checklistText ? `\n--- Review Checklist ---\n${checklistText}` : '',
-      prBody ? `\n--- PR Description ---\n${prBody.slice(0, 6000)}` : '',
-      changedFilesList.length > 0
-        ? `\n--- Modified Files (${changedFilesList.length}) ---\n${changedFilesList.join('\n')}`
-        : '',
-      truncatedDiff ? `\n--- Full Unified Git Diff ---\n\`\`\`diff\n${truncatedDiff}\n\`\`\`` : '',
-    ]
-      .filter(Boolean)
-      .join('\n');
+    const agentCatalog = loadDomainAgentCatalog();
+    const agentsConfig = normalizeDomainAgentsConfig(cfg.domainAgents);
+    const activeAgents = singleDomainId
+      ? agentCatalog.filter((a) => a.id === singleDomainId)
+      : agentCatalog.filter((a) => agentsConfig[a.id]?.enabled !== false);
+
+    const shouldLoadProductContext = activeAgents.some((a) => a.id === 'product');
+    const productContext = shouldLoadProductContext
+      ? await resolveProductContextForPr({
+          cfg,
+          pr: { ...pr, jiraKey },
+          prBody,
+        })
+      : null;
+
+    const domainRubricBlock = activeAgents
+      .map(
+        (a) =>
+          `### Agent [${a.id}] — ${a.title} (Weight: ${agentsConfig[a.id]?.weight ?? a.defaultWeight}%)\n- **Mission:** ${a.mission}\n- **When N/A:** ${a.applicability}\n- **Rubric:**\n${a.rubric}`
+      )
+      .join('\n\n');
+
+    const scorecardJsonExample = JSON.stringify(
+      {
+        domains: Object.fromEntries(
+          activeAgents.map((a) => [
+            a.id,
+            {
+              applicable: a.id === 'product' && productContext ? Boolean(productContext.applicableHint) : true,
+              rawScore: 90,
+              summary: `One-sentence English assessment for ${a.shortLabel}.`,
+            },
+          ])
+        ),
+      },
+      null,
+      2
+    );
+
+    const prompt = singleDomainId
+      ? [
+          `Execute a focused SINGLE-DOMAIN DEEP AUDIT solely for the "${singleDomainId.toUpperCase()}" agent (${activeAgents[0]?.title || singleDomainId}) on PR ${cfg.githubOrg}/${pr.repo}#${pr.number} ("${pr.title || ''}", author: ${pr.author || 'unknown'}, head SHA: ${headSha}).`,
+          teamContextLine,
+          `FAST ZERO-WASTE SINGLE-AGENT MODE (CRITICAL):`,
+          `1. Evaluate EXCLUSIVELY the "${singleDomainId}" domain rubric below. Ignore unrelated domains (other agents handle them separately).`,
+          `2. DO NOT run \`gh\`, \`git\`, \`docker\`, tests, or ANY shell command (\`run_command\` is FORBIDDEN), and DO NOT call file-writing tools.`,
+          `3. Every finding you report MUST include \`- **Domain:** ${singleDomainId}\` (and \`- **Rule:** <rule-id>\` when tied to a named rule) plus a single English "Ready-to-paste GitHub comment:" block.`,
+          `4. At the very end of your Markdown output, you MUST append an HTML comment \`<!-- SCORECARD_JSON ... -->\` grading "${singleDomainId}" (\`applicable\`: boolean, \`rawScore\`: integer 0-100 or null if N/A, \`summary\`: concise 1-sentence justification).`,
+          `Output 100% English Markdown starting with "# ${activeAgents[0]?.title || singleDomainId} Deep Audit: ${pr.repo}#${pr.number}" and "## 2. Review Findings". Never publish any comment to GitHub.`,
+          `\n--- Target Domain Agent Rubric ---\n${domainRubricBlock}`,
+          `\n--- Required Trailing Scorecard Block Format ---\n<!-- SCORECARD_JSON\n${scorecardJsonExample}\n-->`,
+          productContext ? `\n--- Product & Jira Context ---\n${productContext.formattedPromptBlock}` : '',
+          combinedRulesText
+            ? `\n--- Active ${normalizedScope === 'personal' ? 'Personal & Team' : 'Shared Team'} DNA Rules ---\n${combinedRulesText.slice(0, 18000)}`
+            : '',
+          fpRulesText
+            ? `\n--- Known False Positives (DO NOT FLAG THESE) ---\n${fpRulesText.slice(0, 8000)}`
+            : '',
+          prBody ? `\n--- PR Description ---\n${prBody.slice(0, 6000)}` : '',
+          changedFilesList.length > 0
+            ? `\n--- Modified Files (${changedFilesList.length}) ---\n${changedFilesList.join('\n')}`
+            : '',
+          truncatedDiff ? `\n--- Full Unified Git Diff ---\n\`\`\`diff\n${truncatedDiff}\n\`\`\`` : '',
+        ]
+          .filter(Boolean)
+          .join('\n')
+      : [
+          `Execute a Mode 1 Multi-Domain code review for PR ${cfg.githubOrg}/${pr.repo}#${pr.number} ("${pr.title || ''}", author: ${pr.author || 'unknown'}, head SHA: ${headSha}).`,
+          teamContextLine,
+          `FAST ZERO-WASTE MODE (CRITICAL):`,
+          `1. All active review rules, domain agent rubrics, false positives, review checklist, output template, PR/Jira context, and the full unified Git diff are ALREADY embedded inline below.`,
+          `2. DO NOT read SKILL.md, DO NOT read reference rule files from disk, DO NOT run \`gh\`, \`git\`, \`docker\`, tests, or ANY shell command (\`run_command\` is FORBIDDEN), and DO NOT call file-writing tools.`,
+          `3. LOCAL BRANCH WARNING: The local workspace directory is checked out on the developer's own working branch, NOT on this PR's head commit (${headSha}). Newly added or modified files in this PR will NOT match on disk — rely directly on the inline Unified Git Diff below.`,
+          `4. STRICT TOOL BUDGET (HARD MAX: 3 READ-ONLY CALLS TOTAL): Only read an existing unchanged base class/interface on disk if strictly required to confirm a Blocker/Major contract bug, and NEVER exceed 3 file reads total. Synthesize and return your complete Markdown review immediately.`,
+          `5. MULTI-DOMAIN SCORING REQUIREMENTS: Tag EVERY finding with \`- **Domain:** <security|product|quality|performance|testing>\` (and \`- **Rule:** <rule-id>\` if matching an active rule), and append a trailing \`<!-- SCORECARD_JSON ... -->\` block at the very end evaluating each active domain (\`applicable\`, \`rawScore\` 0-100, \`summary\`).`,
+          `Output the complete Markdown review report in 100% English directly as your response text, starting with "# Code Review: ${pr.repo}#${pr.number} — ${pr.title || ''}" and "## 1. Task Summary & Functional Problem Solved" (Business & Functional Problem Solved, Technical & Feature Solution, Jira & Scope Compliance), and providing a single English "Ready-to-paste GitHub comment:" block per finding.`,
+          `Never publish any comment to GitHub.`,
+          templateText ? `\n--- Output Markdown Template ---\n${templateText}` : '',
+          domainRubricBlock ? `\n--- Active Multi-Domain Scoring Agents ---\n${domainRubricBlock}` : '',
+          `\n--- Required Trailing Scorecard Block Format ---\n<!-- SCORECARD_JSON\n${scorecardJsonExample}\n-->`,
+          productContext ? `\n--- Product & Jira Context ---\n${productContext.formattedPromptBlock}` : '',
+          combinedRulesText
+            ? `\n--- Active ${normalizedScope === 'personal' ? 'Personal & Team' : 'Shared Team'} DNA Rules ---\n${combinedRulesText.slice(0, 18000)}`
+            : '',
+          fpRulesText
+            ? `\n--- Known False Positives (DO NOT FLAG THESE) ---\n${fpRulesText.slice(0, 8000)}`
+            : '',
+          checklistText ? `\n--- Review Checklist ---\n${checklistText}` : '',
+          prBody ? `\n--- PR Description ---\n${prBody.slice(0, 6000)}` : '',
+          changedFilesList.length > 0
+            ? `\n--- Modified Files (${changedFilesList.length}) ---\n${changedFilesList.join('\n')}`
+            : '',
+          truncatedDiff ? `\n--- Full Unified Git Diff ---\n\`\`\`diff\n${truncatedDiff}\n\`\`\`` : '',
+        ]
+          .filter(Boolean)
+          .join('\n');
 
     const resolvedCliLabel = (() => {
       try {
@@ -1111,7 +1308,9 @@ export async function runPrReviewJob({ cfg, pr, scope = 'shared', existingJob = 
       }
     })();
     job.cli = resolvedCliLabel;
-    job.phase = `Running AI audit (${resolvedCliLabel})…`;
+    job.phase = singleDomainId
+      ? `Running ${singleDomainId} deep audit (${resolvedCliLabel})…`
+      : `Running AI audit (${resolvedCliLabel})…`;
 
     // Snapshot previous mtime if file existed so a stale file on disk isn't mistaken for fresh output
     const prevMtimeMs = fs.existsSync(reviewFilePath) ? fs.statSync(reviewFilePath).mtimeMs : 0;
@@ -1122,7 +1321,7 @@ export async function runPrReviewJob({ cfg, pr, scope = 'shared', existingJob = 
       agentCli: cfg.agentCli || 'agy',
       approvalMode: 'yolo',
       timeoutMs: 420000,
-      inactivityTimeoutMs: 210000,
+      inactivityTimeoutMs: 60000,
       maxRetries: 1,
       includeDirs: [cfg.reviewsDir, repoPath].filter(Boolean),
       onStreamUpdate: ({ phase }) => {
@@ -1147,9 +1346,121 @@ export async function runPrReviewJob({ cfg, pr, scope = 'shared', existingJob = 
       );
     }
 
-    const findings = parseFindingsFromMarkdown(md, pr.repo);
-    const summary = summarizeFindings(findings);
-    const verdict = inferVerdictFromFindings(findings, md);
+    const nowIso = new Date().toISOString();
+    const rulesLookup = buildRulesLookupMap(activeTeam?.id || cfg.teamProfile);
+    const parsedScorecardBlock = parseScorecardBlockFromMarkdown(md);
+    let finalFindings = [];
+    let rawDomains = {};
+    let previousScorecard = null;
+    let effectiveProductMeta = productContext
+      ? {
+          source: productContext.source,
+          jiraKey: productContext.jiraKey,
+          jiraAvailable: productContext.jiraAvailable,
+          ticketSummary: productContext.ticketSummary,
+          manualNote: productContext.manualNote,
+          applicableHint: productContext.applicableHint,
+        }
+      : null;
+
+    if (singleDomainId) {
+      const prevArtifact = getReviewArtifact({
+        cfg,
+        repo: pr.repo,
+        number: Number(pr.number),
+        headSha,
+        teamProfile: activeTeam?.id || cfg.teamProfile,
+      });
+
+      const newDomainFindings = parseFindingsFromMarkdown(md, pr.repo).map((f) => ({
+        ...f,
+        domain: singleDomainId,
+      }));
+
+      if (prevArtifact?.markdown) {
+        const prevFindings = parseFindingsFromMarkdown(prevArtifact.markdown, pr.repo);
+        const preservedOtherDomains = prevFindings.filter(
+          (f) => inferDomainForFinding(f) !== singleDomainId
+        );
+        finalFindings = [...preservedOtherDomains, ...newDomainFindings].map((f, idx) => ({
+          ...f,
+          id: `#${idx + 1}`,
+        }));
+        md = rebuildReviewFindingsSection(prevArtifact.markdown, finalFindings);
+        const prevBlock =
+          prevArtifact.metadata?.scorecard ||
+          parseScorecardBlockFromMarkdown(prevArtifact.markdown);
+        previousScorecard = prevBlock || null;
+        if (prevBlock?.domains) {
+          rawDomains = { ...prevBlock.domains };
+        }
+        if (!effectiveProductMeta && prevArtifact.metadata?.productContext) {
+          effectiveProductMeta = prevArtifact.metadata.productContext;
+        }
+      } else {
+        finalFindings = newDomainFindings.map((f, idx) => ({ ...f, id: `#${idx + 1}` }));
+        for (const a of agentCatalog) {
+          if (a.id !== singleDomainId) {
+            rawDomains[a.id] = {
+              applicable: false,
+              rawScore: null,
+              summary: 'Not run yet (single-domain pass only).',
+              lastRunMode: 'pending',
+            };
+          }
+        }
+      }
+
+      const incomingDom = parsedScorecardBlock?.domains?.[singleDomainId] || {};
+      rawDomains[singleDomainId] = {
+        ...incomingDom,
+        applicable:
+          incomingDom.applicable !== undefined
+            ? Boolean(incomingDom.applicable)
+            : singleDomainId === 'product' && productContext && !productContext.applicableHint && newDomainFindings.length === 0
+            ? false
+            : true,
+        lastRunMode: 'deep',
+        updatedAt: nowIso,
+        source:
+          singleDomainId === 'product' && productContext
+            ? productContext.source
+            : incomingDom.source || null,
+      };
+    } else {
+      finalFindings = parseFindingsFromMarkdown(md, pr.repo);
+      const incomingDomains = parsedScorecardBlock?.domains || {};
+      for (const a of agentCatalog) {
+        const d = incomingDomains[a.id] || {};
+        const hasProductFindings =
+          a.id === 'product' &&
+          finalFindings.some((f) => inferDomainForFinding(f) === 'product');
+        const defaultApplicable =
+          a.id === 'product' && productContext && !productContext.applicableHint && !hasProductFindings
+            ? false
+            : true;
+        rawDomains[a.id] = {
+          ...d,
+          applicable: d.applicable !== undefined ? Boolean(d.applicable) : defaultApplicable,
+          lastRunMode: 'orchestrated',
+          updatedAt: nowIso,
+          source:
+            a.id === 'product' && productContext ? productContext.source : d.source || null,
+        };
+      }
+    }
+
+    const scorecard = computeBoundedScorecard({
+      rawDomains,
+      findings: finalFindings,
+      agentsConfig,
+      rulesById: rulesLookup,
+      previousScorecard,
+    });
+    md = upsertScorecardInMarkdown(md, scorecard);
+
+    const summary = summarizeFindings(finalFindings);
+    const verdict = inferVerdictFromFindings(finalFindings, md);
 
     saveReviewArtifact({
       cfg,
@@ -1163,6 +1474,8 @@ export async function runPrReviewJob({ cfg, pr, scope = 'shared', existingJob = 
       findingsSummary: summary,
       jiraKey,
       reviewedBy: cfg.githubUser || 'worker',
+      scorecard,
+      productContext: effectiveProductMeta,
     });
 
     const defaultSyncScript = path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh');
@@ -1204,23 +1517,33 @@ export async function runPrReviewJob({ cfg, pr, scope = 'shared', existingJob = 
   }
 }
 
-export function triggerPrReview({ cfg, pr, scope = 'shared' }) {
+export function triggerPrReview({ cfg, pr, scope = 'shared', domain = '' }) {
   const prKey = `${pr.repo}#${pr.number}`;
   const normalizedScope = scope === 'personal' ? 'personal' : 'shared';
+  const targetDomain = normalizeDomainId(domain) || '';
   const existing = [...activeJobs.values()].find(
     (j) =>
       j.prKey === prKey &&
       j.type === 'review' &&
       j.scope === normalizedScope &&
+      (j.domain || '') === targetDomain &&
       (j.status === 'running' || j.status === 'queued')
   );
   if (existing) return existing;
 
-  const job = createQueuedReviewJob({ pr, scope: normalizedScope });
+  const job = createQueuedReviewJob({ pr, scope: normalizedScope, domain: targetDomain });
   job.status = 'running';
-  job.phase = 'Fetching PR diff and metadata from GitHub…';
+  job.phase = targetDomain
+    ? `Fetching PR diff for ${targetDomain} deep pass…`
+    : 'Fetching PR diff and metadata from GitHub…';
 
-  runPrReviewJob({ cfg, pr, scope: normalizedScope, existingJob: job }).catch(() => {
+  runPrReviewJob({
+    cfg,
+    pr,
+    scope: normalizedScope,
+    targetDomain,
+    existingJob: job,
+  }).catch(() => {
     // job.status and job.error already populated by runPrReviewJob
   });
 

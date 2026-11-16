@@ -35,6 +35,7 @@
 ### 🔴 Blockers, Bugs & Functional Gaps
 
 #### `#1` — [{{SHORT_TITLE}}](file://{{ABSOLUTE_FILE_PATH}}#L{{START_LINE}}-L{{END_LINE}})
+- **Domain:** {{DOMAIN}} <!-- security | product | quality | performance | testing -->
 - **Why it matters:** {{EXPLANATION_FOR_ANTOINE}}
 - **Ready-to-paste GitHub comment:**
 ````markdown
@@ -92,3 +93,15 @@
 Tell me in the chat:
 1. **Which `#ID`s you reject** (and why $\rightarrow$ I will propose an entry in `false-positives.md`).
 2. **What I missed or should phrase differently** ($\rightarrow$ I will propose an update to `reviewer-dna.md`).
+
+<!-- SCORECARD_JSON
+{
+  "domains": {
+    "security": { "applicable": true, "rawScore": 95, "summary": "One-sentence domain assessment." },
+    "product": { "applicable": true, "rawScore": 90, "summary": "One-sentence domain assessment." },
+    "quality": { "applicable": true, "rawScore": 88, "summary": "One-sentence domain assessment." },
+    "performance": { "applicable": true, "rawScore": 92, "summary": "One-sentence domain assessment." },
+    "testing": { "applicable": true, "rawScore": 85, "summary": "One-sentence domain assessment." }
+  }
+}
+-->
