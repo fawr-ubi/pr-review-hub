@@ -139,22 +139,9 @@ function cleanReviewMarkdownOutput(rawText = '') {
   return text;
 }
 
-const MODEL_FALLBACKS = {
-  'gemini-4-argon-high': 'gemini-3.8-flash-high',
-  'gemini-4-argon-medium': 'gemini-3.8-flash-medium',
-  'gemini-4-argon-low': 'gemini-3.8-flash-low',
-  'gemini-3.1-pro-high': 'gemini-3.8-flash-high',
-  'gemini-3.1-pro-low': 'gemini-3.8-flash-low',
-  'gemini-2.5-pro': 'gemini-2.5-flash',
-  'gemini-2.0-pro-exp-02-05': 'gemini-2.5-flash',
-  'claude-3-7-sonnet-20250219': 'claude-3-5-haiku-20241022',
-  'claude-3-5-sonnet-20241022': 'claude-3-5-haiku-20241022',
-};
-
-function isRetryableModelError(errMsg) {
+function isTransientApiError(errMsg) {
   const e = String(errMsg).toLowerCase();
   return (
-    e.includes('not recognized') ||
     e.includes('quota') ||
     e.includes('503') ||
     e.includes('504') ||
@@ -166,10 +153,23 @@ function isRetryableModelError(errMsg) {
   );
 }
 
+export function isAgentAuthError(errMsg) {
+  const e = String(errMsg || '').toLowerCase();
+  return (
+    e.includes('authentication required') ||
+    e.includes('authentication expired') ||
+    e.includes('authentication timed out') ||
+    e.includes('authentication failed') ||
+    e.includes('waiting for authentication') ||
+    e.includes('please sign in')
+  );
+}
+
 function isRetryableCliError(errMsg) {
+  if (isAgentAuthError(errMsg)) return false;
   const e = String(errMsg).toLowerCase();
   return (
-    isRetryableModelError(e) ||
+    isTransientApiError(e) ||
     e.includes('stalled') ||
     e.includes('exited with code') ||
     e.includes('econnreset') ||
@@ -178,26 +178,287 @@ function isRetryableCliError(errMsg) {
   );
 }
 
+let activeAgyOAuth = null;
+
+function cleanupActiveAgyOAuth() {
+  if (!activeAgyOAuth) return;
+  if (activeAgyOAuth.cleanupTimer) clearTimeout(activeAgyOAuth.cleanupTimer);
+  try {
+    activeAgyOAuth.child?.stdin?.destroy();
+    activeAgyOAuth.child?.kill('SIGTERM');
+  } catch {
+    // ignore
+  }
+  activeAgyOAuth = null;
+}
+
+const AGY_PTY_BRIDGE_SCRIPT = [
+  'import os, pty, select, signal, sys',
+  'bin_path = sys.argv[1]',
+  'args = [bin_path, "--dangerously-skip-permissions", "--disable-slash-commands", "--output-format", "stream-json", "--effort", "low", "-p", "Reply OK"]',
+  'pid, fd = pty.fork()',
+  'if pid == 0:',
+  '    os.execv(bin_path, args)',
+  'def _terminate(*_):',
+  '    try: os.kill(pid, signal.SIGTERM)',
+  '    except Exception: pass',
+  '    sys.exit(0)',
+  'signal.signal(signal.SIGTERM, _terminate)',
+  'signal.signal(signal.SIGINT, _terminate)',
+  'stdin_open = True',
+  'while True:',
+  '    watch = [fd] + ([0] if stdin_open else [])',
+  '    try:',
+  '        r, _, _ = select.select(watch, [], [], 0.2)',
+  '    except Exception:',
+  '        break',
+  '    if fd in r:',
+  '        try:',
+  '            data = os.read(fd, 4096)',
+  '            if not data: break',
+  '            os.write(1, data)',
+  '        except OSError:',
+  '            break',
+  '    if 0 in r:',
+  '        try:',
+  '            inp = os.read(0, 4096)',
+  '            if not inp:',
+  '                stdin_open = False',
+  '            else:',
+  '                os.write(fd, inp)',
+  '        except OSError:',
+  '            stdin_open = False',
+  '_, status = os.waitpid(pid, 0)',
+  'sys.exit(os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8))',
+].join('\n');
+
+export async function startAgyOAuthSession({ _customBinPath = '' } = {}) {
+  cleanupActiveAgyOAuth();
+  const bin = _customBinPath || resolveAgentBinary('agy').bin;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('python3', ['-u', '-c', AGY_PTY_BRIDGE_SCRIPT, bin], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let combined = '';
+    let urlResolved = false;
+    let authSucceeded = false;
+    let authWaiter = null;
+
+    const cleanupTimer = setTimeout(() => {
+      cleanupActiveAgyOAuth();
+    }, 60000);
+    cleanupTimer.unref?.();
+
+    const session = {
+      child,
+      authUrl: '',
+      expiresAt: Date.now() + 58000,
+      cleanupTimer,
+      getCombined: () => combined,
+      setAuthWaiter: (w) => {
+        authWaiter = w;
+      },
+      isAuthenticated: () => authSucceeded,
+    };
+    activeAgyOAuth = session;
+
+    const startupTimer = setTimeout(() => {
+      if (!urlResolved) {
+        urlResolved = true;
+        cleanupActiveAgyOAuth();
+        reject(new Error('Timed out waiting for Antigravity CLI (agy) sign-in URL'));
+      }
+    }, 10000);
+
+    const inspectOutput = (chunk) => {
+      combined += chunk.toString('utf8');
+      // Strip ANSI CSI sequences and carriage returns for clean URL & event matching
+      const clean = combined.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').replace(/\r/g, '');
+
+      if (
+        clean.includes('"event":"init"') ||
+        clean.includes('"event": "init"') ||
+        clean.includes('"status":"SUCCESS"') ||
+        /authentication successful|successfully logged in/i.test(clean)
+      ) {
+        authSucceeded = true;
+        if (!urlResolved) {
+          urlResolved = true;
+          clearTimeout(startupTimer);
+          cleanupActiveAgyOAuth();
+          resolve({ ok: true, authRequired: false, authenticated: true });
+          return;
+        }
+        if (authWaiter) {
+          const w = authWaiter;
+          authWaiter = null;
+          cleanupActiveAgyOAuth();
+          w.resolve({ ok: true, authenticated: true });
+          return;
+        }
+      }
+
+      if (!urlResolved) {
+        // Wait until the full prompt line ("Enter:") arrives so a wrapped URL is never truncated mid-chunk
+        const urlMatch = clean.match(/https:\/\/accounts\.google\.com\/o\/oauth2\/auth[^\s]+/);
+        if (urlMatch && (clean.includes('Enter:') || clean.includes('Waiting for authentication'))) {
+          urlResolved = true;
+          clearTimeout(startupTimer);
+          session.authUrl = urlMatch[0].trim();
+          session.expiresAt = Date.now() + 57000;
+          resolve({
+            ok: true,
+            authRequired: true,
+            authenticated: false,
+            authUrl: session.authUrl,
+            expiresAt: session.expiresAt,
+          });
+        }
+      } else if (
+        authWaiter &&
+        /invalid_grant|authentication failed|authentication timed out|malformed auth code/i.test(
+          clean
+        )
+      ) {
+        const w = authWaiter;
+        authWaiter = null;
+        cleanupActiveAgyOAuth();
+        w.reject(
+          new Error(
+            'Authorization code was rejected or expired. Click "Generate Fresh Link" and paste the new code within 60s.'
+          )
+        );
+      }
+    };
+
+    child.stdout.on('data', inspectOutput);
+    child.stderr.on('data', inspectOutput);
+
+    child.on('error', (err) => {
+      clearTimeout(startupTimer);
+      if (!urlResolved) {
+        urlResolved = true;
+        cleanupActiveAgyOAuth();
+        reject(err);
+      } else if (authWaiter) {
+        const w = authWaiter;
+        authWaiter = null;
+        cleanupActiveAgyOAuth();
+        w.reject(err);
+      }
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(startupTimer);
+      if (authSucceeded) {
+        if (authWaiter) {
+          const w = authWaiter;
+          authWaiter = null;
+          cleanupActiveAgyOAuth();
+          w.resolve({ ok: true, authenticated: true });
+        }
+        return;
+      }
+      if (!urlResolved) {
+        urlResolved = true;
+        cleanupActiveAgyOAuth();
+        if (code === 0) {
+          resolve({ ok: true, authRequired: false, authenticated: true });
+        } else {
+          reject(
+            new Error(
+              `Antigravity CLI (agy) exited with code ${code}: ${combined.trim().slice(-300)}`
+            )
+          );
+        }
+      } else if (authWaiter) {
+        const w = authWaiter;
+        authWaiter = null;
+        cleanupActiveAgyOAuth();
+        if (code === 0) {
+          w.resolve({ ok: true, authenticated: true });
+        } else {
+          w.reject(
+            new Error(
+              'Authorization failed or timed out. Click "Generate Fresh Link" and submit the new code within 60s.'
+            )
+          );
+        }
+      }
+    });
+  });
+}
+
+export async function submitAgyOAuthCode(code) {
+  const trimmed = String(code || '').trim();
+  if (!trimmed) {
+    throw new Error('Authorization code is required');
+  }
+  if (!activeAgyOAuth || !activeAgyOAuth.child || Date.now() > activeAgyOAuth.expiresAt) {
+    cleanupActiveAgyOAuth();
+    throw new Error(
+      'Sign-in session expired (60s PKCE window). Click "Generate Fresh Link" first, then paste the new code.'
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let modelPollTimer = null;
+
+    const finish = (err, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(verifyTimer);
+      if (modelPollTimer) clearInterval(modelPollTimer);
+      if (err) reject(err);
+      else resolve(val);
+    };
+
+    const verifyTimer = setTimeout(() => {
+      cleanupActiveAgyOAuth();
+      finish(new Error('Timed out verifying authorization code with Antigravity CLI (agy).'));
+    }, 25000);
+
+    activeAgyOAuth.setAuthWaiter({
+      resolve: (val) => finish(null, val),
+      reject: (err) => finish(err),
+    });
+
+    // Fast parallel check: as soon as `agy` writes the exchanged token to disk, `agy models` exits 0
+    const agyBin = resolveAgentBinary('agy').bin;
+    modelPollTimer = setInterval(async () => {
+      if (settled) return;
+      try {
+        const { stdout, stderr } = await execFileAsync(agyBin, ['models'], { timeout: 3500 });
+        if (!/please sign in|authentication required/i.test(`${stdout || ''}\n${stderr || ''}`)) {
+          cleanupActiveAgyOAuth();
+          finish(null, { ok: true, authenticated: true });
+        }
+      } catch {
+        // still exchanging token or rejected
+      }
+    }, 2000);
+    modelPollTimer.unref?.();
+
+    try {
+      activeAgyOAuth.child.stdin.write(`${trimmed}\r\n`);
+    } catch (err) {
+      cleanupActiveAgyOAuth();
+      finish(new Error(`Failed to send authorization code to CLI: ${err.message}`));
+    }
+  });
+}
+
 export async function runCliPrompt(args) {
   const maxRetries = args.maxRetries ?? 1;
   let attempt = 0;
-  let currentModel = args.model || '';
 
   while (attempt <= maxRetries) {
     try {
-      return await _runCliPromptInternal({ ...args, model: currentModel });
+      return await _runCliPromptInternal(args);
     } catch (err) {
-      if (currentModel && MODEL_FALLBACKS[currentModel] && isRetryableModelError(err.message)) {
-        const fallbackModel = MODEL_FALLBACKS[currentModel];
-        args.onStreamUpdate?.({
-          phase: `⚠️ Model ${currentModel} unavailable. Retrying with fallback: ${fallbackModel}…`,
-          partialText: '',
-        });
-        currentModel = fallbackModel;
-        attempt++;
-        continue;
-      }
-
       if (attempt < maxRetries && isRetryableCliError(err.message)) {
         attempt++;
         args.onStreamUpdate?.({
@@ -278,7 +539,6 @@ async function _runCliPromptInternal({
   fastChatMode = false,
   includeDirs = [],
   onStreamUpdate = null,
-  model = '',
   _customBinPath = '',
 }) {
   if (customAgentRunner && !_customBinPath) {
@@ -306,9 +566,6 @@ async function _runCliPromptInternal({
         '--output-format',
         'stream-json',
       ];
-      if (model) {
-        args.push('--model', model);
-      }
       for (const dir of dirsToAdd) {
         args.push('--add-dir', dir);
       }
@@ -376,10 +633,35 @@ async function _runCliPromptInternal({
         }
       };
 
+      const failIfAuthPrompt = () => {
+        if (timers.isSettled()) return true;
+        if (
+          /Authentication required\. Please visit|Waiting for authentication|Please sign in/i.test(
+            `${rawStdout}\n${rawStderr}`
+          )
+        ) {
+          timers.clearAll();
+          try {
+            child.stdin?.destroy();
+            child.kill('SIGTERM');
+          } catch {
+            // ignore
+          }
+          reject(
+            new Error(
+              'Antigravity CLI (agy) authentication required. Click "Sign in to Antigravity (agy)" to reconnect.'
+            )
+          );
+          return true;
+        }
+        return false;
+      };
+
       child.stdout.on('data', (chunk) => {
         timers.resetHeartbeat();
         const str = chunk.toString('utf8');
         rawStdout += str;
+        if (failIfAuthPrompt()) return;
         lineBuffer += str;
         const lines = lineBuffer.split('\n');
         lineBuffer = lines.pop() || '';
@@ -391,6 +673,7 @@ async function _runCliPromptInternal({
       child.stderr.on('data', (chunk) => {
         timers.resetHeartbeat();
         rawStderr += chunk.toString('utf8');
+        failIfAuthPrompt();
       });
 
       child.on('error', (err) => {
@@ -431,9 +714,6 @@ async function _runCliPromptInternal({
       ];
       if (approvalMode === 'yolo' || approvalMode === 'auto_edit') {
         args.push('--dangerously-skip-permissions');
-      }
-      if (model) {
-        args.push('--model', model);
       }
       for (const dir of validIncludeDirs) {
         args.push('--add-dir', dir);
@@ -506,9 +786,6 @@ async function _runCliPromptInternal({
       '-e',
       'none',
     ];
-    if (model) {
-      args.push('--model', model);
-    }
     for (const dir of validIncludeDirs) {
       args.push('--include-directories', dir);
     }
@@ -848,7 +1125,6 @@ export async function runPrReviewJob({ cfg, pr, scope = 'shared', existingJob = 
       inactivityTimeoutMs: 210000,
       maxRetries: 1,
       includeDirs: [cfg.reviewsDir, repoPath].filter(Boolean),
-      model: cfg.model || '',
       onStreamUpdate: ({ phase }) => {
         if (phase) job.phase = phase;
       },
@@ -1057,7 +1333,6 @@ export async function sendPrChatMessage({
       timeoutMs: 120000,
       fastChatMode: true,
       includeDirs: [SKILL_ROOT, cfg.reviewsDir, repoPath],
-      model: cfg.model || '',
       onStreamUpdate: ({ phase, partialText, toolName }) => {
         if (phase) streamState.phase = phase;
         if (typeof partialText === 'string') streamState.partialText = partialText;

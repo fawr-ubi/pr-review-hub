@@ -314,7 +314,6 @@ export function getDefaultConfig() {
     githubTeams: [],
     teamProfile: process.env.REVIEW_HUB_TEAM_PROFILE || 'popcorn-back',
     agentCli: detectInstalledAgentCli(),
-    model: process.env.REVIEW_HUB_MODEL || '',
     projectsDir: defaultProjectsDir,
     reviewsDir: defaultReviewsDir,
     jiraBaseUrl: 'https://ubitransport.atlassian.net/browse',
@@ -394,6 +393,7 @@ export function loadConfig(customConfigFile = '') {
             ? saved.onboardingCompleted
             : hasValidSavedUser,
       };
+      delete merged.model;
       merged.projectsDir = expandHome(merged.projectsDir || defaults.projectsDir);
       merged.reviewsDir = expandHome(merged.reviewsDir || defaults.reviewsDir);
       return merged;
@@ -415,6 +415,7 @@ export function saveConfig(partialConfig, customConfigFile = '') {
     ...rawUpdated,
     ...normalizeSharedHubFields(rawUpdated, current),
   };
+  delete updated.model;
   if (typeof updated.githubTeams === 'string') {
     updated.githubTeams = updated.githubTeams
       .split(',')
@@ -439,7 +440,7 @@ export function saveConfig(partialConfig, customConfigFile = '') {
  * Automatically bootstraps config.json, skill symlinks, and local reference files on first server start
  * even if the user ran `npm start` directly without running `./install.sh`.
  */
-export function ensureConfigBootstrapped() {
+export function ensureConfigBootstrapped(customConfigFile = '') {
   ensureSkillSymlinks();
 
   const refDir = path.join(SKILL_ROOT, 'references');
@@ -470,17 +471,23 @@ export function ensureConfigBootstrapped() {
     }
   }
 
-  const configFile = getConfigFile();
+  const configFile = customConfigFile || getConfigFile();
   if (!fs.existsSync(configFile)) {
     const defaults = getDefaultConfig();
     const detectedTeams = detectGithubTeamsSync(defaults.githubOrg);
     const inferredProfile = inferTeamProfileFromGithubTeams(detectedTeams);
-    const bootstrapped = saveConfig({
-      ...defaults,
-      githubTeams: detectedTeams,
-      teamProfile: inferredProfile,
-      onboardingCompleted: false,
-    });
+    const initialRole = process.env.REVIEW_HUB_ROLE === 'worker' ? 'worker' : 'reader';
+    const bootstrapped = saveConfig(
+      {
+        ...defaults,
+        githubTeams: detectedTeams,
+        teamProfile: inferredProfile,
+        hubRole: initialRole,
+        autoReviewEnabled: initialRole === 'worker',
+        onboardingCompleted: false,
+      },
+      configFile
+    );
     try {
       fs.mkdirSync(path.join(bootstrapped.reviewsDir, 'archive'), { recursive: true });
     } catch {
@@ -489,7 +496,7 @@ export function ensureConfigBootstrapped() {
     return bootstrapped;
   }
 
-  const cfg = loadConfig();
+  const cfg = loadConfig(configFile);
   try {
     fs.mkdirSync(path.join(cfg.reviewsDir, 'archive'), { recursive: true });
   } catch {

@@ -46,6 +46,8 @@ import {
   triggerPrReview,
   sendPrChatMessage,
   dismissFindingAsFalsePositive,
+  startAgyOAuthSession,
+  submitAgyOAuthCode,
 } from './lib/agent.mjs';
 import {
   listAllRules,
@@ -834,48 +836,6 @@ export function createHubServer(options = {}) {
         });
       }
 
-      if (req.method === 'GET' && pathname === '/api/models') {
-        const cli = urlObj.searchParams.get('cli') || 'agy';
-        try {
-          if (cli === 'agy') {
-            try {
-              let stdout;
-              try {
-                const { execFileSync } = await import('node:child_process');
-                stdout = execFileSync('agy', ['models'], { encoding: 'utf8', env: process.env });
-              } catch (err) {
-                stdout = (err.stdout || '') + '\n' + (err.stderr || '');
-              }
-              const cleanedStdout = (stdout || '').replace(/[\\s\\S]*?Fetching available models\\.\\.\\./g, '');
-              const models = cleanedStdout.split('\n').filter(Boolean).map(line => {
-                const [id, ...rest] = line.trim().split(/\s+/);
-                if (id) return { id, name: rest.join(' ') };
-                return null;
-              }).filter(Boolean);
-              return sendJson(res, 200, { models });
-            } catch (err) {
-              console.error("Failed to execute agy models:", err);
-              return sendJson(res, 500, { error: err.message });
-            }
-          }
-          
-          const staticModels = {
-             gemini: [
-               { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
-               { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
-               { id: 'gemini-2.0-pro-exp-02-05', name: 'Gemini 2.0 Pro Experimental' }
-             ],
-             claude: [
-               { id: 'claude-3-7-sonnet-20250219', name: 'Claude 3.7 Sonnet' },
-               { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet' }
-             ]
-          };
-          return sendJson(res, 200, { models: staticModels[cli] || [] });
-        } catch (err) {
-          console.error("SERVER 500 ERROR:", err); return sendJson(res, 500, { error: err.message });
-        }
-      }
-
       if (req.method === 'POST' && pathname === '/api/config') {
         const body = await readRequestBody(req);
         const updated = saveConfig(body);
@@ -1454,6 +1414,25 @@ export function createHubServer(options = {}) {
       // =========================================================================
       if (req.method === 'GET' && pathname === '/api/agent/jobs') {
         return sendJson(res, 200, { jobs: getAgentJobs() });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/agent/auth/start') {
+        const authRes = await startAgyOAuthSession();
+        if (authRes.authenticated) {
+          scheduler.resumeAfterAuth();
+        }
+        return sendJson(res, 200, { ...authRes, scheduler: scheduler.getStatus() });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/agent/auth/code') {
+        const body = await readRequestBody(req);
+        const verifyRes = await submitAgyOAuthCode(body.code);
+        const resumed = scheduler.resumeAfterAuth();
+        return sendJson(res, 200, {
+          ...verifyRes,
+          enqueuedCount: resumed.enqueuedJobs.length,
+          scheduler: scheduler.getStatus(),
+        });
       }
 
       if (req.method === 'POST' && pathname === '/api/agent/review') {

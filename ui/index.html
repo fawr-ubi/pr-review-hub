@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PR Review Hub</title>
-  <link rel="stylesheet" href="/styles.css?v=20261109-10" />
+  <link rel="stylesheet" href="/styles.css?v=20261116-1" />
   <link id="hljsThemeLink" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -104,10 +104,10 @@
       </div>
 
       <div id="prContentArea" class="pr-content hidden">
-        <!-- PR Topbar -->
+        <!-- PR Topbar (3-row full-width layout) -->
         <header class="pr-topbar">
-          <div class="pr-topbar-info">
-            <div class="pr-meta-row">
+          <div class="pr-topbar-row-top">
+            <div class="pr-topbar-identity">
               <button id="backToPrQueueBtn" class="btn btn-secondary btn-xs" title="Return to full-page PR selection queue (shortcut: q)">
                 &larr; All PRs
               </button>
@@ -115,7 +115,42 @@
               <span id="prDraftBadge" class="badge badge-draft hidden">Draft</span>
               <span id="prAuthorBadge" class="badge"></span>
               <span id="prModeBadge" class="badge"></span>
-              <span id="prMergeableBadge" class="badge hidden"></span>
+            </div>
+
+            <div class="pr-topbar-actions">
+              <button id="triggerReviewBtn" class="btn btn-secondary btn-sm" title="Run or re-run shared AI review now (shortcut: r)">
+                <span id="reviewJobSpinner" class="spinner hidden"></span>
+                <span id="triggerReviewLabel">Run Review (r)</span>
+              </button>
+              <button id="triggerPersonalReviewBtn" class="btn btn-ghost btn-sm" title="Run a personal local pass including your .local.md rules without overwriting shared Hub artifacts">
+                Personal Pass (.local)
+              </button>
+              <button id="toggleSplitViewBtn" class="btn btn-secondary btn-sm" title="Side-by-side Report + Code mode (shortcut: s)">
+                Split (s)
+              </button>
+              <button id="popoutWorkspaceBtn" class="btn btn-secondary btn-sm" title="Open Diff workspace in a separate synchronized window (shortcut: o)">
+                Pop-out (o) &#8599;
+              </button>
+              <button id="toggleChatDrawerBtn" class="btn btn-secondary btn-sm" title="Ask a question or debrief the review agent (shortcut: c)">
+                Agent Q&amp;A (c)
+              </button>
+              <a id="openGithubPrBtn" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-sm" title="Open Pull Request on GitHub (shortcut: g)">
+                GitHub (g) &#8599;
+              </a>
+              <button id="prTopbarRexBtn" class="btn btn-secondary btn-sm" title="Log testing feedback / REX on this PR">
+                Feedback / REX
+              </button>
+              <button id="openBatchReviewModalBtn" class="btn btn-primary btn-sm" title="Open Submit Review to GitHub modal (shortcut: m)">
+                Submit Review (m)
+              </button>
+            </div>
+          </div>
+
+          <h2 id="prTitleHeader" class="pr-title-header"></h2>
+
+          <div class="pr-topbar-row-meta">
+            <div class="pr-topbar-meta-tags">
+              <span id="prMergeableBadge" class="hidden"></span>
               <span id="prCodeOwnersBadges" class="pr-codeowners-inline"></span>
               <span id="prVerdictBadge" class="badge"></span>
               <span id="prCiBadge" class="badge badge-mono hidden"></span>
@@ -123,8 +158,8 @@
               <a id="prJiraLink" href="#" target="_blank" rel="noopener" class="btn btn-ghost btn-xs hidden"></a>
               <span id="prShaBadge" class="badge badge-mono" title="HEAD Commit"></span>
             </div>
-            <h2 id="prTitleHeader" class="pr-title-header"></h2>
-            <div class="pr-subbar-row">
+
+            <div class="pr-topbar-right-tools">
               <div id="prBranchRow" class="pr-branch-row"></div>
               <div class="worktree-bar">
                 <span id="worktreeStatusBadge" class="badge badge-mono">Worktree: Direct Git</span>
@@ -134,34 +169,6 @@
                 <button id="openVscodeBtn" class="btn btn-ghost btn-xs" title="Mount worktree and open in VS Code">VS Code</button>
               </div>
             </div>
-          </div>
-
-          <div class="pr-topbar-actions">
-            <button id="triggerReviewBtn" class="btn btn-secondary btn-sm" title="Run or re-run shared AI review now (shortcut: r)">
-              <span id="reviewJobSpinner" class="spinner hidden"></span>
-              <span id="triggerReviewLabel">Run Review (r)</span>
-            </button>
-            <button id="triggerPersonalReviewBtn" class="btn btn-ghost btn-sm" title="Run a personal local pass including your .local.md rules without overwriting shared Hub artifacts">
-              Personal Pass (.local)
-            </button>
-            <button id="toggleSplitViewBtn" class="btn btn-secondary btn-sm" title="Side-by-side Report + Code mode (shortcut: s)">
-              Split (s)
-            </button>
-            <button id="popoutWorkspaceBtn" class="btn btn-secondary btn-sm" title="Open Diff workspace in a separate synchronized window (shortcut: o)">
-              Pop-out (o) &#8599;
-            </button>
-            <button id="toggleChatDrawerBtn" class="btn btn-secondary btn-sm" title="Ask a question or debrief the review agent (shortcut: c)">
-              Agent Q&amp;A (c)
-            </button>
-            <a id="openGithubPrBtn" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-sm" title="Open Pull Request on GitHub (shortcut: g)">
-              GitHub (g) &#8599;
-            </a>
-            <button id="prTopbarRexBtn" class="btn btn-secondary btn-sm" title="Log testing feedback / REX on this PR">
-              Feedback / REX
-            </button>
-            <button id="openBatchReviewModalBtn" class="btn btn-primary btn-sm" title="Open Submit Review to GitHub modal (shortcut: m)">
-              Submit Review (m)
-            </button>
           </div>
         </header>
 
@@ -355,7 +362,7 @@
   <!-- Toast notification -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script type="module" src="/app.js?v=20261113-1"></script>
+  <script type="module" src="/app.js?v=20261116-1"></script>
 
   <!-- Debug Console Drawer -->
   <div id="debugConsoleDrawer" style="position:fixed;bottom:0;left:0;right:0;height:40vh;background:var(--bg-surface);border-top:1px solid var(--border-color);z-index:10000;display:flex;flex-direction:column;transform:translateY(100%);transition:transform 0.2s ease-out;box-shadow:0 -5px 15px rgba(0,0,0,0.1);">

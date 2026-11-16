@@ -633,6 +633,15 @@ function renderSchedulerStatusBadge() {
   const autoEnabled = sched ? sched.autoReviewEnabled : cfg.autoReviewEnabled !== false;
   const intervalMin = Math.max(1, Math.round((sched?.autoSyncIntervalSec || cfg.autoSyncIntervalSec || 300) / 60));
 
+  badgeEl.style.borderColor = '';
+  badgeEl.style.color = '';
+  if (sched?.authRequired) {
+    badgeEl.textContent = '🔑 AGY Auth Required — Sign In';
+    badgeEl.title = 'Antigravity CLI (agy) session expired. Click to sign in and resume reviews.';
+    badgeEl.style.borderColor = 'var(--sev-blocker-border)';
+    badgeEl.style.color = 'var(--sev-blocker)';
+    return;
+  }
   if (sched?.activeJob) {
     const qSuffix = sched.queueLength > 0 ? ` (+${sched.queueLength} queued)` : '';
     badgeEl.textContent = `Worker: Reviewing ${sched.activeJob.prKey}${qSuffix}`;
@@ -843,13 +852,23 @@ async function scheduleClientPrPrefetch() {
   }
 }
 
+function isMyPr(pr) {
+  if (!pr) return false;
+  const currentUser = String(state.config?.githubUser || '').trim().toLowerCase();
+  const prAuthor = String(pr.author || '').trim().toLowerCase();
+  if (currentUser && prAuthor) {
+    return prAuthor === currentUser;
+  }
+  return pr.reviewMode === 'Self-Review';
+}
+
 function updateFilterCounts() {
   const openPrs = state.prs.filter((p) => !p.isArchived);
   const nonDraftOpenPrs = openPrs.filter((p) => !p.isDraft);
   document.getElementById('count-open').textContent = nonDraftOpenPrs.length;
   document.getElementById('count-actionable').textContent = nonDraftOpenPrs.filter(isActionablePr).length;
-  document.getElementById('count-peer').textContent = nonDraftOpenPrs.filter((p) => p.reviewMode === 'Peer-Review').length;
-  document.getElementById('count-self').textContent = nonDraftOpenPrs.filter((p) => p.reviewMode === 'Self-Review').length;
+  document.getElementById('count-peer').textContent = nonDraftOpenPrs.filter((p) => !isMyPr(p)).length;
+  document.getElementById('count-self').textContent = nonDraftOpenPrs.filter((p) => isMyPr(p)).length;
   const draftCountEl = document.getElementById('count-draft');
   if (draftCountEl) {
     draftCountEl.textContent = openPrs.filter((p) => Boolean(p.isDraft)).length;
@@ -931,8 +950,8 @@ function getFilteredPrs() {
       if (pr.isDraft) return false;
       if (state.activeFilter === 'open' && pr.isArchived) return false;
       if (state.activeFilter === 'actionable' && !isActionablePr(pr)) return false;
-      if (state.activeFilter === 'peer' && (pr.isArchived || pr.reviewMode !== 'Peer-Review')) return false;
-      if (state.activeFilter === 'self' && (pr.isArchived || pr.reviewMode !== 'Self-Review')) return false;
+      if (state.activeFilter === 'peer' && (pr.isArchived || isMyPr(pr))) return false;
+      if (state.activeFilter === 'self' && (pr.isArchived || !isMyPr(pr))) return false;
       if (state.activeFilter === 'archived' && !pr.isArchived) return false;
     }
 
@@ -947,7 +966,8 @@ function getFilteredPrs() {
       const owners = (pr.requiredOwnerTeams || []).map((t) => t.teamSlug).join(' ');
       const draftToken = pr.isDraft ? 'draft brouillon' : '';
       const mergeableToken = pr.mergeReadiness?.isMergeable ? 'mergeable prete' : '';
-      const hay = `${pr.key} ${pr.title} ${pr.author} ${pr.authorDisplayName || ''} ${pr.jiraKey || ''} ${pr.headRefName || ''} ${approvers} ${pending} ${labels} ${owners} ${draftToken} ${mergeableToken}`.toLowerCase();
+      const myPrToken = isMyPr(pr) ? 'my pr self-review' : 'peer-review';
+      const hay = `${pr.key} ${pr.title} ${pr.author} ${pr.authorDisplayName || ''} ${pr.jiraKey || ''} ${pr.headRefName || ''} ${approvers} ${pending} ${labels} ${owners} ${draftToken} ${mergeableToken} ${myPrToken}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -990,10 +1010,16 @@ function renderMergeableTagHtml(pr, asBadge = false) {
   if (mr.isMergeable) {
     return `<span class="${asBadge ? 'badge badge-mergeable-ok' : 'pr-tag pr-tag-mergeable-ok'}" title="Ready to merge: Non-Draft, no Git conflict, CODEOWNERS team(s) approved, and CI passing">Mergeable &check;</span>`;
   }
-  const reasons = Array.isArray(mr.blockingReasons) && mr.blockingReasons.length > 0
-    ? mr.blockingReasons.join(' · ')
-    : 'Requirements not met';
-  return `<span class="${asBadge ? 'badge badge-mergeable-blocked' : 'pr-tag pr-tag-mergeable-blocked'}" title="Not mergeable: ${escapeHtml(reasons)}">Not mergeable: ${escapeHtml(reasons)}</span>`;
+  const rawReasons = Array.isArray(mr.blockingReasons) ? mr.blockingReasons : [];
+  const hasOwnerBadges = Array.isArray(pr.requiredOwnerTeams) && pr.requiredOwnerTeams.length > 0;
+  const conciseReasons = hasOwnerBadges
+    ? rawReasons.filter((r) => !/^waiting approval:/i.test(String(r).trim()))
+    : rawReasons;
+  const tooltipDetail = rawReasons.length > 0 ? rawReasons.join(' · ') : 'Requirements not met';
+  const labelText = conciseReasons.length > 0
+    ? `Not mergeable: ${conciseReasons.join(' · ')}`
+    : 'Not mergeable';
+  return `<span class="${asBadge ? 'badge badge-mergeable-blocked' : 'pr-tag pr-tag-mergeable-blocked'}" title="Not mergeable: ${escapeHtml(tooltipDetail)}">${escapeHtml(labelText)}</span>`;
 }
 
 function renderPrList() {
@@ -1009,6 +1035,7 @@ function renderPrList() {
   listEl.innerHTML = filtered
     .map((pr) => {
       const isSelected = pr.key === state.selectedPrKey;
+      const myPr = isMyPr(pr);
       const statusClass = getCardStatusClass(pr);
       const authorFullLabel = pr.authorDisplayName || `@${pr.author || 'unknown'}`;
       const isAuthorActive = state.activeAuthor === pr.author;
@@ -1016,7 +1043,9 @@ function renderPrList() {
       const draftBadge = pr.isDraft
         ? `<span class="badge badge-draft" title="Draft Pull Request — Automatic AI review paused">Draft</span>`
         : '';
-      const modeBadge = `<span class="badge">${escapeHtml(pr.reviewMode === 'Self-Review' ? 'Self-Review' : 'Peer-Review')}</span>`;
+      const modeBadge = myPr
+        ? `<span class="badge badge-my-pr" title="You authored this Pull Request (Self-Review)">👤 My PR</span>`
+        : `<span class="badge">Peer-Review</span>`;
       const jiraBadge =
         pr.jiraKey && pr.jiraKey !== '—'
           ? `<span class="badge">Ticket ${escapeHtml(pr.jiraKey)}</span>`
@@ -1114,7 +1143,7 @@ function renderPrList() {
           : '';
 
       return `
-        <div class="pr-card ${statusClass} ${isSelected ? 'active' : ''}" data-key="${escapeHtml(pr.key)}">
+        <div class="pr-card ${statusClass} ${myPr ? 'is-my-pr' : ''} ${isSelected ? 'active' : ''}" data-key="${escapeHtml(pr.key)}">
           <div class="pr-card-top">
             <div class="pr-card-identity">
               <span class="pr-card-key">${escapeHtml(pr.repo)} #${pr.number}</span>
@@ -1222,15 +1251,20 @@ function renderTopbar(pr) {
     authorBadgeEl.textContent = pr.authorDisplayName || (pr.author ? `@${pr.author}` : '');
     authorBadgeEl.title = pr.author ? `@${pr.author}` : '';
   }
+  const myPr = isMyPr(pr);
   const modeBadge = document.getElementById('prModeBadge');
-  modeBadge.textContent = pr.reviewMode === 'Self-Review' ? 'Self-Review' : 'Peer-Review';
-  modeBadge.className = 'badge';
+  modeBadge.textContent = myPr ? '👤 My PR' : 'Peer-Review';
+  modeBadge.className = myPr ? 'badge badge-my-pr' : 'badge';
+  modeBadge.title = myPr ? 'You authored this Pull Request (Self-Review)' : 'Peer-Review';
 
   const mergeableBadgeEl = document.getElementById('prMergeableBadge');
   if (mergeableBadgeEl) {
-    if (pr.mergeReadiness) {
-      mergeableBadgeEl.outerHTML = `<span id="prMergeableBadge">${renderMergeableTagHtml(pr, true)}</span>`;
+    const mergeableHtml = renderMergeableTagHtml(pr, true);
+    if (mergeableHtml) {
+      mergeableBadgeEl.innerHTML = mergeableHtml;
+      mergeableBadgeEl.classList.remove('hidden');
     } else {
+      mergeableBadgeEl.innerHTML = '';
       mergeableBadgeEl.classList.add('hidden');
     }
   }
@@ -1439,18 +1473,25 @@ async function selectPr(prKey, broadcast = true) {
         </div>
       `;
     } else if (pr.lastFailedJob) {
+      const errText = String(pr.lastFailedJob.error || 'Unknown error while running AI agent CLI.');
+      const isAuthErr = /authentication|sign in|waiting for auth/i.test(errText);
+      const showAgySignIn = isAuthErr || (state.config?.agentCli || 'agy') === 'agy';
       document.getElementById('markdownContainer').innerHTML = `
         <div class="empty-card" style="margin:40px auto;max-width:680px;border-color:var(--sev-blocker-border);background:var(--sev-blocker-bg);">
           <h3 style="color:var(--sev-blocker);margin-top:0;">Last AI Review Attempt Failed</h3>
-          <p class="meta-text" style="margin-bottom:10px;color:var(--text-primary);white-space:pre-wrap;text-align:left;font-family:var(--font-mono);font-size:12px;padding:10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);">${escapeHtml(pr.lastFailedJob.error || 'Unknown error while running AI agent CLI.')}</p>
-          <p class="meta-text" style="margin-bottom:14px;">Click <strong>Doctor</strong> in the top bar to verify your <code>gemini</code> / <code>claude</code> CLI installation and authentication.</p>
+          <p class="meta-text" style="margin-bottom:10px;color:var(--text-primary);white-space:pre-wrap;text-align:left;font-family:var(--font-mono);font-size:12px;padding:10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);">${escapeHtml(errText)}</p>
+          <p class="meta-text" style="margin-bottom:14px;">Verify your <code>agy</code> / <code>gemini</code> / <code>claude</code> CLI authentication below or open <strong>Doctor</strong> in the top bar.</p>
           <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
-            <button id="emptyCardRunReviewBtn" class="btn btn-primary btn-sm">Retry AI Review</button>
+            ${showAgySignIn ? `<button id="emptyCardSignInAgyBtn" class="btn btn-primary btn-sm">🔑 Sign in to Antigravity (agy)</button>` : ''}
+            <button id="emptyCardRunReviewBtn" class="btn ${showAgySignIn ? 'btn-secondary' : 'btn-primary'} btn-sm">Retry AI Review</button>
             <button id="emptyCardOpenDoctorBtn" class="btn btn-secondary btn-sm">Open Doctor &amp; Setup Check</button>
             <a href="${escapeHtml(pr.url)}" target="_blank" class="btn btn-secondary btn-sm">Open on GitHub ↗</a>
           </div>
         </div>
       `;
+      document.getElementById('emptyCardSignInAgyBtn')?.addEventListener('click', () => {
+        openAgyAuthModal();
+      });
       document.getElementById('emptyCardOpenDoctorBtn')?.addEventListener('click', () => {
         openDoctorModal();
       });
@@ -5628,14 +5669,6 @@ async function openSettingsModal() {
         </div>
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">AI Model Override (leave empty for CLI default):</label>
-        <select id="cfgModel" class="search-input">
-          <option value="">-- CLI Default --</option>
-          ${cfg.model ? `<option value="${escapeHtml(cfg.model)}" selected>${escapeHtml(cfg.model)}</option>` : ''}
-          <option disabled>Loading models...</option>
-        </select>
-      </div>
-      <div>
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
           <label style="font-weight:500;">Watched GitHub Teams:</label>
           <button type="button" id="cfgDiscoverTeamsBtn" class="btn btn-ghost btn-xs">Detect my GitHub teams</button>
@@ -5697,8 +5730,9 @@ async function openSettingsModal() {
       </div>
       <div style="border-top:1px solid var(--border-color);padding-top:10px;margin-top:4px;">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
-          <strong style="font-size:0.84rem;">System Health Check (Environment Doctor)</strong>
-          <div style="display:flex;gap:6px;align-items:center;">
+          <strong style="font-size:0.84rem;">System Health Check &amp; Teammate Sharing</strong>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            <button type="button" id="cfgCopyInstallCmdBtn" class="btn btn-secondary btn-xs" title="Copy 1-command install snippet for a teammate">Copy Teammate 1-Liner</button>
             <a href="/api/export-zip" class="btn btn-secondary btn-xs" title="Download a clean shareable .zip without personal local config">Download Shareable .zip</a>
             <button type="button" id="cfgRefreshDoctorBtn" class="btn btn-ghost btn-xs">Re-check</button>
           </div>
@@ -5791,41 +5825,12 @@ async function openSettingsModal() {
   document.getElementById('cfgDiscoverTeamsBtn')?.addEventListener('click', renderDiscoveredTeamPills);
   renderDiscoveredTeamPills();
 
-  async function refreshModels() {
-    const cli = document.getElementById('cfgAgentCli').value;
-    const modelSelect = document.getElementById('cfgModel');
-    const currentVal = modelSelect.value;
-    
-    // Set loading state
-    modelSelect.innerHTML = '<option value="">-- CLI Default --</option><option disabled>Loading models...</option>';
-    
-    try {
-      const res = await fetch(`/api/models?cli=${encodeURIComponent(cli)}`);
-      if (res.ok) {
-        const { models } = await res.json();
-        let html = '<option value="">-- CLI Default --</option>';
-        models.forEach(m => {
-          const isSelected = m.id === currentVal ? 'selected' : '';
-          html += `<option value="${escapeHtml(m.id)}" ${isSelected}>${escapeHtml(m.name)} (${escapeHtml(m.id)})</option>`;
-        });
-        // If currentVal is not empty and not in the fetched list, append it so it's not lost
-        if (currentVal && !models.find(m => m.id === currentVal)) {
-          html += `<option value="${escapeHtml(currentVal)}" selected>${escapeHtml(currentVal)} (Custom/Unavailable)</option>`;
-        }
-        modelSelect.innerHTML = html;
-      } else {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error || `HTTP ${res.status}`);
-      }
-    } catch (e) {
-      console.error('Failed to fetch models', e);
-      modelSelect.innerHTML = '<option value="">-- CLI Default --</option><option disabled>Error loading models</option>';
-    }
-  }
-
-  document.getElementById('cfgAgentCli')?.addEventListener('change', refreshModels);
-  // Initial fetch
-  refreshModels();
+  document.getElementById('cfgCopyInstallCmdBtn')?.addEventListener('click', async () => {
+    const repoSlug = document.getElementById('cfgCentralIssuesRepo')?.value.trim() || 'fawr-ubi/pr-review-hub';
+    const cmd = `gh repo clone ${repoSlug} ~/.gemini/config/skills/my-review && cd ~/.gemini/config/skills/my-review && npm start`;
+    await navigator.clipboard?.writeText(cmd).catch(() => {});
+    showToast('Copied teammate 1-line install command to clipboard.');
+  });
 
   confirmBtn.onclick = async () => {
     const githubUser = document.getElementById('cfgGithubUser').value.trim();
@@ -5833,7 +5838,6 @@ async function openSettingsModal() {
     const teamProfile = document.getElementById('cfgTeamProfile')?.value || 'popcorn-back';
     const centralIssuesRepo = document.getElementById('cfgCentralIssuesRepo')?.value.trim() || 'fawr-ubi/pr-review-hub';
     const agentCli = document.getElementById('cfgAgentCli')?.value || 'agy';
-    const model = document.getElementById('cfgModel')?.value.trim() || '';
     const githubTeams = document
       .getElementById('cfgGithubTeams')
       .value.split(',')
@@ -5868,7 +5872,6 @@ async function openSettingsModal() {
           teamProfile,
           centralIssuesRepo,
           agentCli,
-          model,
           githubTeams,
           projectsDir,
           reviewsDir,
@@ -5900,7 +5903,154 @@ async function openSettingsModal() {
 }
 
 document.getElementById('settingsBtn')?.addEventListener('click', openSettingsModal);
-document.getElementById('schedulerStatusBadge')?.addEventListener('click', openSettingsModal);
+document.getElementById('schedulerStatusBadge')?.addEventListener('click', () => {
+  if (state.scheduler?.authRequired) {
+    openAgyAuthModal();
+  } else {
+    openSettingsModal();
+  }
+});
+
+let agyAuthCountdownTimer = null;
+
+async function openAgyAuthModal() {
+  const modal = document.getElementById('githubModal');
+  const titleEl = document.getElementById('modalTitle');
+  const bodyEl = document.getElementById('modalBody');
+  const confirmBtn = document.getElementById('confirmModalBtn');
+  if (!modal || !titleEl || !bodyEl || !confirmBtn) return;
+
+  if (agyAuthCountdownTimer) {
+    clearInterval(agyAuthCountdownTimer);
+    agyAuthCountdownTimer = null;
+  }
+
+  titleEl.textContent = '🔑 Sign in to Antigravity CLI (agy)';
+  confirmBtn.textContent = 'Verify & Resume Reviews';
+  confirmBtn.disabled = true;
+  modal.classList.remove('hidden');
+
+  const startFreshSession = async () => {
+    if (agyAuthCountdownTimer) {
+      clearInterval(agyAuthCountdownTimer);
+      agyAuthCountdownTimer = null;
+    }
+    confirmBtn.disabled = true;
+    bodyEl.innerHTML = `<div class="meta-text" style="padding:14px 0;">Generating fresh Google OAuth PKCE link from <code>agy</code>…</div>`;
+    try {
+      const res = await fetch('/api/agent/auth/start', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to start agy OAuth flow');
+
+      if (data.authenticated) {
+        if (data.scheduler) state.scheduler = data.scheduler;
+        renderSchedulerStatusBadge();
+        modal.classList.add('hidden');
+        await loadState(true);
+        showToast('Antigravity CLI (agy) is already signed in! Resuming reviews.');
+        return;
+      }
+
+      const authUrl = data.authUrl || '';
+      const expiresAt = Number(data.expiresAt) || Date.now() + 55000;
+
+      bodyEl.innerHTML = `
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          <p class="meta-text" style="margin:0;">
+            <code>agy</code> uses a 60-second PKCE session. Open the Google login page below, copy the authorization code (<code>4/0A...</code>), and paste it here before the timer expires.
+          </p>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;background:var(--bg-elevated);border:1px solid var(--border-color);border-radius:6px;">
+            <a id="agyOAuthOpenUrlBtn" href="${escapeHtml(authUrl)}" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">1. Open Google Login Page ↗</a>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span id="agyOAuthTimerLabel" class="meta-text" style="font-family:var(--font-mono);font-weight:600;">57s remaining</span>
+              <button type="button" id="agyOAuthRefreshBtn" class="btn btn-secondary btn-xs">Generate Fresh Link</button>
+            </div>
+          </div>
+          <div>
+            <label class="field-label" for="agyOAuthCodeInput">2. Paste Authorization Code</label>
+            <input id="agyOAuthCodeInput" type="text" class="text-input" placeholder="4/0A..." autocomplete="off" style="font-family:var(--font-mono);" />
+          </div>
+        </div>
+      `;
+
+      const codeInput = document.getElementById('agyOAuthCodeInput');
+      const timerLabel = document.getElementById('agyOAuthTimerLabel');
+      confirmBtn.disabled = false;
+      setTimeout(() => codeInput?.focus(), 60);
+
+      const updateTimer = () => {
+        if (modal.classList.contains('hidden')) {
+          clearInterval(agyAuthCountdownTimer);
+          agyAuthCountdownTimer = null;
+          return;
+        }
+        const secLeft = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+        if (timerLabel) {
+          timerLabel.textContent = secLeft > 0 ? `${secLeft}s remaining` : 'Expired — click Generate Fresh Link';
+          timerLabel.style.color = secLeft <= 12 ? 'var(--sev-blocker)' : '';
+        }
+        if (secLeft <= 0) {
+          confirmBtn.disabled = true;
+          clearInterval(agyAuthCountdownTimer);
+          agyAuthCountdownTimer = null;
+        }
+      };
+      updateTimer();
+      agyAuthCountdownTimer = setInterval(updateTimer, 1000);
+
+      document.getElementById('agyOAuthRefreshBtn')?.addEventListener('click', startFreshSession);
+      codeInput?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !confirmBtn.disabled) {
+          e.preventDefault();
+          confirmBtn.click();
+        }
+      });
+    } catch (err) {
+      bodyEl.innerHTML = `
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          <p class="meta-text" style="color:var(--sev-blocker);margin:0;">${escapeHtml(err.message)}</p>
+          <div><button type="button" id="agyOAuthRetryBtn" class="btn btn-secondary btn-sm">Try Again</button></div>
+        </div>
+      `;
+      document.getElementById('agyOAuthRetryBtn')?.addEventListener('click', startFreshSession);
+    }
+  };
+
+  confirmBtn.onclick = async () => {
+    const code = document.getElementById('agyOAuthCodeInput')?.value.trim() || '';
+    if (!code) {
+      showToast('Paste the authorization code (4/0A...) first.', 3000);
+      return;
+    }
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Verifying…';
+    try {
+      const res = await fetch('/api/agent/auth/code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Authentication failed');
+      if (agyAuthCountdownTimer) {
+        clearInterval(agyAuthCountdownTimer);
+        agyAuthCountdownTimer = null;
+      }
+      if (data.scheduler) state.scheduler = data.scheduler;
+      modal.classList.add('hidden');
+      renderSchedulerStatusBadge();
+      await loadState(true);
+      scheduleJobPollingIfNeeded();
+      showToast('Signed in to Antigravity (agy)! Auto-reviews resumed.');
+    } catch (err) {
+      showToast(err.message, 5000);
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Verify & Resume Reviews';
+    }
+  };
+
+  await startFreshSession();
+}
 
 async function openDoctorModal() {
   const modal = document.getElementById('githubModal');
@@ -5945,12 +6095,14 @@ async function openDoctorModal() {
                   </div>
                   <div class="meta-text" style="font-size:0.74rem;word-break:break-word;">${escapeHtml(chk.detail || '')}</div>
                   ${
-                    !chk.ok && chk.fixHint
-                      ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:4px;padding:4px 6px;background:var(--bg-surface);border-radius:4px;border:1px solid var(--border-subtle);">
+                    !chk.ok && chk.authRequired
+                      ? `<div style="margin-top:4px;"><button type="button" class="btn btn-primary btn-xs doctor-agy-signin-btn">🔑 Sign in to Antigravity (agy)</button></div>`
+                      : !chk.ok && chk.fixHint
+                        ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:4px;padding:4px 6px;background:var(--bg-surface);border-radius:4px;border:1px solid var(--border-subtle);">
                           <code style="font-size:0.71rem;color:var(--accent-warning,#f59e0b);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(chk.fixHint)}</code>
                           <button type="button" class="btn btn-ghost btn-xs doctor-copy-fix-btn" data-fix-cmd="${escapeHtml(chk.fixHint)}" data-idx="${idx}">Copy</button>
                         </div>`
-                      : ''
+                        : ''
                   }
                 </div>
               `
@@ -5961,6 +6113,11 @@ async function openDoctorModal() {
       `;
 
       bodyEl.querySelector('#doctorModalRecheckBtn')?.addEventListener('click', renderDoctorContent);
+      bodyEl.querySelectorAll('.doctor-agy-signin-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          openAgyAuthModal();
+        });
+      });
       bodyEl.querySelectorAll('.doctor-copy-fix-btn').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const cmd = btn.getAttribute('data-fix-cmd') || '';
@@ -6045,10 +6202,24 @@ async function openFirstRunWelcomeModal() {
         </div>
         <input type="text" id="welcomeGithubTeams" class="search-input" value="${escapeHtml((cfg.githubTeams || []).join(', '))}" placeholder="E.g.: popcorn-back, ubi-eng-team-popcorn" />
       </div>
+      <div style="border-top:1px solid var(--border-color);padding-top:10px;display:flex;flex-direction:column;gap:8px;">
+        <label style="display:block;font-weight:600;">4. Execution Mode (Teammate Reader vs Dedicated Worker):</label>
+        <select id="welcomeHubRole" class="search-input">
+          <option value="reader" ${cfg.hubRole !== 'worker' ? 'selected' : ''}>Reader Mode (Recommended for teammates — browse queue &amp; run manual reviews on demand, 0 background tokens)</option>
+          <option value="worker" ${cfg.hubRole === 'worker' ? 'selected' : ''}>Dedicated Worker Mode (periodically syncs &amp; auto-reviews open non-Draft PRs every 5m)</option>
+        </select>
+        <div>
+          <label style="display:block;font-weight:500;margin-bottom:4px;font-size:0.8rem;">Shared Store Git Repo (optional — pre-loads reviews computed by your team's Worker):</label>
+          <input type="text" id="welcomeSharedStoreRepo" class="search-input" value="${escapeHtml(cfg.sharedStoreRepo || '')}" placeholder="Optional: e.g. ubitransports/pr-review-store (leave empty for standalone local mode)" />
+        </div>
+      </div>
       <div style="border-top:1px solid var(--border-color);padding-top:10px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;flex-wrap:wrap;">
           <strong style="font-size:0.82rem;">Environment Health Check (Doctor)</strong>
-          <button type="button" id="welcomeRefreshDoctorBtn" class="btn btn-ghost btn-xs">Re-check</button>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <button type="button" id="welcomeCopyInstallCmdBtn" class="btn btn-ghost btn-xs" title="Copy 1-command install snippet for a teammate">Copy Teammate 1-Liner</button>
+            <button type="button" id="welcomeRefreshDoctorBtn" class="btn btn-ghost btn-xs">Re-check</button>
+          </div>
         </div>
         <div id="welcomeDoctorBox" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:0.76rem;">
           <span class="meta-text">Checking environment…</span>
@@ -6082,6 +6253,12 @@ async function openFirstRunWelcomeModal() {
     }
   };
   document.getElementById('welcomeRefreshDoctorBtn')?.addEventListener('click', refreshWelcomeDoctor);
+  document.getElementById('welcomeCopyInstallCmdBtn')?.addEventListener('click', async () => {
+    const repoSlug = cfg.centralIssuesRepo || 'fawr-ubi/pr-review-hub';
+    const cmd = `gh repo clone ${repoSlug} ~/.gemini/config/skills/my-review && cd ~/.gemini/config/skills/my-review && npm start`;
+    await navigator.clipboard?.writeText(cmd).catch(() => {});
+    showToast('Copied teammate 1-line install command to clipboard.');
+  });
   refreshWelcomeDoctor();
 
   (async () => {
@@ -6142,6 +6319,8 @@ async function openFirstRunWelcomeModal() {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
+    const hubRole = document.getElementById('welcomeHubRole')?.value === 'worker' ? 'worker' : 'reader';
+    const sharedStoreRepo = document.getElementById('welcomeSharedStoreRepo')?.value.trim() || '';
 
     confirmBtn.disabled = true;
     try {
@@ -6154,12 +6333,16 @@ async function openFirstRunWelcomeModal() {
           teamProfile,
           agentCli,
           githubTeams,
+          hubRole,
+          autoReviewEnabled: hubRole === 'worker',
+          sharedStoreRepo,
           onboardingCompleted: true,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Error saving configuration');
       state.config = data.config;
+      if (data.scheduler) state.scheduler = data.scheduler;
       modal.classList.add('hidden');
       await loadRules();
       await runQueueSync();

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
 import { scanPrQueue } from './sync.mjs';
-import { createQueuedReviewJob, runPrReviewJob } from './agent.mjs';
+import { createQueuedReviewJob, runPrReviewJob, isAgentAuthError } from './agent.mjs';
 import {
   hasReviewArtifact,
   pullSharedStore,
@@ -38,6 +38,7 @@ export class AutoReviewScheduler {
 
     this.queue = [];
     this.activeItem = null;
+    this.authRequired = false;
     this.failedCooldowns = new Map();
     this.failureCooldownMs = 30 * 60 * 1000;
     this._draining = false;
@@ -201,6 +202,9 @@ export class AutoReviewScheduler {
   }
 
   enqueuePendingFromLocalState({ force = false } = {}) {
+    if (this.authRequired && !force) {
+      return { enqueuedJobs: [], skippedCount: 0, authRequired: true };
+    }
     const cfg = this.loadConfigFn();
     const openPrs = readLocalOpenPrs(cfg.reviewsDir);
     // Exclude Draft PRs (isDraft or syncStatus === 'DRAFT') and prioritize unreviewed recent PRs first
@@ -241,6 +245,16 @@ export class AutoReviewScheduler {
     return { enqueuedJobs, skippedCount };
   }
 
+  resumeAfterAuth() {
+    this.authRequired = false;
+    this.failedCooldowns.clear();
+    const cfg = this.loadConfigFn();
+    if (cfg.hubRole === 'worker' && cfg.autoReviewEnabled) {
+      return this.enqueuePendingFromLocalState({ force: false });
+    }
+    return { enqueuedJobs: [], skippedCount: 0 };
+  }
+
   async _drainQueue() {
     if (this._draining) return;
     this._draining = true;
@@ -278,9 +292,24 @@ export class AutoReviewScheduler {
             scope: item.scope,
             existingJob: item.job,
           });
+          this.authRequired = false;
           this.failedCooldowns.delete(cooldownKey);
           this.completedCount++;
-        } catch {
+        } catch (err) {
+          if (isAgentAuthError(err?.message)) {
+            this.authRequired = true;
+            while (this.queue.length > 0) {
+              const pending = this.queue.shift();
+              if (pending?.job) {
+                pending.job.status = 'failed';
+                pending.job.phase = 'Paused — CLI authentication required';
+                pending.job.error = err.message;
+                pending.job.finishedAt = new Date().toISOString();
+              }
+            }
+            this.failedCount++;
+            break;
+          }
           this.failedCooldowns.set(cooldownKey, Date.now());
           this.failedCount++;
         } finally {
@@ -362,6 +391,7 @@ export class AutoReviewScheduler {
     return {
       running: this._running,
       hubRole: cfg.hubRole || 'worker',
+      authRequired: this.authRequired,
       autoReviewEnabled: Boolean(cfg.autoReviewEnabled),
       autoSyncIntervalSec: Number(cfg.autoSyncIntervalSec) || 300,
       sharedStoreConfigured: Boolean(cfg.sharedStoreRepo),

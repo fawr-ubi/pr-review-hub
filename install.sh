@@ -89,6 +89,15 @@ fi
 read -r -p "AI Agent CLI runner (agy / gemini / claude) [${DEFAULT_AGENT_CLI}]: " INPUT_AGENT_CLI
 AGENT_CLI="${INPUT_AGENT_CLI:-$DEFAULT_AGENT_CLI}"
 
+read -r -p "Hub execution role (reader [Recommended for teammates] / worker) [reader]: " INPUT_HUB_ROLE
+HUB_ROLE="${INPUT_HUB_ROLE:-reader}"
+if [[ "${HUB_ROLE}" != "worker" ]]; then
+  HUB_ROLE="reader"
+fi
+
+read -r -p "Shared Store Git repo (optional, leave empty for standalone local mode) []: " INPUT_SHARED_REPO
+SHARED_STORE_REPO="${INPUT_SHARED_REPO:-}"
+
 read -r -p "Local repositories workspace (projectsDir) [${DEFAULT_PROJECTS_DIR}]: " INPUT_PROJECTS_DIR
 PROJECTS_DIR="${INPUT_PROJECTS_DIR:-$DEFAULT_PROJECTS_DIR}"
 PROJECTS_DIR="${PROJECTS_DIR/#\~/$HOME}"
@@ -128,6 +137,9 @@ const cfg = {
   githubTeams: teams,
   teamProfile: process.argv[9] || "popcorn-back",
   agentCli: process.argv[10] || "agy",
+  hubRole: process.argv[11] === "worker" ? "worker" : "reader",
+  autoReviewEnabled: process.argv[11] === "worker",
+  sharedStoreRepo: process.argv[12] || "",
   projectsDir: process.argv[4],
   reviewsDir: process.argv[5],
   jiraBaseUrl: process.argv[6].replace(/\/+$/, ""),
@@ -137,7 +149,7 @@ const cfg = {
   onboardingCompleted: true
 };
 fs.writeFileSync(path.join(process.argv[8], "config.json"), JSON.stringify(cfg, null, 2) + "\n");
-' "${GITHUB_USER}" "${GITHUB_ORG}" "${RAW_TEAMS}" "${PROJECTS_DIR}" "${REVIEWS_DIR}" "${JIRA_BASE_URL}" "${RAW_PREFIXES}" "${TARGET_SKILL_DIR}" "${TEAM_PROFILE}" "${AGENT_CLI}"
+' "${GITHUB_USER}" "${GITHUB_ORG}" "${RAW_TEAMS}" "${PROJECTS_DIR}" "${REVIEWS_DIR}" "${JIRA_BASE_URL}" "${RAW_PREFIXES}" "${TARGET_SKILL_DIR}" "${TEAM_PROFILE}" "${AGENT_CLI}" "${HUB_ROLE}" "${SHARED_STORE_REPO}"
 
 # Synchronize 3-layer combined rule files (Common DNA + Team DNA + Local DNA) and skill symlinks
 node --input-type=module -e "

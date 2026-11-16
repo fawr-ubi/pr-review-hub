@@ -45,9 +45,10 @@ npm start
 
 #### What happens automatically on your very first `npm start`?
 - **Auto-bootstraps `config.json` & Skill Symlinks**: Queries your GitHub login (`gh api user`), discovers your GitHub teams (`gh api user/teams`), and **auto-matches your Team Agent Profile** (`popcorn-back`, `frontend-web`, `mobile-kotlin`, `qa-automation`, etc.).
-- **1-Click Welcome Setup Wizard in the UI**: On first browser load, a pre-filled Welcome modal lets you confirm your **Team Agent Profile**, watched **GitHub Teams**, and **AI CLI runner** (`agy` / `gemini` / `claude`), then syncs your open Pull Requests in 1 click.
-- **Zero-`jq` Native Node.js Sync Engine**: Fetches your open Pull Requests, review statuses, CI states, and CODEOWNERS readiness on both macOS and Linux without requiring `jq`.
-- **Works even without local repo clones**: When you click **`Run Review`** or **`Review All`**, the server fetches the PR diff and metadata directly from GitHub (`gh pr diff`) and streams it to the AI agent (`agy`, `gemini`, or `claude`) with your team's rules and review checklist embedded.
+- **Safe Teammate Default (`Reader Mode`)**: New installs default to **`Reader Mode`** (`0` background AI token burn) so teammates can safely browse the PR queue, inspect diffs, consume shared reviews, and trigger manual reviews (`Run Review`) on demand — or opt into **`Dedicated Worker Mode`** (auto-reviews open non-Draft PRs every 5 minutes) right from the 1-Click Welcome Wizard.
+- **In-App Google OAuth Sign-In for `agy`**: If your Antigravity CLI (`agy`) Google OAuth session expires, PR Review Hub displays a **`🔑 Sign in to Antigravity (agy)`** modal directly in the web UI (via a local PTY PKCE bridge) and resumes reviews automatically.
+- **Instant `👤 My PR` Identification**: Pull Requests you authored are highlighted across the queue and PR header with a dedicated **`👤 My PR`** badge, even when consuming a shared review store synced by a teammate's Worker.
+- **Zero-`jq` Native Node.js Sync Engine & Remote GitHub Diffs**: Works out of the box on macOS and Linux even without local repository clones (`gh pr diff`).
 
 ---
 

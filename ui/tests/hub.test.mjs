@@ -12,7 +12,12 @@ import {
   resolveFindingAgainstDiff
 } from '../lib/parser.mjs';
 
-import { loadConfig, saveConfig, inferTeamProfileFromGithubTeams } from '../lib/config.mjs';
+import {
+  loadConfig,
+  saveConfig,
+  ensureConfigBootstrapped,
+  inferTeamProfileFromGithubTeams,
+} from '../lib/config.mjs';
 import { recordPrReview, generateIndexMarkdown } from '../lib/sync.mjs';
 import {
   computeAuthorInitials,
@@ -29,6 +34,7 @@ import {
   runCliPrompt,
   runPrReviewJob,
   dismissFindingAsFalsePositive,
+  isAgentAuthError,
 } from '../lib/agent.mjs';
 import { AutoReviewScheduler } from '../lib/scheduler.mjs';
 import {
@@ -2039,6 +2045,113 @@ describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
         process.env.REVIEW_HUB_CONFIG = prevConfigEnv;
       } else {
         delete process.env.REVIEW_HUB_CONFIG;
+      }
+    }
+  });
+
+  test('Consolidation: strips legacy model config, defaults brand-new installs to reader, exposes My PR badge + 3-row header, and pauses scheduler on OAuth expiry', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-consolidation-'));
+    const freshCfgPath = path.join(tmpDir, 'fresh-config.json');
+    const prevRoleEnv = process.env.REVIEW_HUB_ROLE;
+    delete process.env.REVIEW_HUB_ROLE;
+
+    try {
+      const bootstrapped = ensureConfigBootstrapped(freshCfgPath);
+      assert.equal(bootstrapped.hubRole, 'reader', 'Brand-new teammate config must default to safe reader role');
+      assert.equal('model' in bootstrapped, false, 'Default config must not expose legacy model selection');
+
+      // Legacy config with broken model key is cleaned on load and save
+      fs.writeFileSync(
+        freshCfgPath,
+        JSON.stringify({
+          githubOrg: 'ubitransports',
+          githubUser: 'teammate-dev',
+          model: 'deprecated-broken-model',
+          onboardingCompleted: true,
+        }),
+        'utf8'
+      );
+      const cleanedLoad = loadConfig(freshCfgPath);
+      assert.equal('model' in cleanedLoad, false);
+      const cleanedSave = saveConfig({ model: 'another-broken-model', hubRole: 'reader' }, freshCfgPath);
+      assert.equal('model' in cleanedSave, false);
+
+      // Auth error helper & Scheduler OAuth pause + resumeAfterAuth
+      assert.equal(
+        isAgentAuthError('Antigravity CLI (agy) authentication required. Click "Sign in"'),
+        true
+      );
+      assert.equal(isAgentAuthError('Transient 503 service unavailable'), false);
+
+      const sched = new AutoReviewScheduler({
+        loadConfigFn: () => ({
+          hubRole: 'worker',
+          autoReviewEnabled: true,
+          autoSyncIntervalSec: 300,
+          teamProfile: 'popcorn-back',
+          reviewsDir: tmpDir,
+        }),
+        scanPrQueueFn: async () => ({ prs: [] }),
+        pullStoreFn: async () => ({ synced: false }),
+        hydrateFn: () => {},
+        runReviewFn: async () => {
+          throw new Error('Antigravity CLI (agy) authentication required.');
+        },
+      });
+
+      sched.enqueuePrReview({
+        repo: '2cloud-services',
+        number: 5999,
+        headRefOid: 'deadbeef1234',
+      });
+      await sched.waitForIdle();
+      assert.equal(sched.getStatus().authRequired, true);
+
+      // Next automatic enqueue stays paused while authRequired is true
+      const pausedRes = sched.enqueuePendingFromLocalState({ force: false });
+      assert.equal(pausedRes.authRequired, true);
+      assert.equal(pausedRes.enqueuedJobs.length, 0);
+
+      // Resuming after OAuth clears authRequired
+      sched.resumeAfterAuth();
+      assert.equal(sched.getStatus().authRequired, false);
+
+      // HTTP & UI verification: /api/models removed (404), UI exposes badge-my-pr, 3-row header, and welcomeHubRole
+      const prevConfigEnv = process.env.REVIEW_HUB_CONFIG;
+      process.env.REVIEW_HUB_CONFIG = freshCfgPath;
+      const srv = createHubServer();
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+      const baseUrl = `http://127.0.0.1:${srv.address().port}`;
+      try {
+        const modelsRes = await fetch(`${baseUrl}/api/models?cli=agy`);
+        assert.equal(modelsRes.status, 404, 'Removed /api/models endpoint must return 404');
+
+        const [htmlRes, cssRes, jsRes] = await Promise.all([
+          fetch(`${baseUrl}/`),
+          fetch(`${baseUrl}/styles.css`),
+          fetch(`${baseUrl}/app.js`),
+        ]);
+        const [html, css, js] = await Promise.all([htmlRes.text(), cssRes.text(), jsRes.text()]);
+
+        assert.ok(html.includes('pr-topbar-row-top'), 'index.html must include 3-row full-width topbar');
+        assert.ok(html.includes('pr-topbar-row-meta'), 'index.html must include full-width metadata row');
+        assert.ok(css.includes('.badge-my-pr'), 'styles.css must define .badge-my-pr');
+        assert.ok(css.includes('.pr-card.is-my-pr'), 'styles.css must define .pr-card.is-my-pr');
+        assert.ok(js.includes('function isMyPr(pr)'), 'app.js must define isMyPr helper');
+        assert.ok(js.includes('👤 My PR'), 'app.js must render My PR badge');
+        assert.ok(js.includes('welcomeHubRole'), 'Welcome wizard must expose Reader/Worker selector');
+        assert.equal(js.includes('cfgModel'), false, 'app.js must not contain legacy cfgModel selector');
+      } finally {
+        await new Promise((r) => srv.close(r));
+        if (prevConfigEnv) {
+          process.env.REVIEW_HUB_CONFIG = prevConfigEnv;
+        } else {
+          delete process.env.REVIEW_HUB_CONFIG;
+        }
+      }
+    } finally {
+      if (prevRoleEnv !== undefined) {
+        process.env.REVIEW_HUB_ROLE = prevRoleEnv;
       }
     }
   });

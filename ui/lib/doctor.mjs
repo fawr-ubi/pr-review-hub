@@ -88,12 +88,32 @@ export async function runDoctor(cfg = {}) {
       }
     }
   }
+  let agentAuthRequired = false;
+  if (agentOk && resolvedCli === 'agy' && !process.env.NODE_TEST_CONTEXT) {
+    try {
+      const activeBin = findCliBinaryPath('agy') || primaryBin;
+      const { stdout, stderr } = await execFileAsync(activeBin, ['models'], { timeout: 4500 });
+      if (/please sign in|authentication required/i.test(`${stdout || ''}\n${stderr || ''}`)) {
+        agentOk = false;
+        agentAuthRequired = true;
+        agentDetail = `${agentDetail} — Sign-in required`;
+      }
+    } catch (err) {
+      const msg = `${err?.stdout || ''}\n${err?.stderr || ''}\n${err?.message || ''}`;
+      if (/please sign in|authentication required/i.test(msg)) {
+        agentOk = false;
+        agentAuthRequired = true;
+        agentDetail = `${agentDetail} — Sign-in required`;
+      }
+    }
+  }
   checks.push({
     id: 'agentCli',
     label: `AI Agent CLI (${resolvedCli})`,
     ok: agentOk,
+    authRequired: agentAuthRequired,
     detail: agentDetail,
-    fixHint: 'npm install -g @google/gemini-cli && gemini',
+    fixHint: agentAuthRequired ? 'agy' : 'npm install -g @google/gemini-cli && gemini',
   });
 
   // 5. Local Projects Workspace & Git Repositories (Optional — Remote GitHub mode always works)
