@@ -2155,6 +2155,48 @@ describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
       }
     }
   });
+
+  test('Visual hierarchy: highlights key CTAs, collapses secondary actions into More dropdowns, and renders bold clickable branch pills', async () => {
+    const srv = createHubServer();
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const baseUrl = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      const [htmlRes, cssRes, jsRes] = await Promise.all([
+        fetch(`${baseUrl}/`),
+        fetch(`${baseUrl}/styles.css`),
+        fetch(`${baseUrl}/app.js`),
+      ]);
+      const [html, css, js] = await Promise.all([htmlRes.text(), cssRes.text(), jsRes.text()]);
+
+      // Prominent primary & daily-driver CTAs
+      assert.ok(html.includes('id="backToPrQueueBtn" class="btn btn-nav-back'), 'Back to All PRs must be prominent');
+      assert.ok(html.includes('id="openBatchReviewModalBtn" class="btn btn-cta-submit'), 'Submit Review must use emerald CTA');
+      assert.ok(html.includes('id="triggerReviewBtn" class="btn btn-ai'), 'Run Review must use AI accent CTA');
+      assert.ok(html.includes('id="reviewAllPendingBtn" class="btn btn-ai'), 'Review All must use AI accent CTA');
+      assert.ok(html.includes('id="syncQueueBtn" class="btn btn-sync'), 'Sync GitHub must use sync primary CTA');
+      assert.ok(html.includes('id="openGithubPrBtn"') && html.includes('btn-external'), 'GitHub link must be prominent');
+      assert.ok(html.includes('id="prJiraLink"') && html.includes('btn-jira'), 'Jira ticket link must be prominent');
+      assert.ok(html.includes('id="openPhpstormBtn" class="btn btn-ide'), 'PhpStorm button must use IDE highlight');
+      assert.ok(html.includes('id="openVscodeBtn" class="btn btn-ide'), 'VS Code button must use IDE highlight');
+
+      // Secondary actions grouped in More ▾ dropdowns
+      assert.ok(html.includes('id="prTopbarMoreMenu"'), 'PR topbar must group secondary actions into More dropdown');
+      assert.ok(html.includes('id="queueHeaderMoreMenu"'), 'Queue header must group utility actions into More dropdown');
+
+      // Bold clickable source & target branch pills + stacked amber warning + finding CTAs + uniform heights
+      assert.ok(css.includes('.branch-pill'), 'styles.css must define .branch-pill');
+      assert.ok(css.includes('.branch-pill.branch-target.is-stacked'), 'styles.css must highlight stacked target branches');
+      assert.ok(css.includes('.btn.btn-sm') && css.includes('height: 28px;'), 'All .btn-sm buttons must share locked 28px height');
+      assert.ok(css.includes('.btn.btn-xs') && css.includes('height: 24px;'), 'All .btn-xs buttons must share locked 24px height');
+      assert.ok(css.includes('[data-theme="light"] .btn.btn-ai'), 'Light theme must preserve semantic button colors');
+      assert.ok(css.includes('.btn-cta-submit') && css.includes('.btn-ai') && css.includes('.btn-diff-jump'));
+      assert.ok(js.includes('function renderBranchPillsHtml('), 'app.js must render bold clickable branch pills');
+      assert.ok(js.includes('copy-branch-btn'), 'branch pills must copy branch name on click');
+      assert.ok(js.includes('Post to GitHub') && js.includes('View in Diff'), 'Finding cards must highlight Post to GitHub & View in Diff');
+    } finally {
+      await new Promise((r) => srv.close(r));
+    }
+  });
 });
 
 

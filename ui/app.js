@@ -291,7 +291,7 @@ function syncKeybindingLegends() {
 
   const backBtn = document.getElementById('backToPrQueueBtn');
   if (backBtn) {
-    backBtn.textContent = `← All PRs (${qLbl})`;
+    backBtn.innerHTML = `&larr; All PRs <kbd class="btn-kbd">${escapeHtml(qLbl)}</kbd>`;
     backBtn.title = `Return to full-page PR selection queue (shortcut: ${qLbl})`;
   }
 
@@ -334,7 +334,7 @@ function syncKeybindingLegends() {
 
   const splitBtn = document.getElementById('toggleSplitModeBtn') || document.getElementById('toggleSplitViewBtn');
   if (splitBtn) {
-    splitBtn.textContent = `Split (${sLbl})`;
+    splitBtn.textContent = state.splitMode ? `✓ Split View (${sLbl})` : `Split View (${sLbl})`;
     splitBtn.title = `Side-by-side Report + Diff view (shortcut: ${sLbl})`;
   }
 
@@ -1022,6 +1022,30 @@ function renderMergeableTagHtml(pr, asBadge = false) {
   return `<span class="${asBadge ? 'badge badge-mergeable-blocked' : 'pr-tag pr-tag-mergeable-blocked'}" title="Not mergeable: ${escapeHtml(tooltipDetail)}">${escapeHtml(labelText)}</span>`;
 }
 
+function renderBranchPillsHtml(pr, { includeSha = false } = {}) {
+  if (!pr || !pr.headRefName) return '';
+  const head = String(pr.headRefName).trim();
+  const base = String(pr.baseRefName || 'develop').trim();
+  const isStackedBase =
+    Boolean(pr.isStacked) || !['develop', 'main', 'master'].includes(base.toLowerCase());
+  const shaShort = includeSha ? (pr.headRefOid || pr.lastReviewedSha || '').slice(0, 7) : '';
+  const shaNote = shaShort
+    ? `<span class="branch-sha-note">&middot; commit ${escapeHtml(shaShort)}</span>`
+    : '';
+  const targetTitle = isStackedBase
+    ? `Stacked / Feature target branch (base): ${base} — Click to copy`
+    : `Target branch (base): ${base} — Click to copy`;
+
+  return `
+    <span class="branch-flow">
+      <button type="button" class="branch-pill branch-source copy-branch-btn" data-branch="${escapeHtml(head)}" title="Source branch (head): ${escapeHtml(head)} — Click to copy">${escapeHtml(head)}</button>
+      <span class="branch-arrow" aria-hidden="true">&rarr;</span>
+      <button type="button" class="branch-pill branch-target ${isStackedBase ? 'is-stacked' : ''} copy-branch-btn" data-branch="${escapeHtml(base)}" title="${escapeHtml(targetTitle)}">${escapeHtml(base)}</button>
+      ${shaNote}
+    </span>
+  `;
+}
+
 function renderPrList() {
   syncPrSortOrderButton();
   const listEl = document.getElementById('prList');
@@ -1069,17 +1093,17 @@ function renderPrList() {
           : '';
 
       const needsRun = pr.syncStatus === 'NEEDS_REVIEW' || pr.syncStatus === 'NEEDS_UPDATE' || pr.syncStatus === 'DRAFT';
+      const highlightRunCta = needsRun && !pr.isDraft;
       const quickRunBtn = pr.runningJob
         ? `<span class="badge"><span class="spinner"></span> AI Review running…</span>`
         : needsRun
-        ? `<button class="btn btn-secondary btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Run AI review now">Run AI Review</button>`
+        ? `<button class="btn ${highlightRunCta ? 'btn-ai' : 'btn-secondary'} btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Run AI review now">Run AI Review</button>`
         : `<button class="btn btn-secondary btn-xs card-run-review-btn" data-key="${escapeHtml(pr.key)}" title="Re-run AI review">Re-run Review</button>`;
 
       const cleanStatus = formatCleanStatus(pr.reviewStatus);
       const cleanSummary = formatCleanSummary(pr.findingsSummary);
-      const shaShort = (pr.headRefOid || pr.lastReviewedSha || '').slice(0, 7);
       const branchSummary = pr.headRefName
-        ? `<div class="pr-card-branch">${escapeHtml(pr.headRefName)} → ${escapeHtml(pr.baseRefName || 'develop')}${shaShort ? ` · commit ${escapeHtml(shaShort)}` : ''}</div>`
+        ? `<div class="pr-card-branch">${renderBranchPillsHtml(pr, { includeSha: true })}</div>`
         : '';
 
       // Detailed PR metadata & review tags
@@ -1172,7 +1196,7 @@ function renderPrList() {
               ${postedInfo}
             </div>
             <div class="pr-card-actions">
-              <button class="btn btn-primary btn-xs card-open-report-btn" data-key="${escapeHtml(pr.key)}" title="Open full audit report (default click action)">Read Audit</button>
+              <button class="btn btn-secondary btn-xs card-open-report-btn" data-key="${escapeHtml(pr.key)}" title="Open full audit report (default click action)">Read Audit</button>
               <button class="btn btn-secondary btn-xs card-open-diff-btn" data-key="${escapeHtml(pr.key)}" title="Open 3. Git Diff tab">Open Diff</button>
               ${quickRunBtn}
             </div>
@@ -1192,6 +1216,7 @@ function renderPrList() {
     card.addEventListener('click', (e) => {
       if (
         e.target.closest('.author-badge') ||
+        e.target.closest('.copy-branch-btn') ||
         e.target.closest('.card-run-review-btn') ||
         e.target.closest('.card-open-report-btn') ||
         e.target.closest('.card-open-diff-btn')
@@ -1331,9 +1356,10 @@ function renderTopbar(pr) {
   const sha = (pr.headRefOid || pr.lastReviewedSha || '').slice(0, 7);
   document.getElementById('prShaBadge').textContent = sha ? `commit ${sha}` : '';
   document.getElementById('prTitleHeader').textContent = pr.title || pr.key;
-  document.getElementById('prBranchRow').textContent = pr.headRefName
-    ? `${pr.headRefName} → ${pr.baseRefName || 'develop'}`
-    : '';
+  const branchRowEl = document.getElementById('prBranchRow');
+  if (branchRowEl) {
+    branchRowEl.innerHTML = renderBranchPillsHtml(pr, { includeSha: false });
+  }
   document.getElementById('openGithubPrBtn').href =
     pr.url || `https://github.com/ubitransports/${pr.repo}/pull/${pr.number}`;
 
@@ -1595,7 +1621,17 @@ function renderReportFindingsQuickBar() {
                   <button class="btn btn-ghost btn-xs qbar-ask-btn" data-idx="${idx}" title="Ask agent about this finding">Ask Agent</button>
                   <button class="btn btn-ghost btn-xs qbar-add-rule-btn" data-idx="${idx}" title="Extract a permanent rule into reviewer-dna.md">+ Rule</button>
                   <button class="btn btn-ghost btn-xs qbar-dismiss-btn" data-idx="${idx}" title="Mark as false positive (updates false-positives.md)">${f.dismissed ? 'Dismissed' : 'False Positive'}</button>
-                  <button class="btn btn-secondary btn-xs qbar-copy-btn" data-idx="${idx}">Copy MD</button>
+                  <button class="btn btn-ghost btn-xs qbar-copy-btn" data-idx="${idx}">Copy MD</button>
+                  ${
+                    f.filePath
+                      ? `<button class="btn btn-diff-jump btn-xs qbar-view-diff-btn" data-path="${escapeHtml(f.filePath)}" data-line="${f.startLine || ''}" title="Open this exact line in Git Diff">View in Diff</button>`
+                      : ''
+                  }
+                  ${
+                    f.posted
+                      ? `<span class="badge badge-severity-ok" title="Already posted to GitHub">&check; Posted</span>`
+                      : `<button class="btn btn-cta-submit btn-xs qbar-post-gh-btn" data-idx="${idx}" title="Preview and post this finding comment to GitHub">Post to GitHub</button>`
+                  }
                 </div>
               </div>
             </div>
@@ -1657,6 +1693,19 @@ function renderReportFindingsQuickBar() {
         await navigator.clipboard.writeText(f.customComment);
         showToast(`Comment ${f.id} copied.`);
       }
+    });
+  });
+
+  barEl.querySelectorAll('.qbar-view-diff-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      navigateToCodeLocation(btn.dataset.path, Number(btn.dataset.line) || null, 'diff');
+    });
+  });
+
+  barEl.querySelectorAll('.qbar-post-gh-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const f = findings[Number(btn.dataset.idx)];
+      if (f) openSingleCommentModal(f, f.filePath ? 'inline' : 'general');
     });
   });
 }
@@ -1938,7 +1987,17 @@ function upgradeReportFindingsInDom(container, findings) {
         <button class="btn btn-ghost btn-xs rcard-ask-btn" data-idx="${fIdx}">Ask Agent</button>
         <button class="btn btn-ghost btn-xs rcard-rule-btn" data-idx="${fIdx}">+ Rule</button>
         <button class="btn btn-ghost btn-xs rcard-fp-btn" data-idx="${fIdx}">${finding.dismissed ? 'Dismissed' : 'False Positive'}</button>
-        <button class="btn btn-secondary btn-xs rcard-copy-btn" data-idx="${fIdx}">Copy MD</button>
+        <button class="btn btn-ghost btn-xs rcard-copy-btn" data-idx="${fIdx}">Copy MD</button>
+        ${
+          fullLoc
+            ? `<button class="btn btn-diff-jump btn-xs rcard-view-diff-btn" data-path="${escapeHtml(finding.filePath)}" data-line="${finding.startLine || ''}" title="Jump to ${escapeHtml(fullLoc)} in Git Diff">View in Diff</button>`
+            : ''
+        }
+        ${
+          finding.posted
+            ? `<span class="badge badge-severity-ok" title="Already posted to GitHub">&check; Posted</span>`
+            : `<button class="btn btn-cta-submit btn-xs rcard-post-gh-btn" data-idx="${fIdx}" title="Preview and post this finding comment to GitHub">Post to GitHub</button>`
+        }
       </div>
     `;
 
@@ -2011,6 +2070,13 @@ function upgradeReportFindingsInDom(container, findings) {
     header.querySelector('.rcard-copy-btn')?.addEventListener('click', async () => {
       await navigator.clipboard.writeText(finding.customComment);
       showToast(`Comment ${finding.id} copied.`);
+    });
+    header.querySelector('.rcard-view-diff-btn')?.addEventListener('click', (e) => {
+      const btn = e.currentTarget;
+      navigateToCodeLocation(btn.dataset.path, Number(btn.dataset.line) || null, 'diff');
+    });
+    header.querySelector('.rcard-post-gh-btn')?.addEventListener('click', () => {
+      openSingleCommentModal(finding, finding.filePath ? 'inline' : 'general');
     });
   });
 }
@@ -2722,12 +2788,15 @@ function renderFindingsTab() {
               <div class="finding-actions-right">
                 ${
                   f.filePath
-                    ? `<button class="btn btn-primary btn-sm post-inline-btn" data-idx="${idx}">
-                        Post inline
+                    ? `<button class="btn btn-diff-jump btn-sm view-diff-finding-btn" data-path="${escapeHtml(f.filePath)}" data-line="${f.startLine || ''}">
+                        View in Diff
+                      </button>
+                      <button class="btn btn-cta-submit btn-sm post-inline-btn" data-idx="${idx}">
+                        Post to GitHub
                       </button>`
                     : ''
                 }
-                <button class="btn btn-secondary btn-sm post-general-btn" data-idx="${idx}">
+                <button class="btn ${f.filePath ? 'btn-secondary' : 'btn-cta-submit'} btn-sm post-general-btn" data-idx="${idx}">
                   Post general
                 </button>
               </div>
@@ -2844,6 +2913,12 @@ function renderFindingsTab() {
     btn.addEventListener('click', () => {
       const f = findings[Number(btn.dataset.idx)];
       openSingleCommentModal(f, 'inline');
+    });
+  });
+
+  listEl.querySelectorAll('.view-diff-finding-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      navigateToCodeLocation(btn.dataset.path, Number(btn.dataset.line) || null, 'diff');
     });
   });
 
@@ -7714,6 +7789,36 @@ document.addEventListener('DOMContentLoaded', () => {
     if ((e.key === '~' || e.key === '`' || (e.ctrlKey && e.key.toLowerCase() === 'l')) && !e.target.matches('input, textarea, select')) {
       e.preventDefault();
       toggleDebugConsole();
+    } else if (e.key === 'Escape') {
+      document.querySelectorAll('details.action-dropdown[open]').forEach((d) => {
+        d.removeAttribute('open');
+      });
+    }
+  });
+
+  // Delegated click handler: copy clickable branch pills + auto-close More ▾ dropdowns
+  document.addEventListener('click', async (e) => {
+    const branchBtn = e.target.closest('.copy-branch-btn');
+    if (branchBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const branchName = branchBtn.dataset.branch || '';
+      if (branchName) {
+        await navigator.clipboard?.writeText(branchName).catch(() => {});
+        showToast(`Copied branch: ${branchName}`, 2200);
+      }
+      return;
+    }
+
+    const clickedDropdown = e.target.closest('details.action-dropdown');
+    document.querySelectorAll('details.action-dropdown[open]').forEach((openEl) => {
+      if (openEl !== clickedDropdown) {
+        openEl.removeAttribute('open');
+      }
+    });
+
+    if (e.target.closest('.action-dropdown-item')) {
+      clickedDropdown?.removeAttribute('open');
     }
   });
 });
