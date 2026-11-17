@@ -6361,15 +6361,17 @@ async function openFirstRunWelcomeModal() {
         <input type="text" id="welcomeGithubTeams" class="search-input" value="${escapeHtml((cfg.githubTeams || []).join(', '))}" placeholder="E.g.: popcorn-back, ubi-eng-team-popcorn" />
       </div>
       <div style="border-top:1px solid var(--border-color);padding-top:10px;display:flex;flex-direction:column;gap:8px;">
-        <label style="display:block;font-weight:600;">4. Execution Mode (Teammate Reader vs Dedicated Worker):</label>
+        <label style="display:block;font-weight:600;">4. Execution Mode:</label>
         <select id="welcomeHubRole" class="search-input">
-          <option value="reader" ${cfg.hubRole !== 'worker' ? 'selected' : ''}>Reader Mode (Recommended for teammates — browse queue &amp; run manual reviews on demand, 0 background tokens)</option>
+          <option value="reader" ${cfg.hubRole !== 'worker' ? 'selected' : ''}>Standalone / Reader Mode (Recommended — browse queue &amp; click Run Review on demand, 0 background tokens)</option>
           <option value="worker" ${cfg.hubRole === 'worker' ? 'selected' : ''}>Dedicated Worker Mode (periodically syncs &amp; auto-reviews open non-Draft PRs every 5m)</option>
         </select>
-        <div>
-          <label style="display:block;font-weight:500;margin-bottom:4px;font-size:0.8rem;">Shared Store Git Repo (optional — pre-loads reviews computed by your team's Worker):</label>
-          <input type="text" id="welcomeSharedStoreRepo" class="search-input" value="${escapeHtml(cfg.sharedStoreRepo || '')}" placeholder="Optional: e.g. ubitransports/pr-review-store (leave empty for standalone local mode)" />
-        </div>
+        <details style="font-size:0.79rem;">
+          <summary style="cursor:pointer;color:var(--text-muted);user-select:none;">Advanced: Connect to a private Shared Team Store (optional)</summary>
+          <div style="margin-top:6px;">
+            <input type="text" id="welcomeSharedStoreRepo" class="search-input" value="${escapeHtml(cfg.sharedStoreRepo || '')}" placeholder="Leave empty for standalone mode (or enter a PRIVATE repo slug)" />
+          </div>
+        </details>
       </div>
       <div style="border-top:1px solid var(--border-color);padding-top:10px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;flex-wrap:wrap;">
@@ -6419,6 +6421,28 @@ async function openFirstRunWelcomeModal() {
   });
   refreshWelcomeDoctor();
 
+  let manualProfileOverride = false;
+  const profileSelectEl = document.getElementById('welcomeTeamProfile');
+  profileSelectEl?.addEventListener('change', () => {
+    manualProfileOverride = true;
+  });
+
+  const autoMatchWelcomeProfileFromSlugs = (slugs = []) => {
+    if (manualProfileOverride || !profileSelectEl) return;
+    const clean = slugs.map((s) => String(s || '').trim().toLowerCase().replace(/^[^/]+\//, '')).filter(Boolean);
+    if (clean.length === 0) return;
+    const ordered = [...profiles].sort((a, b) =>
+      a.id === 'popcorn-back' ? 1 : b.id === 'popcorn-back' ? -1 : a.id.localeCompare(b.id)
+    );
+    for (const prof of ordered) {
+      const pTeams = (prof.githubTeams || []).map((t) => String(t || '').trim().toLowerCase().replace(/^[^/]+\//, ''));
+      if (clean.some((sl) => pTeams.includes(sl))) {
+        profileSelectEl.value = prof.id;
+        return;
+      }
+    }
+  };
+
   (async () => {
     const box = document.getElementById('welcomeDiscoveredTeamsBox');
     const orgInput = document.getElementById('welcomeGithubOrg');
@@ -6446,6 +6470,7 @@ async function openFirstRunWelcomeModal() {
         teams.forEach((t) => selectedSet.add(t.slug));
         teamsInput.value = Array.from(selectedSet).join(', ');
       }
+      autoMatchWelcomeProfileFromSlugs(Array.from(selectedSet));
       box.innerHTML = teams
         .map((t) => {
           const checked = selectedSet.has(t.slug) || selectedSet.has(t.combinedSlug);
@@ -6461,6 +6486,7 @@ async function openFirstRunWelcomeModal() {
         cb.addEventListener('change', () => {
           const checkedSlugs = Array.from(box.querySelectorAll('.welcome-team-cb:checked')).map((el) => el.value);
           teamsInput.value = checkedSlugs.join(', ');
+          autoMatchWelcomeProfileFromSlugs(checkedSlugs);
         });
       });
     } catch {

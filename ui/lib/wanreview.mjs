@@ -446,7 +446,10 @@ export function loadWanreviewRulesFromRepo(wanreviewRepoPath = '', teamProfileId
   }
 
   const mapped = mapHubTeamToWanreview(teamProfileId);
-  const teamDir = mapped.team ? path.join(rulesRoot, 'teams', mapped.team) : '';
+  const candidateTeamDirs = [mapped.team, String(teamProfileId || '').trim().toLowerCase()]
+    .filter(Boolean)
+    .map((slug) => path.join(rulesRoot, 'teams', slug));
+  const teamDir = candidateTeamDirs.find((d) => fs.existsSync(d)) || candidateTeamDirs[0] || '';
   const teamLayerMeta = teamDir ? parseLayerMetadataFile(path.join(teamDir, '_layer.md')) : { vertical: '', disable: [] };
   const effectiveVertical = teamLayerMeta.vertical || mapped.vertical;
   const verticalDir = effectiveVertical ? path.join(rulesRoot, 'verticals', effectiveVertical) : '';

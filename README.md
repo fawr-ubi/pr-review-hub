@@ -1,18 +1,16 @@
-# PR Review Hub & `my-review` Agent (`v1.2.0`)
+# PR Review Hub & `my-review` Agent (`v1.3.0`)
 
-Zero-dependency local web cockpit (`http://localhost:4242`) and continuously learning AI code review agent (`my-review`) for GitHub Pull Requests. Built to scale across **any GitHub account, any GitHub organization, and multiple engineering teams** with dedicated team agent profiles, layered review rules, and human-in-the-loop GitHub publishing.
+Zero-dependency local web cockpit (`http://localhost:4242`), **Multi-Domain `/100` PR Scoring Engine** (5 specialized agents), and continuously learning AI code review agent (`my-review`) for GitHub Pull Requests. Built to scale across **any GitHub account, any GitHub organization, and multiple engineering squads** (`Popcorn`, `Pili`, `Banana`, `Papaya`, `Frontend Web`, `Mobile Kotlin`, `QA Automation`) with layered review rules, `ubitransports/wanreview` compatibility, and 100% human-in-the-loop GitHub publishing.
 
-> **100% Human-in-the-Loop Guarantee:** The AI agent and background sync **never** auto-publish comments or reviews to GitHub. Every inline comment, reply, or review submission happens only when you explicitly click a button in the UI.
+> **100% Human-in-the-Loop & Zero Background Token Burn by Default:** The AI agent **never** auto-publishes comments or reviews to GitHub. New teammate installs default to **Standalone / Reader Mode** (`0` background token burn — AI reviews only run when you explicitly click `Run Review`).
 
 ---
 
-## ⚡ 1-Command Zero-Config Quick Start (< 30 Seconds)
+## ⚡ 1-Command Colleague Full Setup (< 30 Seconds)
 
 You don't need `npm install` (zero external dependencies) or manual configuration files. Just make sure `node` (>= 18), `gh` (authenticated), and an AI CLI (`agy`, `gemini`, or `claude`) are installed:
 
 ### 1. Prerequisites (macOS / Linux)
-
-You must install **and configure** your AI runner so it can call the LLM API.
 
 ```bash
 # 1. Core CLI tools (Node.js >= 18 & GitHub CLI)
@@ -22,33 +20,31 @@ brew install node gh
 gh auth status || gh auth login
 
 # 3. AI Agent CLI: Antigravity CLI (`agy`), Gemini CLI (`gemini`), or Claude Code CLI (`claude`)
-# IMPORTANT: Make sure your AI runner is installed AND authenticated (e.g. valid API key configured).
-# Without a working AI runner, clicking "Run Review" will do nothing.
 which agy || which gemini || which claude
+
+# 4. Optional (Enriches Product & Scope Agent with Jira acceptance criteria):
+which acli || echo "Optional: acli not installed — Product agent will fall back to PR description"
 ```
 
 ---
 
-### 2. Clone & Start Immediately (Zero-Config Auto-Setup)
+### 2. 1-Command Full Colleague Setup
 
-Clone the repository anywhere (either directly into `~/.gemini/config/skills/my-review` or in your usual projects folder — skill symlinks for Antigravity/Gemini and Claude Code are created automatically on startup):
+Run this single command in your terminal — it clones **PR Review Hub**, auto-detects your GitHub account & squad (`Pili`, `Popcorn`, `Banana`, `Papaya`, `Front`, `Mobile`, `QA`), syncs your open Pull Requests, runs `Doctor`, starts the background daemon (no terminal tab kept open), and opens **[http://localhost:4242](http://localhost:4242)**:
 
 ```bash
 gh repo clone fawr-ubi/pr-review-hub ~/.gemini/config/skills/my-review && \
-cd ~/.gemini/config/skills/my-review && \
-npm start
+~/.gemini/config/skills/my-review/install.sh
 ```
 
-*(Alternative if you prefer `git clone`: `git clone https://github.com/fawr-ubi/pr-review-hub.git ~/.gemini/config/skills/my-review && cd ~/.gemini/config/skills/my-review && npm start`)*
+*(Want zero interactive prompts using your auto-detected GitHub teams? Append `--yes`. To check status or stop the background daemon anytime: `cd ~/.gemini/config/skills/my-review && npm run status` / `npm run stop`.)*
 
-**[http://localhost:4242](http://localhost:4242)** opens automatically in your browser!
-
-#### What happens automatically on your very first `npm start`?
-- **Auto-bootstraps `config.json` & Skill Symlinks**: Queries your GitHub login (`gh api user`), discovers your GitHub teams (`gh api user/teams`), and **auto-matches your Team Agent Profile** (`popcorn-back`, `frontend-web`, `mobile-kotlin`, `qa-automation`, etc.).
-- **Safe Teammate Default (`Reader Mode`)**: New installs default to **`Reader Mode`** (`0` background AI token burn) so teammates can safely browse the PR queue, inspect diffs, consume shared reviews, and trigger manual reviews (`Run Review`) on demand — or opt into **`Dedicated Worker Mode`** (auto-reviews open non-Draft PRs every 5 minutes) right from the 1-Click Welcome Wizard.
-- **In-App Google OAuth Sign-In for `agy`**: If your Antigravity CLI (`agy`) Google OAuth session expires, PR Review Hub displays a **`🔑 Sign in to Antigravity (agy)`** modal directly in the web UI (via a local PTY PKCE bridge) and resumes reviews automatically.
-- **Instant `👤 My PR` Identification**: Pull Requests you authored are highlighted across the queue and PR header with a dedicated **`👤 My PR`** badge, even when consuming a shared review store synced by a teammate's Worker.
-- **Zero-`jq` Native Node.js Sync Engine & Remote GitHub Diffs**: Works out of the box on macOS and Linux even without local repository clones (`gh pr diff`).
+#### What happens automatically on your very first start?
+- **Auto-bootstraps `config.json` & Squad Profile**: Detects your GitHub login (`gh api user`), discovers your GitHub teams (`gh api user/teams`), and **auto-selects your Squad Agent Profile** (`pili-back`, `popcorn-back`, `banana-back`, `papaya-back`, `frontend-web`, `mobile-kotlin`, `qa-automation`).
+- **Safe Teammate Standalone Mode (`0` background tokens)**: Starts in **`Standalone / Reader Mode`** so you browse your PR queue freely and trigger 5-agent reviews (`Run Review`) on demand.
+- **Multi-Domain `/100` PR Scorecard**: Evaluates each reviewed PR across **5 domain agents** (`Security 25%`, `Product & Scope 20%`, `Quality & Architecture 25%`, `Performance 15%`, `Testing & Anti-Bloat 15%`) with live score recalculation on False Positive dismissal and isolated single-agent Deep Re-runs (`↻`).
+- **In-App Google OAuth Sign-In for `agy`**: If your Antigravity CLI (`agy`) Google OAuth session expires, sign back in directly inside the web UI modal without leaving your browser.
+- **Instant `👤 My PR` Badge**: Pull Requests you authored are highlighted across the queue and PR header.
 
 ---
 
@@ -196,10 +192,14 @@ Every shortcut can be customized by clicking **`? Keyboard Shortcuts`** in the b
 ## 🧪 Useful CLI Commands
 
 ```bash
-npm start        # Start PR Review Hub on http://localhost:4242 (auto-bootstraps config on first run)
-npm run setup    # Run interactive ./install.sh wizard
-npm run doctor   # Run environment & AI CLI health checks
-npm run sync     # Scan GitHub PR queue via scripts/sync-queue.sh
-npm test         # Run the unit & E2E test suite
-npm run package  # Build a clean pr-review-hub-shareable.zip archive
+npm run start:bg      # Start PR Review Hub as a background daemon on :4242 and open browser
+npm run status        # Check daemon status, active squad profile, and cached PR count
+npm run stop          # Stop running background daemon cleanly
+npm start             # Start PR Review Hub in foreground
+npm run doctor        # Run environment, AI CLI & Jira CLI health checks
+npm run setup         # Run interactive ./install.sh wizard (+ macOS Finder launcher)
+npm run simulate:pili # Launch an isolated brand-new colleague setup simulation for Pili Squad (:4243)
+npm run sync          # Scan GitHub PR queue via scripts/sync-queue.sh
+npm test              # Run the 50-test unit & E2E suite
+npm run package       # Build a clean pr-review-hub-shareable.zip archive
 ```

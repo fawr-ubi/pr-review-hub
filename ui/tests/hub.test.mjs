@@ -58,6 +58,7 @@ import {
   saveReviewArtifact,
   pullSharedStore,
   pushSharedStore,
+  assertSharedStoreNotPublicGithub,
   recordSharedFindingAction,
   readSharedFindingsState,
 } from '../lib/store.mjs';
@@ -296,7 +297,8 @@ describe('Diff Hunk Parser & Line Resolver', () => {
 // 5. Integration Tests: Real Review Markdown Files in Workspace
 // =============================================================================
 describe('Real Review Markdown Reports Integration', () => {
-  const realReviewsDir = '/Users/antoinefawer/Ubitransport/projects/artifacts/reviews';
+  const realReviewsDir =
+    process.env.REVIEWS_DIR || path.join(os.homedir(), 'Ubitransport/projects/artifacts/reviews');
 
   test('successfully parses all real review-*.md files without throwing', () => {
     if (!fs.existsSync(realReviewsDir)) return;
@@ -1503,8 +1505,10 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     assert.equal(inferTeamProfileFromGithubTeams(['popcorn-front']), 'frontend-web');
     assert.equal(inferTeamProfileFromGithubTeams(['ubitransports/ubi-eng-team-mobile']), 'mobile-kotlin');
     assert.equal(inferTeamProfileFromGithubTeams(['ubi-eng-team-qa']), 'qa-automation');
-    assert.equal(inferTeamProfileFromGithubTeams(['pili-back']), 'popcorn-back');
-    assert.equal(inferTeamProfileFromGithubTeams(['banana-back']), 'popcorn-back');
+    assert.equal(inferTeamProfileFromGithubTeams(['pili-back']), 'pili-back');
+    assert.equal(inferTeamProfileFromGithubTeams(['banana-back']), 'banana-back');
+    assert.equal(inferTeamProfileFromGithubTeams(['papaya-back']), 'papaya-back');
+    assert.equal(inferTeamProfileFromGithubTeams(['popcorn-back']), 'popcorn-back');
     assert.equal(inferTeamProfileFromGithubTeams([]), 'popcorn-back');
 
     // 2. Native Node.js sync engine records review state and generates INDEX.md without jq
@@ -2689,6 +2693,96 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
       }
       fs.rmSync(tmpWanDir, { recursive: true, force: true });
       fs.rmSync(tmpExportDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Colleague Onboarding Simulation (Pili Squad): auto-detects pili-back, defaults to Standalone Reader Mode, exposes Doctor Jira/Mode checks, and blocks public GitHub sharedStore pushes', async () => {
+    const tmpSimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-sim-pili-'));
+    const prevCfgEnv = process.env.REVIEW_HUB_CONFIG;
+    const prevTeamsEnv = process.env.REVIEW_HUB_TEAMS;
+    const prevRoleEnv = process.env.REVIEW_HUB_ROLE;
+    const prevReviewsEnv = process.env.REVIEWS_DIR;
+
+    const simCfgPath = path.join(tmpSimDir, 'config.json');
+    const simReviewsDir = path.join(tmpSimDir, 'reviews');
+    process.env.REVIEW_HUB_CONFIG = simCfgPath;
+    process.env.REVIEW_HUB_TEAMS = 'pili-back,ubi-eng-team-pili';
+    process.env.REVIEW_HUB_ROLE = 'reader';
+    process.env.REVIEWS_DIR = simReviewsDir;
+
+    try {
+      // 1. Fresh colleague bootstrap must select `pili-back`, Reader Mode, 0 background auto-review, and trigger Welcome Wizard
+      const bootstrapped = ensureConfigBootstrapped(simCfgPath);
+      assert.equal(bootstrapped.teamProfile, 'pili-back');
+      assert.deepEqual(bootstrapped.githubTeams, ['pili-back', 'ubi-eng-team-pili']);
+      assert.equal(bootstrapped.hubRole, 'reader');
+      assert.equal(bootstrapped.autoReviewEnabled, false);
+      assert.equal(bootstrapped.onboardingCompleted, false);
+
+      // 2. Spin up server and verify Welcome endpoints + Doctor checks (`acli` + `executionMode`)
+      const srv = createHubServer();
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+      const port = srv.address().port;
+      const baseUrl = `http://127.0.0.1:${port}`;
+
+      try {
+        const [stateRes, teamsRes, doctorRes, profilesRes] = await Promise.all([
+          fetch(`${baseUrl}/api/state`),
+          fetch(`${baseUrl}/api/github/teams?org=ubitransports`),
+          fetch(`${baseUrl}/api/doctor`),
+          fetch(`${baseUrl}/api/teams/profiles`),
+        ]);
+        const stateJson = await stateRes.json();
+        const teamsJson = await teamsRes.json();
+        const doctorJson = await doctorRes.json();
+        const profilesJson = await profilesRes.json();
+
+        assert.equal(stateJson.config.teamProfile, 'pili-back');
+        assert.equal(stateJson.config.hubRole, 'reader');
+        assert.equal(stateJson.config.onboardingCompleted, false);
+        assert.deepEqual(
+          teamsJson.teams.map((t) => t.slug),
+          ['pili-back', 'ubi-eng-team-pili']
+        );
+        assert.ok(
+          (profilesJson.profiles || []).some((p) => p.id === 'pili-back'),
+          'Team profiles catalog must expose dedicated pili-back squad profile'
+        );
+        assert.ok(
+          (doctorJson.checks || []).some((c) => c.id === 'acli' && c.ok === true),
+          'Doctor must expose non-blocking Jira CLI check'
+        );
+        assert.ok(
+          (doctorJson.checks || []).some(
+            (c) => c.id === 'executionMode' && c.detail.includes('Standalone Mode')
+          ),
+          'Doctor must confirm Teammate Standalone Mode'
+        );
+      } finally {
+        await new Promise((r) => srv.close(r));
+      }
+
+      // 3. Public GitHub leak guard must reject pushing internal review artifacts to a public repo
+      await assert.rejects(
+        () =>
+          assertSharedStoreNotPublicGithub('fawr-ubi/pr-review-hub', async () => false),
+        /Security block: refusing to push internal PR review artifacts to PUBLIC GitHub repository/
+      );
+      const privRes = await assertSharedStoreNotPublicGithub(
+        'ubitransports/private-review-store',
+        async () => true
+      );
+      assert.equal(privRes.ok, true);
+    } finally {
+      if (prevCfgEnv !== undefined) process.env.REVIEW_HUB_CONFIG = prevCfgEnv;
+      else delete process.env.REVIEW_HUB_CONFIG;
+      if (prevTeamsEnv !== undefined) process.env.REVIEW_HUB_TEAMS = prevTeamsEnv;
+      else delete process.env.REVIEW_HUB_TEAMS;
+      if (prevRoleEnv !== undefined) process.env.REVIEW_HUB_ROLE = prevRoleEnv;
+      else delete process.env.REVIEW_HUB_ROLE;
+      if (prevReviewsEnv !== undefined) process.env.REVIEWS_DIR = prevReviewsEnv;
+      else delete process.env.REVIEWS_DIR;
+      fs.rmSync(tmpSimDir, { recursive: true, force: true });
     }
   });
 });

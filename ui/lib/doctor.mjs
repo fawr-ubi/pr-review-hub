@@ -45,14 +45,31 @@ export async function runDoctor(cfg = {}) {
   let ghAuthDetail = ghCheck.detail;
   if (ghCheck.ok) {
     try {
-      const { stdout, stderr } = await execFileAsync('gh', ['auth', 'status'], { timeout: 5000 });
+      const { stdout, stderr } = await execFileAsync('gh', ['auth', 'status'], { timeout: 8000 });
       ghAuthOk = true;
       const combined = `${stdout || ''}\n${stderr || ''}`;
       const match = combined.match(/Logged in to [^\s]+ account ([^\s(]+)/i);
       ghAuthDetail = match ? `Authenticated as ${match[1]}` : 'Authenticated with GitHub CLI';
     } catch {
-      ghAuthOk = false;
-      ghAuthDetail = 'Not authenticated (run: gh auth login)';
+      // Check local token via `gh auth token` so transient GitHub API timeouts aren't misreported as logged-out
+      try {
+        const { stdout: tok } = await execFileAsync('gh', ['auth', 'token'], { timeout: 2500 });
+        if (String(tok || '').trim().length > 5) {
+          ghAuthOk = true;
+          const hostsPath = path.join(os.homedir(), '.config', 'gh', 'hosts.yml');
+          const rawHosts = fs.existsSync(hostsPath) ? fs.readFileSync(hostsPath, 'utf8') : '';
+          const userMatch = rawHosts.match(/^\s*user:\s*([^\s#]+)/m);
+          ghAuthDetail = userMatch
+            ? `Authenticated locally as ${userMatch[1]} (GitHub API slow/offline)`
+            : 'Authenticated locally via gh keyring';
+        } else {
+          ghAuthOk = false;
+          ghAuthDetail = 'Not authenticated (run: gh auth login)';
+        }
+      } catch {
+        ghAuthOk = false;
+        ghAuthDetail = 'Not authenticated (run: gh auth login)';
+      }
     }
   }
   checks.push({
@@ -204,6 +221,37 @@ export async function runDoctor(cfg = {}) {
     detail: fs.existsSync(geminiSkillPath)
       ? `Linked at ${geminiSkillPath}`
       : `Loaded from ${SKILL_ROOT}`,
+  });
+
+  // 9. Optional Atlassian CLI (acli) for Product & Scope Jira enrichment
+  const acliBin =
+    ['/opt/homebrew/bin/acli', '/usr/local/bin/acli', path.join(os.homedir(), '.local/bin/acli')].find((p) =>
+      fs.existsSync(p)
+    ) || 'acli';
+  const acliCheck = await checkBinary(acliBin, ['--version']);
+  checks.push({
+    id: 'acli',
+    label: 'Atlassian Jira CLI (Product Agent Context)',
+    ok: true,
+    optional: !acliCheck.ok,
+    detail: acliCheck.ok
+      ? `Active (${acliCheck.detail}) — Jira acceptance criteria auto-loaded with 1h cache`
+      : 'Optional — Not installed; Product agent falls back cleanly to PR description & commit messages',
+  });
+
+  // 10. Hub Execution Mode (Standalone Reader vs Shared Store vs Worker)
+  const role = cfg.hubRole === 'worker' ? 'worker' : 'reader';
+  const hasSharedRepo = Boolean(String(cfg.sharedStoreRepo || '').trim());
+  checks.push({
+    id: 'executionMode',
+    label: 'Hub Execution Mode',
+    ok: true,
+    detail:
+      role === 'worker'
+        ? `Dedicated Worker Mode (auto-sync & background 5-agent reviews${hasSharedRepo ? ` → ${cfg.sharedStoreRepo}` : ', local store'})`
+        : hasSharedRepo
+        ? `Teammate Reader Mode (connected to shared store ${cfg.sharedStoreRepo})`
+        : 'Teammate Standalone Mode (0 background token burn — click "Run Review" on demand)',
   });
 
   const allOk = checks.every((c) => c.ok);

@@ -1,17 +1,25 @@
 {
   "name": "pr-review-hub",
-  "version": "1.2.0",
-  "description": "Multi-team local web cockpit and continuously learning AI code review agent (my-review) for GitHub Pull Requests.",
+  "version": "1.3.0",
+  "description": "Multi-team local web cockpit, multi-domain /100 PR scoring engine, and continuously learning AI code review agent (my-review) for GitHub Pull Requests.",
   "type": "module",
   "private": true,
+  "bin": {
+    "pr-review-hub": "./bin/pr-review-hub.mjs"
+  },
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
     "start": "node ui/server.mjs",
+    "start:bg": "node bin/pr-review-hub.mjs start --bg",
+    "stop": "node bin/pr-review-hub.mjs stop",
+    "status": "node bin/pr-review-hub.mjs status",
     "test": "node --test ui/tests/hub.test.mjs",
     "sync": "./scripts/sync-queue.sh scan",
-    "doctor": "node --input-type=module -e \"import { loadConfig } from './ui/lib/config.mjs'; import { runDoctor } from './ui/lib/doctor.mjs'; const r = await runDoctor(loadConfig()); for (const c of r.checks) console.log((c.ok ? '🟢' : '🔴'), c.label, '—', c.detail);\"",
+    "doctor": "node bin/pr-review-hub.mjs doctor",
+    "simulate:pili": "node bin/pr-review-hub.mjs simulate --team pili-back --port 4243 --reset",
+    "simulate:pili:stop": "node bin/pr-review-hub.mjs simulate --team pili-back --port 4243 --stop",
     "package": "./scripts/package-shareable-zip.sh",
     "setup": "./install.sh"
   }

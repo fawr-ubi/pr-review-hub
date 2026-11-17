@@ -24,15 +24,40 @@ function expandHome(p) {
   return p;
 }
 
+let _cachedDetectedGithubUser = '';
+let _cachedDetectedGithubUserAt = 0;
+
 export function detectGithubUser() {
   if (process.env.REVIEW_HUB_USER) return process.env.REVIEW_HUB_USER;
+  if (_cachedDetectedGithubUser && Date.now() - _cachedDetectedGithubUserAt < 120000) {
+    return _cachedDetectedGithubUser;
+  }
+  // Fast local ~/.config/gh/hosts.yml lookup first (< 1ms, zero network stall)
+  try {
+    const hostsPath = path.join(os.homedir(), '.config', 'gh', 'hosts.yml');
+    if (fs.existsSync(hostsPath)) {
+      const raw = fs.readFileSync(hostsPath, 'utf8');
+      const userMatch = raw.match(/^\s*user:\s*([^\s#]+)/m);
+      if (userMatch && userMatch[1]) {
+        _cachedDetectedGithubUser = userMatch[1].trim();
+        _cachedDetectedGithubUserAt = Date.now();
+        return _cachedDetectedGithubUser;
+      }
+    }
+  } catch {
+    // fall through to gh api
+  }
   try {
     const out = execFileSync('gh', ['api', 'user', '--jq', '.login'], {
       encoding: 'utf8',
       timeout: 3500,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-    if (out) return out;
+    if (out) {
+      _cachedDetectedGithubUser = out;
+      _cachedDetectedGithubUserAt = Date.now();
+      return out;
+    }
   } catch {
     // ignore offline / gh error
   }
@@ -40,6 +65,11 @@ export function detectGithubUser() {
 }
 
 export function detectGithubTeamsSync(orgFilter = 'ubitransports') {
+  if (process.env.REVIEW_HUB_TEAMS) {
+    return process.env.REVIEW_HUB_TEAMS.split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
   try {
     const out = execFileSync(
       'gh',
@@ -153,6 +183,31 @@ export function detectLocalProjectsDir() {
 }
 
 export async function discoverGithubIdentityAndTeams(orgFilter = '') {
+  if (process.env.REVIEW_HUB_TEAMS) {
+    const resolvedLogin = detectGithubUser();
+    const effectiveOrg = orgFilter || process.env.REVIEW_HUB_ORG || 'ubitransports';
+    const simTeams = process.env.REVIEW_HUB_TEAMS.split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((rawSlug) => {
+        const clean = rawSlug.replace(/^[^/]+\//, '');
+        return {
+          slug: clean,
+          name: clean,
+          org: effectiveOrg,
+          fullSlug: `${effectiveOrg}/${clean}`,
+          combinedSlug: `${effectiveOrg}/${clean}`,
+          inferredProfile: inferTeamProfileFromGithubTeams([clean]),
+        };
+      });
+    return {
+      login: resolvedLogin,
+      githubUser: resolvedLogin,
+      name: '',
+      teams: simTeams,
+      inferredProfile: inferTeamProfileFromGithubTeams(simTeams.map((t) => t.slug)),
+    };
+  }
   try {
     const [userRes, teamsRes] = await Promise.all([
       execFileAsync('gh', ['api', 'user', '--jq', '{login: .login, name: .name}'], {

@@ -4,8 +4,19 @@
   "githubTeams": [
     "your-github-team-slug"
   ],
-  "teamProfile": "popcorn-back",
+  "teamProfile": "pili-back",
   "agentCli": "agy",
+  "hubRole": "reader",
+  "autoReviewEnabled": false,
+  "sharedStoreRepo": "",
+  "wanreviewRepoPath": "",
+  "domainAgents": {
+    "security": { "enabled": true, "weight": 25 },
+    "product": { "enabled": true, "weight": 20 },
+    "quality": { "enabled": true, "weight": 25 },
+    "performance": { "enabled": true, "weight": 15 },
+    "testing": { "enabled": true, "weight": 15 }
+  },
   "projectsDir": "~/Ubitransport/projects",
   "reviewsDir": "~/Ubitransport/projects/artifacts/reviews",
   "jiraBaseUrl": "https://ubitransport.atlassian.net/browse",

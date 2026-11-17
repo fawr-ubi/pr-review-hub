@@ -412,7 +412,7 @@ export async function scanPrQueue(customCfg = null) {
     url
     author { login ... on User { name } }
     repository { name }
-    files(first: 100) { nodes { path } }
+    files(first: 60) { nodes { path } }
     labels(first: 10) { nodes { name color } }
     commits(last: 1) {
       totalCount
@@ -420,7 +420,7 @@ export async function scanPrQueue(customCfg = null) {
     }
     comments { totalCount }
     reviewThreads { totalCount }
-    latestOpinionatedReviews(first: 20) {
+    latestOpinionatedReviews(first: 15) {
       nodes {
         author { login ... on User { name } }
         state
@@ -435,7 +435,7 @@ export async function scanPrQueue(customCfg = null) {
         }
       }
     }
-    reviews(last: 20) {
+    reviews(last: 12) {
       nodes {
         author { login ... on User { name } }
         state
@@ -445,52 +445,87 @@ export async function scanPrQueue(customCfg = null) {
     }
   `;
 
-  const queryBlocks = [];
+  // Keep each GraphQL search bucket self-contained so we execute in small batches (2 aliases max per call)
+  // and never trigger GitHub's 10-second GraphQL complexity HTTP 502 timeout.
+  const searchEntries = [];
   if (userLogin) {
-    queryBlocks.push(`
-      me: search(query: "org:${org} is:pr is:open updated:>=${cutoffDate} review-requested:${userLogin}", type: ISSUE, first: 30) {
-        nodes { ... on PullRequest { ${prFragment} } }
+    searchEntries.push(
+      {
+        alias: 'me',
+        q: `org:${org} is:pr is:open sort:updated-desc review-requested:${userLogin}`,
+        limit: 25,
+      },
+      {
+        alias: 'reviewedByMe',
+        q: `org:${org} is:pr is:open sort:updated-desc reviewed-by:${userLogin}`,
+        limit: 20,
+      },
+      {
+        alias: 'authoredByMe',
+        q: `org:${org} is:pr is:open sort:updated-desc author:${userLogin}`,
+        limit: 25,
       }
-      reviewedByMe: search(query: "org:${org} is:pr is:open updated:>=${cutoffDate} reviewed-by:${userLogin}", type: ISSUE, first: 30) {
-        nodes { ... on PullRequest { ${prFragment} } }
-      }
-      authoredByMe: search(query: "org:${org} is:pr is:open updated:>=${cutoffDate} author:${userLogin}", type: ISSUE, first: 30) {
-        nodes { ... on PullRequest { ${prFragment} } }
-      }
-      myDrafts: search(query: "org:${org} is:pr is:open is:draft updated:>=${cutoffDate} author:${userLogin}", type: ISSUE, first: 20) {
-        nodes { ... on PullRequest { ${prFragment} } }
-      }
-    `);
+    );
   }
 
   const githubTeams = Array.isArray(cfg.githubTeams) ? cfg.githubTeams : [];
   githubTeams.forEach((rawSlug, idx) => {
     const cleanSlug = String(rawSlug || '').trim().replace(new RegExp(`^${org}/`, 'i'), '');
     if (!cleanSlug) return;
-    queryBlocks.push(`
-      team_${idx}: search(query: "org:${org} is:pr is:open updated:>=${cutoffDate} team-review-requested:${org}/${cleanSlug}", type: ISSUE, first: 30) {
-        nodes { ... on PullRequest { ${prFragment} } }
-      }
-    `);
+    searchEntries.push({
+      alias: `team_${idx}`,
+      q: `org:${org} is:pr is:open sort:updated-desc team-review-requested:${org}/${cleanSlug}`,
+      limit: 25,
+    });
   });
 
-  // Include drafts from the active Team Profile's primary repositories (instead of hardcoding 2cloud-services)
+  // Include drafts from the active Team Profile's primary repositories
   const activeProfile = getActiveTeamProfile(cfg.teamProfile);
-  const profileRepos = Array.isArray(activeProfile?.repos) && activeProfile.repos.length > 0
-    ? activeProfile.repos.slice(0, 3)
-    : ['2cloud-services'];
+  const profileRepos =
+    Array.isArray(activeProfile?.repos) && activeProfile.repos.length > 0
+      ? activeProfile.repos.slice(0, 3)
+      : ['2cloud-services'];
   profileRepos.forEach((repoName, idx) => {
     const cleanRepo = String(repoName || '').trim();
     if (!cleanRepo) return;
-    queryBlocks.push(`
-      draftsRepo_${idx}: search(query: "repo:${org}/${cleanRepo} is:pr is:open is:draft updated:>=${cutoffDate}", type: ISSUE, first: 20) {
-        nodes { ... on PullRequest { ${prFragment} } }
-      }
-    `);
+    searchEntries.push({
+      alias: `draftsRepo_${idx}`,
+      q: `repo:${org}/${cleanRepo} is:pr is:open is:draft sort:updated-desc`,
+      limit: 15,
+    });
   });
 
-  const searchRes = await runGraphql(`{ ${queryBlocks.join('\n')} }`, 60000);
-  const dataBuckets = searchRes?.data || {};
+  const buildBucketBlock = (entry) => `
+    ${entry.alias}: search(query: "${entry.q}", type: ISSUE, first: ${entry.limit}) {
+      nodes { ... on PullRequest { ${prFragment} } }
+    }
+  `;
+
+  const dataBuckets = {};
+  const batchSize = 2;
+  const batches = [];
+  for (let i = 0; i < searchEntries.length; i += batchSize) {
+    batches.push(searchEntries.slice(i, i + batchSize));
+  }
+
+  await Promise.all(
+    batches.map(async (batch) => {
+      try {
+        const res = await runGraphql(`{ ${batch.map(buildBucketBlock).join('\n')} }`, 25000, 1);
+        Object.assign(dataBuckets, res?.data || {});
+      } catch {
+        // Fallback: isolate each single bucket so one heavy search never drops the rest
+        for (const single of batch) {
+          try {
+            const res = await runGraphql(`{ ${buildBucketBlock(single)} }`, 25000, 1);
+            Object.assign(dataBuckets, res?.data || {});
+          } catch {
+            // skip unreachable bucket gracefully
+          }
+        }
+      }
+    })
+  );
 
   const uniquePrsMap = new Map();
   for (const bucket of Object.values(dataBuckets)) {
@@ -637,7 +672,22 @@ export async function scanPrQueue(customCfg = null) {
 }
 
 // Allow direct CLI execution: node ui/lib/sync.mjs [scan|record|index] ...
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
+const isSyncDirectEntry = (() => {
+  try {
+    if (!process.argv[1]) return false;
+    return (
+      fs.realpathSync(path.resolve(process.argv[1])) ===
+      fs.realpathSync(new URL(import.meta.url).pathname)
+    );
+  } catch {
+    return (
+      Boolean(process.argv[1]) &&
+      path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)
+    );
+  }
+})();
+
+if (isSyncDirectEntry) {
   const cmd = process.argv[2] || 'scan';
   (async () => {
     if (cmd === 'record') {

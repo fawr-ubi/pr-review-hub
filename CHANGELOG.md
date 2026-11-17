@@ -2,6 +2,20 @@
 
 All notable changes to **PR Review Hub (`my-review`)** are documented in this file.
 
+## [1.3.0] - 2026-11-16
+
+### Added & Consolidated
+- **Multi-Domain `/100` PR Scoring Engine & 5 Specialized Agents (`references/agents/*.md`, `ui/lib/scoring.mjs`)**:
+  - Added 5 declarative domain scoring agents: `Security & Multi-Tenancy` (`25%`), `Product & Scope` (`20%`), `Quality & Architecture` (`25%`), `Performance & Scalability` (`15%`), and `Testing & Reliability` (`15%`, including explicit **Anti-Over-Testing / Test Pyramid** discipline).
+  - Bounded deterministic `/100` scoring with `enforced` (`100%`), `advisory` (`35%`), and `proposed` (`0pt`) multipliers, Blocker/`locked` safety cap (`59/100`), `N/A` dynamic weight redistribution, instant score recovery on False Positive dismissal, click-to-filter findings by domain, and isolated single-agent Deep Re-runs (`↻`).
+- **Jira Context Enrichment (`ui/lib/jira.mjs`)**:
+  - Auto-fetches Jira acceptance criteria via `acli` with a 1-hour disk cache, falls back cleanly to PR description + commits, supports manual reviewer notes (`+ Context`), and automatically marks purely technical PRs (`chore`, `ci`, `N/A`) as `N/A` for `Product`.
+- **`ubitransports/wanreview` 4-Layer Ingestion & Surgical Export (`ui/lib/wanreview.mjs`)**:
+  - Reads `org -> vertical -> team` rules while honoring `locked: true` immutability and exports selected shared rules as 100% `tools/resolve.py`-compliant Markdown files (strictly excluding `.local.md` personal rules).
+- **Turnkey Colleague Onboarding, Squad Profiles & Background Daemon (`bin/pr-review-hub.mjs`)**:
+  - Added dedicated squad profiles for **`pili-back`**, **`banana-back`**, and **`papaya-back`** alongside `popcorn-back`, `frontend-web`, `mobile-kotlin`, and `qa-automation`.
+  - Added background daemon CLI (`npm run start:bg`, `npm run stop`, `npm run status`), isolated colleague setup simulator (`npm run simulate:pili`), in-app PTY PKCE Google OAuth sign-in for `agy`, `👤 My PR` badge, bold clickable branch pills, semantic CTA hierarchy, and a security guard blocking accidental pushes of shared review artifacts to public GitHub repositories.
+
 ## [1.2.0] - 2026-11-10
 
 ### Added & Fixed

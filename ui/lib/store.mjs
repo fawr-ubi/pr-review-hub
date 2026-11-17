@@ -725,6 +725,65 @@ export function pullSharedStore(customCfg = null) {
   });
 }
 
+const _repoPrivacyCache = new Map();
+
+function extractGithubRepoSlug(rawRepo = '') {
+  const s = String(rawRepo || '').trim();
+  if (!s || s.startsWith('/') || s.startsWith('./') || s.startsWith('../') || s.startsWith('~/') || s.startsWith('file://')) {
+    return '';
+  }
+  if (fs.existsSync(s)) return '';
+  const httpsMatch = s.match(/^https?:\/\/github\.com\/([^/\s]+\/[^/\s.]+?)(?:\.git)?\/?$/i);
+  if (httpsMatch) return httpsMatch[1];
+  const sshMatch = s.match(/^git@github\.com:([^/\s]+\/[^/\s.]+?)(?:\.git)?$/i);
+  if (sshMatch) return sshMatch[1];
+  if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(s)) return s.replace(/\.git$/i, '');
+  return '';
+}
+
+export async function assertSharedStoreNotPublicGithub(rawRepo = '', _visibilityChecker = null) {
+  const slug = extractGithubRepoSlug(rawRepo);
+  if (!slug) return { ok: true, slug: '' };
+
+  if (!_visibilityChecker && _repoPrivacyCache.has(slug)) {
+    const isPrivate = _repoPrivacyCache.get(slug);
+    if (isPrivate === false) {
+      throw new Error(
+        `Security block: refusing to push internal PR review artifacts to PUBLIC GitHub repository "${slug}". Configure a PRIVATE repository instead.`
+      );
+    }
+    return { ok: true, slug };
+  }
+
+  let isPrivate = null;
+  if (typeof _visibilityChecker === 'function') {
+    isPrivate = await _visibilityChecker(slug);
+  } else {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['repo', 'view', slug, '--json', 'isPrivate', '--jq', '.isPrivate'],
+        { timeout: 6000 }
+      );
+      const trimmed = String(stdout || '').trim().toLowerCase();
+      if (trimmed === 'true') isPrivate = true;
+      else if (trimmed === 'false') isPrivate = false;
+    } catch {
+      // Offline or unresolvable — allow git remote auth to handle
+    }
+  }
+
+  if (isPrivate !== null && !_visibilityChecker) {
+    _repoPrivacyCache.set(slug, isPrivate);
+  }
+  if (isPrivate === false) {
+    throw new Error(
+      `Security block: refusing to push internal PR review artifacts to PUBLIC GitHub repository "${slug}". Configure a PRIVATE repository instead.`
+    );
+  }
+  return { ok: true, slug };
+}
+
 export function pushSharedStore(customCfg = null, commitMessage = 'chore(ReviewHub): N/A - Sync shared review artifacts') {
   const cfg = customCfg || loadConfig();
   if (!cfg.sharedStoreRepo) {
@@ -733,6 +792,7 @@ export function pushSharedStore(customCfg = null, commitMessage = 'chore(ReviewH
 
   return withGitSyncLock(async () => {
     try {
+      await assertSharedStoreNotPublicGithub(cfg.sharedStoreRepo);
       const ctx = await ensureGitSyncWorkdir(cfg);
       if (!ctx) return { skipped: true, pushed: false };
       const { syncDir, branch } = ctx;

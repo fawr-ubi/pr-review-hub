@@ -1,16 +1,11 @@
 {
   "id": "popcorn-back",
-  "name": "Backend PHP & Squads (Symfony / API Platform / 2cloud)",
-  "description": "Backend engineering standards for 2cloud-services microservices (PHP 8.3+, Symfony, API Platform, Doctrine) and 2cloud (CakePHP) across Popcorn, Pili, Banana, Papaya, and Moneris squads.",
+  "name": "Popcorn Squad — Backend PHP (Symfony / API Platform / 2cloud)",
+  "description": "Backend engineering standards for the Popcorn squad across 2cloud-services microservices (PHP 8.3+, Symfony, API Platform, Doctrine) and 2cloud (CakePHP).",
   "githubTeams": [
     "ubi-eng-team-popcorn",
+    "ubi-eng-popcorn",
     "popcorn-back",
-    "pili-back",
-    "ubi-eng-team-pili",
-    "banana-back",
-    "ubi-eng-team-banana",
-    "papaya-back",
-    "ubi-eng-team-papaya",
     "moneris-back"
   ],
   "repos": [
