@@ -2098,6 +2098,7 @@ function upgradeReportFindingsInDom(container, findings) {
       const lastPre = preBlocks[preBlocks.length - 1];
       const details = document.createElement('details');
       details.className = 'report-comment-details';
+      details.open = true;
       const summary = document.createElement('summary');
       summary.innerHTML = `<span>Ready-to-paste GitHub comment preview</span><span class="meta-text">Click to expand / collapse</span>`;
       details.appendChild(summary);
@@ -2438,20 +2439,20 @@ function openInlineCommentComposer({
             <input id="inlineComposerTitle" type="text" class="search-input" style="width:280px;padding:4px 8px;font-size:11.5px;" value="${escapeHtml(defaultTitle)}" placeholder="Short comment title..." />
           </div>
         </div>
-        <textarea id="inlineComposerTextarea" class="finding-textarea" rows="4" placeholder="Write your Markdown comment (or your question for the AI Agent)... Cmd+Enter to save to review.">${escapeHtml(defaultBody)}</textarea>
+        <textarea id="inlineComposerTextarea" class="finding-textarea" rows="2" placeholder="Write your Markdown comment (or your question for the AI Agent)... Cmd+Enter to save to review.">${escapeHtml(defaultBody)}</textarea>
         <div class="inline-comment-composer-actions">
-          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-            <button type="button" id="inlineComposerSaveBtn" class="btn btn-primary btn-sm">
-              ${existingFinding ? 'Save changes' : 'Add to review (4. AI Proposals)'}
+          <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
+            <button type="button" id="inlineComposerSaveBtn" class="btn btn-primary btn-xs">
+              ${existingFinding ? 'Save changes' : 'Add to review'}
             </button>
-            <button type="button" id="inlineComposerPostNowBtn" class="btn btn-secondary btn-sm" title="Publish this inline comment directly to GitHub">
-              Post directly to GitHub
+            <button type="button" id="inlineComposerPostNowBtn" class="btn btn-secondary btn-xs" title="Publish this inline comment directly to GitHub">
+              Post to GitHub
             </button>
-            <button type="button" id="inlineComposerAskAiBtn" class="btn btn-ghost btn-sm" title="Open Agent Q&A targeted at this line range">
-              Ask AI Agent (${escapeHtml(formatKeybindLabel(getKeybind('agentChat')))})
+            <button type="button" id="inlineComposerAskAiBtn" class="btn btn-ghost btn-xs" title="Open Agent Q&A targeted at this line range">
+              Ask AI (${escapeHtml(formatKeybindLabel(getKeybind('agentChat')))})
             </button>
           </div>
-          <button type="button" id="inlineComposerCancelBtn" class="btn btn-ghost btn-sm">Cancel (Esc)</button>
+          <button type="button" id="inlineComposerCancelBtn" class="btn btn-ghost btn-xs">Cancel (Esc)</button>
         </div>
       </div>
     </td>
@@ -2460,6 +2461,10 @@ function openInlineCommentComposer({
   anchorRow.insertAdjacentElement('afterend', composerRow);
 
   const textarea = composerRow.querySelector('#inlineComposerTextarea');
+  if (textarea) {
+    autoResizeFindingTextarea(textarea);
+    textarea.addEventListener('input', () => autoResizeFindingTextarea(textarea));
+  }
   const titleInput = composerRow.querySelector('#inlineComposerTitle');
   const sevSelect = composerRow.querySelector('#inlineComposerSeverity');
   const startInput = composerRow.querySelector('#inlineComposerStartLine');
@@ -2753,6 +2758,35 @@ function navigateToCodeLocation(filePath, line = null, preferredView = 'diff') {
   openFileInDiffViewer(filePath, line);
 }
 
+function computeAutoTextareaRows(text) {
+  const raw = String(text || '');
+  if (!raw) return 3;
+  const lines = raw.split('\n');
+  const estimatedLines = lines.reduce(
+    (sum, line) => sum + Math.max(1, Math.ceil((line.length || 1) / 115)),
+    0
+  );
+  return Math.max(3, estimatedLines + 1);
+}
+
+function autoResizeFindingTextarea(ta) {
+  if (!ta) return;
+  ta.style.height = 'auto';
+  if (ta.scrollHeight > 0) {
+    ta.style.height = `${ta.scrollHeight + 2}px`;
+  }
+}
+
+function autoResizeAllFindingTextareas(root = document) {
+  root.querySelectorAll('.finding-textarea').forEach((ta) => {
+    autoResizeFindingTextarea(ta);
+  });
+}
+
+window.addEventListener('resize', () => {
+  requestAnimationFrame(() => autoResizeAllFindingTextareas());
+});
+
 function renderFindingsTab() {
   const findings = state.currentReview?.findings || [];
   document.getElementById('tabFindingsCount').textContent = findings.length;
@@ -2854,7 +2888,7 @@ function renderFindingsTab() {
           </div>
 
           <div class="finding-body">
-            <textarea class="finding-textarea" data-cid="${escapeHtml(f.cid)}">${escapeHtml(f.customComment)}</textarea>
+            <textarea class="finding-textarea" rows="${computeAutoTextareaRows(f.customComment)}" data-cid="${escapeHtml(f.cid)}">${escapeHtml(f.customComment)}</textarea>
 
             <div class="finding-actions">
               <div class="finding-actions-left">
@@ -2933,8 +2967,10 @@ function renderFindingsTab() {
   });
 
   listEl.querySelectorAll('.finding-textarea').forEach((ta) => {
+    autoResizeFindingTextarea(ta);
     let saveTimer = null;
     ta.addEventListener('input', () => {
+      autoResizeFindingTextarea(ta);
       const cid = ta.dataset.cid;
       const finding = findings.find((x) => x.cid === cid);
       if (finding) finding.customComment = ta.value;
@@ -3861,24 +3897,24 @@ function renderDiffLineAndFindingsHtml({
       out.push(`
         <tr>
           <td colspan="3" class="diff-inline-finding">
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
-              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+            <div class="diff-inline-finding-header">
+              <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
                 <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
                 ${rangeBadgeHtml}
-                <strong style="font-size:12.5px;">${escapeHtml(mf.id)} — ${formatInlineCodeHtml(mf.title)}</strong>
+                <strong>${escapeHtml(mf.id)} — ${formatInlineCodeHtml(mf.title)}</strong>
               </div>
-              <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              <div style="display:flex;gap:4px;flex-wrap:wrap;">
                 ${
                   mf.isManual
-                    ? `<button class="btn btn-ghost btn-sm diff-edit-manual-finding-btn" data-cid="${escapeHtml(mf.cid)}">Edit</button>
-                       <button class="btn btn-ghost btn-sm diff-delete-manual-finding-btn" data-cid="${escapeHtml(mf.cid)}">Delete</button>`
+                    ? `<button class="btn btn-ghost btn-xs diff-edit-manual-finding-btn" data-cid="${escapeHtml(mf.cid)}">Edit</button>
+                       <button class="btn btn-ghost btn-xs diff-delete-manual-finding-btn" data-cid="${escapeHtml(mf.cid)}">Delete</button>`
                     : ''
                 }
-                <button class="btn btn-secondary btn-sm diff-copy-finding-btn" data-cid="${escapeHtml(mf.cid)}">Copy</button>
-                <button class="btn btn-primary btn-sm diff-post-finding-btn" data-cid="${escapeHtml(mf.cid)}">Post here</button>
+                <button class="btn btn-secondary btn-xs diff-copy-finding-btn" data-cid="${escapeHtml(mf.cid)}">Copy</button>
+                <button class="btn btn-primary btn-xs diff-post-finding-btn" data-cid="${escapeHtml(mf.cid)}">Post here</button>
               </div>
             </div>
-            <pre style="margin:0;white-space:pre-wrap;background:var(--bg-app);padding:10px;border-radius:4px;border:1px solid var(--border-color);font-size:11.5px;">${escapeHtml(mf.customComment)}</pre>
+            <pre class="diff-inline-finding-body">${escapeHtml(mf.customComment)}</pre>
           </td>
         </tr>
       `);
@@ -3890,7 +3926,7 @@ function renderDiffLineAndFindingsHtml({
     for (const thread of matchingThreads) {
       out.push(`
         <tr>
-          <td colspan="3" class="diff-github-thread">
+          <td colspan="3" class="diff-github-thread ${thread.isResolved ? 'thread-resolved' : ''}">
             ${renderGitHubThreadCardHtml(thread, { inDiff: true })}
           </td>
         </tr>
@@ -4183,53 +4219,76 @@ function renderGitHubThreadCardHtml(thread, { inDiff = false } = {}) {
     ? `<button type="button" class="btn btn-ghost btn-xs gh-thread-resolve-btn" data-thread-id="${escapeHtml(thread.id)}" data-resolved="${thread.isResolved ? '1' : '0'}">${thread.isResolved ? 'Reopen' : 'Resolve'}</button>`
     : '';
 
+  const singleCommentInDiff = inDiff && comments.length === 1;
+
   const commentsHtml = comments
-    .map(
-      (c) => {
-        const cAuthor = c.authorName || c.authorLogin || c.author || 'unknown';
+    .map((c) => {
+      const cAuthor = c.authorName || c.authorLogin || c.author || 'unknown';
+      if (singleCommentInDiff) {
         return `
       <div class="pr-thread-comment">
+        <div class="pr-thread-comment-body markdown-body">${renderMarkdownSafe(c.body)}</div>
+      </div>
+    `;
+      }
+      return `
+      <div class="pr-thread-comment">
         <div class="pr-thread-comment-meta">
-          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
             <strong style="color:var(--text-primary);">${escapeHtml(cAuthor)}</strong>
-            ${c.authorAssociation === 'MEMBER' || c.authorAssociation === 'OWNER' ? '<span class="badge">Member</span>' : ''}
-            <span>${escapeHtml(formatRelativeTime(c.createdAt))}</span>
+            <span>&middot; ${escapeHtml(formatRelativeTime(c.createdAt))}</span>
           </div>
           ${c.url ? `<a href="${escapeHtml(c.url)}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs">GitHub &nearr;</a>` : ''}
         </div>
         <div class="pr-thread-comment-body markdown-body">${renderMarkdownSafe(c.body)}</div>
       </div>
     `;
-      }
-    )
+    })
     .join('');
 
   const firstAuthor = firstComment.authorName || firstComment.authorLogin || firstComment.author || 'this thread';
+  const replyToggleBtnHtml = thread.id
+    ? `<button type="button" class="btn btn-ghost btn-xs gh-thread-toggle-reply-btn" data-thread-id="${escapeHtml(thread.id)}">Reply</button>`
+    : '';
   const replyFormHtml = thread.id
     ? `
-      <form class="pr-thread-reply-box gh-thread-reply-form" data-thread-id="${escapeHtml(thread.id)}">
-        <textarea class="finding-textarea gh-thread-reply-input" rows="2" placeholder="Reply to ${escapeHtml(firstAuthor)} on GitHub..." required></textarea>
-        <div style="display:flex;flex-direction:column;gap:4px;justify-content:flex-end;">
-          <button type="submit" class="btn btn-primary btn-xs">Reply</button>
-        </div>
+      <form class="pr-thread-reply-box gh-thread-reply-form hidden" data-thread-id="${escapeHtml(thread.id)}">
+        <textarea class="finding-textarea gh-thread-reply-input" rows="1" placeholder="Reply to ${escapeHtml(firstAuthor)} on GitHub..." required></textarea>
+        <button type="submit" class="btn btn-primary btn-xs">Send</button>
+        <button type="button" class="btn btn-ghost btn-xs gh-thread-cancel-reply-btn">Cancel</button>
       </form>
     `
     : '';
 
+  const headerTitleHtml = inDiff
+    ? `${statusBadges.join(' ')} <strong style="color:var(--text-primary);">${escapeHtml(firstAuthor)}</strong>${
+        singleCommentInDiff && firstComment.createdAt
+          ? ` <span class="meta-text">&middot; ${escapeHtml(formatRelativeTime(firstComment.createdAt))}</span>`
+          : comments.length > 1
+          ? ` <span class="meta-text">(${comments.length})</span>`
+          : ''
+      }`
+    : `<span class="badge badge-peer">Review Thread</span> ${statusBadges.join(' ')} ${
+        shortPath
+          ? `<code style="font-size:11px;color:var(--accent);word-break:break-all;">${escapeHtml(shortPath)}${lineLabel ? `:${escapeHtml(lineLabel)}` : ''}</code>`
+          : ''
+      }`;
+
+  const singleCommentGhLinkHtml =
+    singleCommentInDiff && firstComment.url
+      ? `<a href="${escapeHtml(firstComment.url)}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs">GitHub &nearr;</a>`
+      : '';
+
   const cardInnerHtml = `
     <div class="pr-thread-header">
       <div class="pr-thread-header-left">
-        <span class="badge badge-peer">GitHub Review Thread</span>
-        ${statusBadges.join(' ')}
-        ${
-          shortPath
-            ? `<code style="font-size:11.5px;color:var(--accent);word-break:break-all;">${escapeHtml(shortPath)}${lineLabel ? `:${escapeHtml(lineLabel)}` : ''}</code>`
-            : ''
-        }
+        ${headerTitleHtml}
       </div>
       <div class="pr-thread-header-right">
         ${jumpBtnHtml}
+        ${replyToggleBtnHtml}
         ${resolveBtnHtml}
+        ${singleCommentGhLinkHtml}
       </div>
     </div>
     <div class="pr-thread-comments">${commentsHtml}</div>
@@ -4238,13 +4297,13 @@ function renderGitHubThreadCardHtml(thread, { inDiff = false } = {}) {
 
   if (inDiff && thread.isResolved) {
     return `
-      <details class="pr-thread-card resolved" style="padding:6px 10px;">
-        <summary style="cursor:pointer;font-size:11.5px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;">
-          <span class="badge badge-pass">Resolved GitHub Thread</span>
+      <details class="pr-thread-card resolved" style="padding:2px 8px;">
+        <summary style="cursor:pointer;font-size:11px;line-height:1.35;color:var(--text-secondary);display:flex;align-items:center;gap:6px;">
+          <span class="badge badge-pass">Resolved</span>
           <strong>${escapeHtml(firstAuthor)}</strong>
-          <span>(${comments.length} message${comments.length > 1 ? 's' : ''}) — Click to expand</span>
+          <span>(${comments.length}) &mdash; Expand</span>
         </summary>
-        <div style="margin-top:8px;">${cardInnerHtml}</div>
+        <div style="margin-top:4px;">${cardInnerHtml}</div>
       </details>
     `;
   }
@@ -4264,6 +4323,28 @@ function bindGitHubThreadActionListeners(containerEl) {
     });
   });
 
+  containerEl.querySelectorAll('.gh-thread-toggle-reply-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const card = btn.closest('.pr-thread-card');
+      const form = card?.querySelector('.gh-thread-reply-form');
+      if (!form) return;
+      const willShow = form.classList.contains('hidden');
+      form.classList.toggle('hidden', !willShow);
+      if (willShow) {
+        const ta = form.querySelector('.gh-thread-reply-input');
+        autoResizeFindingTextarea(ta);
+        ta?.focus();
+      }
+    });
+  });
+
+  containerEl.querySelectorAll('.gh-thread-cancel-reply-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const form = btn.closest('.gh-thread-reply-form');
+      form?.classList.add('hidden');
+    });
+  });
+
   containerEl.querySelectorAll('.gh-thread-resolve-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const threadId = btn.dataset.threadId;
@@ -4276,16 +4357,28 @@ function bindGitHubThreadActionListeners(containerEl) {
   });
 
   containerEl.querySelectorAll('.gh-thread-reply-form').forEach((form) => {
+    const textarea = form.querySelector('.gh-thread-reply-input');
+    textarea?.addEventListener('input', () => autoResizeFindingTextarea(textarea));
+    textarea?.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') {
+        form.classList.add('hidden');
+      } else if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') {
+        ev.preventDefault();
+        form.requestSubmit();
+      }
+    });
     form.addEventListener('submit', async (ev) => {
       ev.preventDefault();
       const threadId = form.dataset.threadId;
-      const textarea = form.querySelector('.gh-thread-reply-input');
       const body = textarea?.value?.trim();
       if (!threadId || !body) return;
       const submitBtn = form.querySelector('button[type="submit"]');
       if (submitBtn) submitBtn.disabled = true;
       const ok = await submitGitHubThreadReply(threadId, body);
-      if (ok && textarea) textarea.value = '';
+      if (ok && textarea) {
+        textarea.value = '';
+        form.classList.add('hidden');
+      }
       if (submitBtn) submitBtn.disabled = false;
     });
   });
@@ -4831,6 +4924,12 @@ function switchTab(tabName, options = {}) {
     }
   }
   renderCollapsibleLayoutState();
+  if (
+    tabName === 'comments' ||
+    (state.splitMode && (state.splitLeftTab === 'comments' || state.splitRightTab === 'comments'))
+  ) {
+    requestAnimationFrame(() => autoResizeAllFindingTextareas());
+  }
   if (tabName === 'diff') {
     setTimeout(() => {
       document.getElementById('diffScrollArea')?.focus({ preventScroll: true });
@@ -4899,6 +4998,9 @@ function applySplitLayout() {
 
   if (state.splitLeftTab === 'rules' || state.splitRightTab === 'rules') {
     loadRules();
+  }
+  if (state.splitLeftTab === 'comments' || state.splitRightTab === 'comments') {
+    requestAnimationFrame(() => autoResizeAllFindingTextareas());
   }
   renderCollapsibleLayoutState();
 }

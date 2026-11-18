@@ -2685,6 +2685,13 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
         assert.ok(html.includes('id="exportWanreviewBtn"'), 'Rules tab must include Export to wanreview button');
         assert.ok(js.includes('function renderPrScorecardPanel()'), 'app.js must define renderPrScorecardPanel');
         assert.ok(js.includes('function focusAuditScorecardDetail()'), 'app.js must define focusAuditScorecardDetail on global score click');
+        assert.ok(js.includes('function autoResizeFindingTextarea('), 'app.js must auto-expand AI proposal textareas without inner scrolling');
+        const cssRes = await fetch(`${baseUrl}/styles.css`);
+        const css = await cssRes.text();
+        assert.ok(css.includes('field-sizing: content'), 'finding-textarea must auto-fit full suggestion height');
+        assert.ok(!css.includes('.findings-list {\n  max-width: 920px;'), 'findings-list must not be constrained to narrow 920px');
+        assert.ok(css.includes('.diff-inline-finding-body') && css.includes('font-size: var(--diff-font-size, 12px);'), 'Inline PR comments must match code font size');
+        assert.ok(js.includes('gh-thread-toggle-reply-btn'), 'Inline PR GitHub threads must collapse Reply input behind a compact toggle button');
         // Ensure PR Queue card rendering was NOT cluttered with score badges
         const prListSlice = js.slice(js.indexOf('function renderPrList()'), js.indexOf('function renderPrList()') + 3500);
         assert.equal(

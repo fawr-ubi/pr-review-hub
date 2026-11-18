@@ -1177,7 +1177,7 @@ code.inline-code {
   display: none;
   flex: 1;
   overflow-y: auto;
-  padding: 24px 32px;
+  padding: 20px 24px;
 }
 
 .tab-panel.active {
@@ -1192,7 +1192,8 @@ code.inline-code {
 
 /* Markdown Body */
 .markdown-body {
-  max-width: 920px;
+  width: 100%;
+  max-width: 1680px;
   margin: 0 auto;
   line-height: 1.65;
   font-size: 13.5px;
@@ -1298,7 +1299,8 @@ code.inline-code {
 
 /* Interactive Comments Tab */
 .comments-toolbar {
-  max-width: 920px;
+  width: 100%;
+  max-width: 1680px;
   margin: 0 auto 14px;
   padding: 10px 14px;
   background: var(--bg-surface);
@@ -1328,7 +1330,8 @@ code.inline-code {
 }
 
 .findings-list {
-  max-width: 920px;
+  width: 100%;
+  max-width: 1680px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -1422,16 +1425,21 @@ code.inline-code {
 
 .finding-textarea {
   width: 100%;
-  min-height: 105px;
+  min-height: 76px;
+  height: auto;
+  field-sizing: content;
+  overflow-y: hidden;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 12.5px;
   line-height: 1.55;
-  padding: 10px 12px;
+  padding: 12px 14px;
   border-radius: 4px;
   border: 1px solid var(--border-color);
   background: var(--bg-app);
   color: var(--text-primary);
-  resize: vertical;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  resize: none;
 }
 
 .finding-textarea:focus {
@@ -1932,8 +1940,32 @@ code.inline-code {
   border-top: 1px solid var(--border-color);
   border-bottom: 1px solid var(--border-color);
   border-left: 3px solid var(--status-major);
-  padding: 12px 16px;
+  padding: 5px 10px;
   font-family: var(--font-sans);
+  font-size: var(--diff-font-size, 12px);
+  line-height: var(--diff-line-height, 1.4);
+}
+
+.diff-inline-finding-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+  font-size: var(--diff-font-size, 12px);
+}
+
+.diff-inline-finding-body {
+  margin: 0;
+  white-space: pre-wrap;
+  background: var(--bg-app);
+  padding: 4px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: var(--diff-font-size, 12px);
+  line-height: var(--diff-line-height, 1.4);
 }
 
 /* Modal */
@@ -1950,7 +1982,7 @@ code.inline-code {
 
 .modal-card {
   width: 100%;
-  max-width: 600px;
+  max-width: min(880px, 94vw);
   background: var(--bg-surface);
   border: 1px solid var(--border-color);
   border-radius: 6px;
@@ -2345,7 +2377,8 @@ code.inline-code {
 
 /* Report Executive Header (Task Summary & Incremental Update) */
 .report-executive-header {
-  max-width: 960px;
+  width: 100%;
+  max-width: 1680px;
   margin: 0 auto 18px;
   display: flex;
   flex-direction: column;
@@ -2412,7 +2445,8 @@ code.inline-code {
 
 /* Report Findings Quick Bar (Structured Findings Index) */
 .report-findings-quickbar {
-  max-width: 960px;
+  width: 100%;
+  max-width: 1680px;
   margin: 0 auto 22px;
   background: var(--bg-surface);
   border: 1px solid var(--border-color);
@@ -2521,7 +2555,8 @@ code.inline-code {
 
 /* Detailed Finding Cards inside #markdownContainer */
 .markdown-body {
-  max-width: 960px;
+  width: 100%;
+  max-width: 1680px;
 }
 
 .report-detail-card {
@@ -3185,24 +3220,33 @@ tr:hover .diff-line-add-btn,
   border-top: 1px solid var(--border-color);
   border-bottom: 1px solid var(--border-color);
   border-left: 3px solid var(--accent);
-  padding: 12px 16px;
+  padding: 6px 10px;
   font-family: var(--font-sans);
+  font-size: var(--diff-font-size, 12px);
 }
 
 .inline-comment-composer {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-width: 880px;
+  gap: 5px;
+  width: 100%;
+  max-width: none;
+}
+
+.inline-comment-composer .finding-textarea {
+  min-height: 52px;
+  padding: 6px 8px;
+  font-size: var(--diff-font-size, 12px);
+  line-height: var(--diff-line-height, 1.4);
 }
 
 .inline-comment-composer-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
-  font-size: 12px;
+  font-size: var(--diff-font-size, 12px);
   font-weight: 600;
   color: var(--text-primary);
 }
@@ -3362,7 +3406,8 @@ tr.comment-range-selected td.blob-line-num {
    Tab 2: PR Description, Commits & GitHub Conversation Overview
    ============================================================================ */
 .pr-overview-container {
-  max-width: 1040px;
+  width: 100%;
+  max-width: 1680px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -3521,12 +3566,13 @@ tr.comment-range-selected td.blob-line-num {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: nowrap;
-  padding: 8px 14px;
+  padding: 4px 10px;
   background: var(--bg-sidebar);
-  border-bottom: 1px solid var(--border-color);
-  font-size: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 11px;
+  line-height: 1.3;
 }
 
 .pr-thread-card.compact-review .pr-thread-header {
@@ -3536,7 +3582,7 @@ tr.comment-range-selected td.blob-line-num {
 .pr-thread-header-left {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
   flex-wrap: wrap;
 }
@@ -3544,7 +3590,7 @@ tr.comment-range-selected td.blob-line-num {
 .pr-thread-header-right {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   flex-shrink: 0;
 }
 
@@ -3555,13 +3601,25 @@ tr.comment-range-selected td.blob-line-num {
 
 .pr-thread-comment,
 .pr-thread-comment-item {
-  padding: 12px 16px;
+  padding: 6px 10px;
   border-bottom: 1px solid var(--border-subtle);
 }
 
 .pr-thread-comment:last-child,
 .pr-thread-comment-item:last-child {
   border-bottom: none;
+}
+
+.pr-thread-comment-body,
+.pr-thread-comment-body.markdown-body {
+  max-width: none;
+  margin: 0;
+  font-size: var(--diff-font-size, 12px);
+  line-height: var(--diff-line-height, 1.4);
+}
+
+.pr-thread-comment-body p {
+  margin: 3px 0;
 }
 
 .pr-thread-comment-body p:first-child {
@@ -3572,23 +3630,49 @@ tr.comment-range-selected td.blob-line-num {
   margin-bottom: 0;
 }
 
+.pr-thread-comment-body pre {
+  padding: 5px 8px;
+  margin: 4px 0;
+  font-size: var(--diff-font-size, 12px);
+  line-height: var(--diff-line-height, 1.4);
+}
+
+.pr-thread-comment-body code {
+  font-size: calc(var(--diff-font-size, 12px) - 0.5px);
+  padding: 0 4px;
+}
+
 .pr-thread-comment-meta {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 6px;
-  font-size: 11.5px;
+  gap: 6px;
+  margin-bottom: 2px;
+  font-size: 11px;
+  line-height: 1.3;
   color: var(--text-secondary);
 }
 
 .pr-thread-reply-box {
-  padding: 10px 14px;
+  padding: 6px 10px;
   background: var(--bg-app);
-  border-top: 1px solid var(--border-color);
+  border-top: 1px solid var(--border-subtle);
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  flex-direction: row;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.pr-thread-reply-box.hidden {
+  display: none !important;
+}
+
+.pr-thread-reply-box .finding-textarea {
+  flex: 1;
+  min-height: 40px;
+  padding: 5px 8px;
+  font-size: var(--diff-font-size, 12px);
+  line-height: var(--diff-line-height, 1.4);
 }
 
 /* Inline GitHub Colleague Review Threads inside Tab 3 (Diff Git) */
@@ -3597,13 +3681,23 @@ tr.comment-range-selected td.blob-line-num {
   border-top: 1px solid var(--border-color);
   border-bottom: 1px solid var(--border-color);
   border-left: 3px solid var(--accent);
-  padding: 10px 14px;
+  padding: 4px 10px;
   font-family: var(--font-sans);
+  font-size: var(--diff-font-size, 12px);
+}
+
+.diff-github-thread .pr-thread-card {
+  border-radius: 4px;
+  border-color: var(--border-subtle);
+}
+
+.diff-github-thread .pr-thread-comment {
+  padding: 4px 8px;
 }
 
 .diff-github-thread.thread-resolved {
   border-left-color: var(--status-ok);
-  padding: 6px 14px;
+  padding: 2px 10px;
 }
 
 /* ============================================================================
@@ -4011,7 +4105,8 @@ tr.comment-range-selected td.blob-line-num {
   align-items: stretch;
   flex-wrap: wrap;
   gap: 10px;
-  max-width: 960px;
+  width: 100%;
+  max-width: 1680px;
   margin: 0 auto 18px;
   padding: 12px 14px;
   background: var(--bg-surface);
