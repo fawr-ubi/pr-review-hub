@@ -2672,9 +2672,19 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
         }
 
         const [html, js] = await Promise.all([htmlRes.text(), jsRes.text()]);
-        assert.ok(html.includes('id="prScorecardPanel"'), 'PR detail view must include #prScorecardPanel');
+        assert.ok(html.includes('id="prGlobalScoreBadge"'), 'PR topbar must include compact clickable #prGlobalScoreBadge');
+        assert.ok(html.includes('id="prScorecardPanel"'), 'Audit Report tab must include #prScorecardPanel');
+        const headerEndIdx = html.indexOf('</header>');
+        const navTabsIdx = html.indexOf('<nav class="view-tabs">');
+        const tabReportIdx = html.indexOf('<section id="tab-report"');
+        const scorecardIdx = html.indexOf('id="prScorecardPanel"');
+        assert.ok(
+          scorecardIdx > tabReportIdx && !(scorecardIdx > headerEndIdx && scorecardIdx < navTabsIdx),
+          '#prScorecardPanel must live inside #tab-report rather than as a persistent top banner above tabs'
+        );
         assert.ok(html.includes('id="exportWanreviewBtn"'), 'Rules tab must include Export to wanreview button');
         assert.ok(js.includes('function renderPrScorecardPanel()'), 'app.js must define renderPrScorecardPanel');
+        assert.ok(js.includes('function focusAuditScorecardDetail()'), 'app.js must define focusAuditScorecardDetail on global score click');
         // Ensure PR Queue card rendering was NOT cluttered with score badges
         const prListSlice = js.slice(js.indexOf('function renderPrList()'), js.indexOf('function renderPrList()') + 3500);
         assert.equal(

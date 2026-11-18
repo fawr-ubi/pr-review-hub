@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PR Review Hub</title>
-  <link rel="stylesheet" href="/styles.css?v=20261116-6" />
+  <link rel="stylesheet" href="/styles.css?v=20261118-1" />
   <link id="hljsThemeLink" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -167,6 +167,7 @@
               <span id="prMergeableBadge" class="hidden"></span>
               <span id="prCodeOwnersBadges" class="pr-codeowners-inline"></span>
               <span id="prVerdictBadge" class="badge"></span>
+              <button type="button" id="prGlobalScoreBadge" class="pr-global-score-badge hidden" title="Click to inspect detailed domain scores in 1. Audit Report"></button>
               <span id="prCiBadge" class="badge badge-mono hidden"></span>
               <span id="prStackBadge" class="badge badge-severity-major hidden" title="This PR targets another feature branch (Stacked PR)">Stacked Branch</span>
               <a id="prJiraLink" href="#" target="_blank" rel="noopener" class="btn btn-jira btn-xs hidden"></a>
@@ -185,9 +186,6 @@
             </div>
           </div>
         </header>
-
-        <!-- Multi-Domain PR Scorecard Panel (PR Detail only — Queue stays clean) -->
-        <section id="prScorecardPanel" class="pr-scorecard-panel hidden" aria-label="Multi-Domain PR Scorecard"></section>
 
         <!-- Navigation Tabs -->
         <nav class="view-tabs">
@@ -247,6 +245,8 @@
           <div id="panelsContainer" class="panels-container">
             <!-- Tab 1: Full Markdown Report -->
             <section id="tab-report" class="tab-panel active">
+              <!-- Multi-Domain PR Scorecard (lives inside Audit Report tab to keep Diff/Workspace uncluttered) -->
+              <section id="prScorecardPanel" class="pr-scorecard-panel hidden" aria-label="Multi-Domain PR Scorecard"></section>
               <div id="reportExecutiveHeader" class="report-executive-header hidden"></div>
               <div id="reportFindingsQuickBar" class="report-findings-quickbar hidden"></div>
               <article id="markdownContainer" class="markdown-body"></article>
@@ -382,7 +382,7 @@
   <!-- Toast notification -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script type="module" src="/app.js?v=20261116-6"></script>
+  <script type="module" src="/app.js?v=20261118-1"></script>
 
   <!-- Debug Console Drawer -->
   <div id="debugConsoleDrawer" style="position:fixed;bottom:0;left:0;right:0;height:40vh;background:var(--bg-surface);border-top:1px solid var(--border-color);z-index:10000;display:flex;flex-direction:column;transform:translateY(100%);transition:transform 0.2s ease-out;box-shadow:0 -5px 15px rgba(0,0,0,0.1);">

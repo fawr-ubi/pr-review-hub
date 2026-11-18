@@ -1610,26 +1610,47 @@ function renderReportFindingsQuickBar() {
     .filter(Boolean)
     .join('');
 
+  const indexedQuickFindings = findings
+    .map((f, idx) => ({ f, idx }))
+    .filter(({ f }) => {
+      if (!state.activeDomainFilter) return true;
+      if (f.isManual) return false;
+      return (f.domain || 'quality') === state.activeDomainFilter;
+    });
+
   barEl.classList.remove('hidden');
   barEl.innerHTML = `
     <div class="report-qbar-header">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-        <strong style="font-size:12.5px;color:var(--text-primary);">Findings Summary (${findings.length})</strong>
+        <strong style="font-size:12.5px;color:var(--text-primary);">Findings Summary (${
+          state.activeDomainFilter ? `${indexedQuickFindings.length}/${findings.length}` : findings.length
+        })</strong>
         ${summaryPills}
+        ${
+          state.activeDomainFilter
+            ? `<button type="button" id="qbarClearDomainFilterBtn" class="btn btn-secondary btn-xs" title="Clear domain filter">Domain: ${escapeHtml(state.activeDomainFilter)} &times;</button>`
+            : ''
+        }
       </div>
       <span class="meta-text">Click #ID to jump to details &middot; Click a file to open it in Diff</span>
     </div>
     <div class="report-qbar-list">
-      ${findings
-        .map((f, idx) => {
-          const sev = getSeverityMeta(f.severity);
-          const fullLoc = f.filePath ? `${f.filePath}${f.startLine ? `:${f.startLine}` : ''}` : '';
-          const shortLoc = formatShortFilePath(f.filePath, f.startLine);
-          return `
+      ${
+        indexedQuickFindings.length === 0
+          ? `<div class="meta-text" style="padding:10px 14px;">No findings raised by the <strong>${escapeHtml(state.activeDomainFilter || '')}</strong> agent on this PR.</div>`
+          : indexedQuickFindings
+              .map(({ f, idx }) => {
+                const sev = getSeverityMeta(f.severity);
+                const fullLoc = f.filePath ? `${f.filePath}${f.startLine ? `:${f.startLine}` : ''}` : '';
+                const domTag = f.domain
+                  ? `<span class="domain-pill domain-pill-${escapeHtml(f.domain)}">${escapeHtml(f.domain)}</span>`
+                  : '';
+                return `
             <div class="report-finding-row ${sev.cardClass} ${f.dismissed ? 'dismissed' : ''}">
               <div class="report-finding-main">
                 <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
                 <a href="#report-finding-${idx}" class="finding-id-link qbar-jump-btn" data-idx="${idx}" title="Jump to detailed section ${escapeHtml(f.id)}">${escapeHtml(f.id)}</a>
+                ${domTag}
                 ${f.category ? `<span class="finding-cat-pill">${formatInlineCodeHtml(f.category)}</span>` : ''}
                 <span class="report-finding-title">${formatInlineCodeHtml(f.title)}</span>
               </div>
@@ -1660,10 +1681,16 @@ function renderReportFindingsQuickBar() {
               </div>
             </div>
           `;
-        })
-        .join('')}
+              })
+              .join('')
+      }
     </div>
   `;
+
+  barEl.querySelector('#qbarClearDomainFilterBtn')?.addEventListener('click', () => {
+    state.activeDomainFilter = null;
+    syncDomainFilterViews();
+  });
 
   bindClickableBreadcrumbs(barEl);
 
@@ -1991,7 +2018,11 @@ function upgradeReportFindingsInDom(container, findings) {
 
     const card = document.createElement('div');
     card.id = `report-finding-${fIdx}`;
+    card.dataset.domain = finding.domain || 'quality';
     card.className = `report-detail-card ${sev.cardClass} ${finding.dismissed ? 'dismissed' : ''}`;
+    if (state.activeDomainFilter && card.dataset.domain !== state.activeDomainFilter) {
+      card.classList.add('hidden');
+    }
 
     const header = document.createElement('div');
     header.className = 'report-detail-card-header';
@@ -2750,8 +2781,7 @@ function renderFindingsTab() {
       `<div class="empty-card" style="margin:32px auto;"><p>No AI comment proposals or manual drafts for this PR. Click or drag on line numbers in <strong>3. Git Diff</strong> to write a comment on one or more lines.</p></div>`;
     document.getElementById('clearDomainFilterBannerBtn')?.addEventListener('click', () => {
       state.activeDomainFilter = null;
-      renderPrScorecardPanel();
-      renderFindingsTab();
+      syncDomainFilterViews();
     });
     return;
   }
@@ -2770,8 +2800,7 @@ function renderFindingsTab() {
       `<div class="empty-card" style="margin:24px auto;"><p>No findings raised by the <strong>${escapeHtml(state.activeDomainFilter)}</strong> agent on this PR.</p></div>`;
     document.getElementById('clearDomainFilterBannerBtn')?.addEventListener('click', () => {
       state.activeDomainFilter = null;
-      renderPrScorecardPanel();
-      renderFindingsTab();
+      syncDomainFilterViews();
     });
     return;
   }
@@ -7952,12 +7981,93 @@ async function refreshActivePrScorecardSilently(pr) {
   }
 }
 
-function renderPrScorecardPanel() {
-  const panelEl = document.getElementById('prScorecardPanel');
-  if (!panelEl) return;
+function applyDomainFilterToReportDom() {
+  const container = document.getElementById('markdownContainer');
+  if (!container) return;
+  container.querySelectorAll('.report-detail-card').forEach((card) => {
+    const dom = card.dataset.domain || 'quality';
+    card.classList.toggle('hidden', Boolean(state.activeDomainFilter && dom !== state.activeDomainFilter));
+  });
+}
 
+function syncDomainFilterViews() {
+  renderPrScorecardPanel();
+  renderReportFindingsQuickBar();
+  applyDomainFilterToReportDom();
+  renderFindingsTab();
+}
+
+function focusAuditScorecardDetail() {
+  const isReportVisible = state.splitMode
+    ? state.splitLeftTab === 'report' || state.splitRightTab === 'report'
+    : state.activeTab === 'report';
+  if (!isReportVisible) {
+    switchTab('report');
+  }
+  requestAnimationFrame(() => {
+    const tabReportEl = document.getElementById('tab-report');
+    const panelEl = document.getElementById('prScorecardPanel');
+    if (tabReportEl) {
+      tabReportEl.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    if (panelEl && !panelEl.classList.contains('hidden')) {
+      panelEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      panelEl.classList.add('is-highlighted');
+      clearTimeout(panelEl._highlightTimer);
+      panelEl._highlightTimer = setTimeout(() => {
+        panelEl.classList.remove('is-highlighted');
+      }, 1400);
+    }
+  });
+}
+
+function renderGlobalScoreTopbarBadge(pr, scorecard) {
+  const badgeEl = document.getElementById('prGlobalScoreBadge');
+  if (!badgeEl) return;
+
+  if (!pr || !scorecard || !scorecard.domains) {
+    badgeEl.classList.add('hidden');
+    badgeEl.innerHTML = '';
+    return;
+  }
+
+  const globalTierCls = scoreTierClassSuffix(scorecard.globalScore);
+  const globalScoreLabel =
+    scorecard.globalScore !== null && scorecard.globalScore !== undefined
+      ? String(scorecard.globalScore)
+      : 'N/A';
+
+  const breakdownSummary = DOMAIN_DISPLAY_ORDER.map((domainId) => {
+    const dom = scorecard.domains[domainId];
+    if (!dom || !dom.enabled) return null;
+    const val = !dom.applicable || dom.score === null || dom.score === undefined ? 'N/A' : `${dom.score}/100`;
+    return `${dom.shortLabel || dom.title}: ${val}`;
+  })
+    .filter(Boolean)
+    .join(' · ');
+
+  badgeEl.className = `pr-global-score-badge scorecard-tier-${globalTierCls}`;
+  badgeEl.title = `PR Score: ${globalScoreLabel}${globalScoreLabel !== 'N/A' ? '/100' : ''}${
+    scorecard.capped && scorecard.capReason ? ` (Capped: ${scorecard.capReason})` : ''
+  }${breakdownSummary ? ` — ${breakdownSummary}` : ''} · Click to view detailed scores in 1. Audit Report`;
+  badgeEl.innerHTML = `<span class="pr-global-score-badge-label">Score</span><span>${escapeHtml(globalScoreLabel)}</span>${
+    globalScoreLabel !== 'N/A' ? '<span class="pr-global-score-badge-denom">/100</span>' : ''
+  }${scorecard.capped ? '<span aria-hidden="true">&#9888;</span>' : '<span style="font-size:9.5px;opacity:0.75;" aria-hidden="true">&#9662;</span>'}`;
+  badgeEl.onclick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    focusAuditScorecardDetail();
+  };
+}
+
+function renderPrScorecardPanel() {
   const pr = state.prs.find((p) => p.key === state.selectedPrKey);
   const scorecard = state.currentReview?.scorecard;
+
+  renderGlobalScoreTopbarBadge(pr, scorecard);
+
+  const panelEl = document.getElementById('prScorecardPanel');
+  if (!panelEl) return;
 
   if (!pr || !scorecard || !scorecard.domains) {
     panelEl.classList.add('hidden');
@@ -8093,8 +8203,7 @@ function renderPrScorecardPanel() {
   panelEl.querySelector('#scorecardClearDomainFilterBtn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     state.activeDomainFilter = null;
-    renderPrScorecardPanel();
-    renderFindingsTab();
+    syncDomainFilterViews();
   });
 
   panelEl.querySelectorAll('.scorecard-domain-rerun-btn').forEach((btn) => {
@@ -8122,16 +8231,8 @@ function renderPrScorecardPanel() {
     card.addEventListener('click', () => {
       const domId = card.dataset.domain || '';
       if (!domId) return;
-      if (state.activeDomainFilter === domId) {
-        state.activeDomainFilter = null;
-      } else {
-        state.activeDomainFilter = domId;
-        if (!state.splitMode && state.activeTab !== 'comments') {
-          switchTab('comments');
-        }
-      }
-      renderPrScorecardPanel();
-      renderFindingsTab();
+      state.activeDomainFilter = state.activeDomainFilter === domId ? null : domId;
+      syncDomainFilterViews();
     });
   });
 }
