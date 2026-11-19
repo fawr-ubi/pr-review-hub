@@ -1016,7 +1016,13 @@ async function fetchPrContextFromGithub(cfg, pr, repoPath = '') {
   };
 }
 
-async function loadTargetRepoRuleContext(cfg, pr, repoPath = '', headSha = '') {
+async function loadTargetRepoRuleContext(
+  cfg,
+  pr,
+  repoPath = '',
+  headSha = '',
+  changedFiles = []
+) {
   const codeownersCandidates = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
   let codeownersContent = '';
   let repoAgentReviewDir = '';
@@ -1098,6 +1104,7 @@ async function loadTargetRepoRuleContext(cfg, pr, repoPath = '', headSha = '') {
     codeownersContent,
     repoAgentReviewDir,
     repoLayerMarkdown,
+    changedFiles: Array.isArray(changedFiles) ? changedFiles : [],
   };
 }
 
@@ -1285,7 +1292,13 @@ export async function runPrReviewJob({
       }
     }
 
-    const repoRuleContext = await loadTargetRepoRuleContext(cfg, pr, repoPath, headSha);
+    const repoRuleContext = await loadTargetRepoRuleContext(
+      cfg,
+      pr,
+      repoPath,
+      headSha,
+      changedFilesList
+    );
     const ruleResolveOptions = {
       ...repoRuleContext,
       ...(effectiveWanreviewPath ? { wanreviewRepoPath: effectiveWanreviewPath } : {}),

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { inferDomainForRule } from './scoring.mjs';
+import { parseCodeOwners } from './metadata.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -38,7 +39,11 @@ export function slugifyWanreviewRuleId(raw = '') {
     .replace(/\(\)/g, '')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
-  return (cleaned || 'custom-rule').slice(0, 64).replace(/-+$/g, '');
+  if (!cleaned) return 'custom-rule';
+  if (cleaned.length <= 76) return cleaned;
+  const sliced = cleaned.slice(0, 76);
+  const lastDash = sliced.lastIndexOf('-');
+  return (lastDash > 24 ? sliced.slice(0, lastDash) : sliced).replace(/-+$/g, '');
 }
 
 /**
@@ -539,17 +544,103 @@ export function exportRulesToWanreviewDirectory({
   };
 }
 
+function codeOwnerPatternMatchesPath(pattern, filePath) {
+  const cleanFile = String(filePath || '').replace(/^\/+/, '');
+  if (!cleanFile || !pattern) return false;
+  if (pattern === '*') return true;
+
+  const anchored = pattern.startsWith('/');
+  const dirOnly = pattern.endsWith('/');
+  const cleanPat = pattern.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!cleanPat) return false;
+
+  if (!cleanPat.includes('*')) {
+    if (dirOnly) {
+      return anchored
+        ? cleanFile.startsWith(`${cleanPat}/`)
+        : cleanFile.startsWith(`${cleanPat}/`) || cleanFile.includes(`/${cleanPat}/`);
+    }
+    return anchored
+      ? cleanFile === cleanPat || cleanFile.startsWith(`${cleanPat}/`)
+      : cleanFile === cleanPat ||
+          cleanFile.startsWith(`${cleanPat}/`) ||
+          cleanFile.endsWith(`/${cleanPat}`) ||
+          cleanFile.includes(`/${cleanPat}/`);
+  }
+
+  const regexStr =
+    (anchored ? '^' : '(?:^|/)') +
+    cleanPat
+      .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/\*\*/g, '.*')
+      .replace(/\*/g, '[^/]*') +
+    (dirOnly ? '/.*$' : '(?:/.*|$)');
+  try {
+    return new RegExp(regexStr).test(cleanFile);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Extracts the owning `@org/<team>` team from `CODEOWNERS` content, mirroring `resolve.py`:
- * prioritizes `*` catch-all rules, preferring a team that exists in `availableTeams` when multiple
- * teams appear on the same line, and falls back to the first matching `@org/<team>` mention.
+ * Extracts the owning `@org/<team>` team from `CODEOWNERS` content:
+ * - When `changedFiles` is provided (e.g. monorepos like `2cloud-services` with per-service paths),
+ *   evaluates GitHub's last-matching-rule-wins semantics across the PR's changed files and picks the
+ *   squad owning the most modified files (tie-breaking with `fallbackTeam`). If zero changed files
+ *   match any `CODEOWNERS` rule, returns `''` so `teamProfile` fallback wins instead of an unrelated path!
+ * - When `changedFiles` is omitted (repo-level resolution), prioritizes `*` catch-all rules (`resolve.py`),
+ *   and only falls back to path-specific rules when all rules in `CODEOWNERS` point to a single squad.
  */
-export function parseTeamFromCodeownersContent(codeownersContent = '', availableTeams = null) {
+export function parseTeamFromCodeownersContent(
+  codeownersContent = '',
+  availableTeams = null,
+  { changedFiles = null, fallbackTeam = '' } = {}
+) {
   const raw = String(codeownersContent || '');
   if (!raw.trim()) return '';
 
+  const isKnownTeam = (t) =>
+    !availableTeams || availableTeams.size === 0 || availableTeams.has(t);
+
+  // 1. Path-aware resolution when the PR's changed files are known
+  if (Array.isArray(changedFiles) && changedFiles.length > 0) {
+    const parsedRules = parseCodeOwners(raw);
+    if (parsedRules.length === 0) return '';
+
+    const counts = new Map();
+    for (const file of changedFiles) {
+      let lastMatchingOwners = null;
+      for (const rule of parsedRules) {
+        if (codeOwnerPatternMatchesPath(rule.pattern, file)) {
+          lastMatchingOwners = rule.owners;
+        }
+      }
+      if (!lastMatchingOwners) continue;
+      for (const rawOwner of lastMatchingOwners) {
+        const norm = normalizeWanreviewTeamSlug(rawOwner);
+        if (norm && isKnownTeam(norm)) {
+          counts.set(norm, (counts.get(norm) || 0) + 1);
+        }
+      }
+    }
+
+    if (counts.size === 0) {
+      return '';
+    }
+
+    const normFallback = normalizeWanreviewTeamSlug(fallbackTeam);
+    const sorted = [...counts.entries()].sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      if (normFallback && a[0] === normFallback) return -1;
+      if (normFallback && b[0] === normFallback) return 1;
+      return a[0].localeCompare(b[0]);
+    });
+    return sorted[0][0];
+  }
+
+  // 2. Repo-level resolution (mirroring `resolve.py` while guarding multi-squad monorepos without `*`)
   const teamRegex = /@[\w.-]+\/([\w-]+)/g;
-  let firstKnownMatch = '';
+  const distinctKnownTeams = new Set();
   let firstAnyMatch = '';
 
   for (const rawLine of raw.split(/\r?\n/)) {
@@ -565,25 +656,30 @@ export function parseTeamFromCodeownersContent(codeownersContent = '', available
     );
     if (matches.length === 0) continue;
 
-    const knownOnLine =
-      availableTeams && availableTeams.size > 0
-        ? matches.find((t) => availableTeams.has(t)) || ''
-        : matches[0];
+    const knownOnLine = matches.find((t) => isKnownTeam(t)) || '';
 
     if (pattern === '*') {
       if (knownOnLine) return knownOnLine;
       return matches[0];
     }
 
-    if (!firstKnownMatch && knownOnLine) {
-      firstKnownMatch = knownOnLine;
+    for (const t of matches) {
+      if (isKnownTeam(t)) distinctKnownTeams.add(t);
     }
     if (!firstAnyMatch) {
       firstAnyMatch = matches[0];
     }
   }
 
-  return firstKnownMatch || firstAnyMatch || '';
+  if (distinctKnownTeams.size === 1) {
+    return [...distinctKnownTeams][0];
+  }
+  if (distinctKnownTeams.size > 1) {
+    // Multi-team monorepo CODEOWNERS without `*` catch-all and without changedFiles -> let teamProfile decide
+    return '';
+  }
+
+  return firstAnyMatch || '';
 }
 
 function parseLayerMetadataContent(raw = '') {
@@ -758,11 +854,13 @@ export function loadWanreviewRulesFromRepo(
   const blobBranch = headInfo.branch === 'main' ? 'main' : 'master';
   const blobBaseUrl = `https://github.com/ubitransports/wanreview/blob/${blobBranch}`;
 
-  const codeownersTeam = options.codeownersContent
-    ? parseTeamFromCodeownersContent(options.codeownersContent, availableTeams)
-    : '';
-
   const mappedFallback = mapHubTeamToWanreview(teamProfileId);
+  const codeownersTeam = options.codeownersContent
+    ? parseTeamFromCodeownersContent(options.codeownersContent, availableTeams, {
+        changedFiles: options.changedFiles || null,
+        fallbackTeam: mappedFallback.team || teamProfileId,
+      })
+    : '';
   const legacyUbiSlug = mappedFallback.team?.endsWith('-back')
     ? `ubi-eng-${mappedFallback.team.replace(/-back$/, '')}`
     : '';
@@ -1012,6 +1110,51 @@ export async function ensureWanreviewRepoSynced(cfg = {}, options = {}) {
  * `git worktree` (leaving the developer's main checkout untouched), validates 100% `resolve.py`
  * compliance with `status: proposed`, pushes the branch, and opens a GitHub Pull Request.
  */
+function findExistingWanreviewRuleConflict(wanreviewRepoPath = '', item = {}) {
+  if (!wanreviewRepoPath || !fs.existsSync(wanreviewRepoPath)) return null;
+  const rulesRoot = path.join(wanreviewRepoPath, 'rules');
+  if (!fs.existsSync(rulesRoot)) return null;
+
+  const targetFullPath = path.join(wanreviewRepoPath, item.relativePath || '');
+  if (item.relativePath && fs.existsSync(targetFullPath)) {
+    return {
+      reason: 'file',
+      message: `Rule file "${item.relativePath}" already exists in ubitransports/wanreview. Choose a more specific title or custom ID.`,
+    };
+  }
+
+  const walkDirs = [path.join(rulesRoot, 'org')];
+  for (const sub of ['verticals', 'teams']) {
+    const parent = path.join(rulesRoot, sub);
+    if (fs.existsSync(parent)) {
+      for (const d of fs.readdirSync(parent, { withFileTypes: true })) {
+        if (d.isDirectory()) walkDirs.push(path.join(parent, d.name));
+      }
+    }
+  }
+
+  for (const dir of walkDirs) {
+    if (!fs.existsSync(dir)) continue;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.md') || entry.name === '_layer.md') continue;
+      const fullPath = path.join(dir, entry.name);
+      try {
+        const parsed = parseWanreviewMarkdown(fs.readFileSync(fullPath, 'utf8'));
+        if (parsed.valid && parsed.meta?.id === item.id) {
+          const rel = path.relative(wanreviewRepoPath, fullPath).split(path.sep).join('/');
+          return {
+            reason: 'id',
+            message: `Rule ID "${item.id}" already exists in ubitransports/wanreview at "${rel}". Choose a distinct title or custom ID.`,
+          };
+        }
+      } catch {
+        // ignore unreadable file
+      }
+    }
+  }
+  return null;
+}
+
 export async function proposeRulePrToWanreview({
   rule = {},
   layer = 'vertical',
@@ -1021,6 +1164,7 @@ export async function proposeRulePrToWanreview({
   status = 'proposed',
   locked = false,
   customId = '',
+  allowOverwrite = false,
   wanreviewRepoPath = '',
   sourcePrKey = '',
   dryRun = false,
@@ -1038,6 +1182,13 @@ export async function proposeRulePrToWanreview({
 
   if (!item.valid) {
     throw new Error(`Rule validation failed for "${item.id}": ${item.errors.join('; ')}`);
+  }
+
+  if (!allowOverwrite && wanreviewRepoPath) {
+    const conflict = findExistingWanreviewRuleConflict(wanreviewRepoPath, item);
+    if (conflict) {
+      throw new Error(conflict.message);
+    }
   }
 
   if (dryRun) {

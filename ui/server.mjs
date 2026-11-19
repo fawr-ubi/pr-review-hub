@@ -1820,19 +1820,28 @@ export function createHubServer(options = {}) {
           }
         }
 
-        const prRes = await proposeRulePrToWanreview({
-          rule: rulePayload,
-          layer: reqBody.layer || 'vertical',
-          vertical: reqBody.vertical || mapped.vertical || 'wfwp-backend',
-          team: reqBody.team || mapped.team || 'popcorn-back',
-          severity: reqBody.severity || '',
-          status: reqBody.status || 'proposed',
-          locked: Boolean(reqBody.locked),
-          customId: reqBody.customId || '',
-          wanreviewRepoPath: targetWanreviewDir,
-          sourcePrKey: reqBody.sourcePrKey || '',
-          dryRun,
-        });
+        let prRes;
+        try {
+          prRes = await proposeRulePrToWanreview({
+            rule: rulePayload,
+            layer: reqBody.layer || 'vertical',
+            vertical: reqBody.vertical || mapped.vertical || 'wfwp-backend',
+            team: reqBody.team || mapped.team || 'popcorn-back',
+            severity: reqBody.severity || '',
+            status: reqBody.status || 'proposed',
+            locked: Boolean(reqBody.locked),
+            customId: reqBody.customId || '',
+            allowOverwrite: Boolean(reqBody.allowOverwrite),
+            wanreviewRepoPath: targetWanreviewDir,
+            sourcePrKey: reqBody.sourcePrKey || '',
+            dryRun,
+          });
+        } catch (err) {
+          const msg = err?.message || String(err);
+          const isValidationErr =
+            /validation failed|already exists|Unsafe rule destination/i.test(msg);
+          return sendJson(res, isValidationErr ? 400 : 500, { error: msg });
+        }
 
         if (!dryRun && reqBody.candidateId) {
           removeCandidateRuleById(reqBody.candidateId);

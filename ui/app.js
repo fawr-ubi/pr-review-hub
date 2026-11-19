@@ -7407,7 +7407,7 @@ function openRuleAuthoringModal({
         </select>
       </div>
 
-      <div id="authorRuleWanreviewFields" class="${activeDest === 'wanreview' ? '' : 'hidden'}" style="display:grid;grid-template-columns:1.2fr 1fr 1fr 0.9fr;gap:8px;">
+      <div id="authorRuleWanreviewFields" class="${activeDest === 'wanreview' ? '' : 'hidden'}" style="display:${activeDest === 'wanreview' ? 'grid' : 'none'};grid-template-columns:1.2fr 1fr 1fr 0.9fr;gap:8px;">
         <label style="font-size:11.5px;font-weight:600;">Target Layer
           <select id="authorWanLayerSelect" class="search-input" style="width:100%;margin-top:4px;">
             <option value="vertical" selected>vertical (shared across squads)</option>
@@ -7448,6 +7448,20 @@ function openRuleAuthoringModal({
     </div>
   `;
 
+  const syncLayerInputsUi = () => {
+    const chosenLayer = bodyEl.querySelector('#authorWanLayerSelect')?.value || 'vertical';
+    const vertInput = bodyEl.querySelector('#authorWanVerticalInput');
+    const teamInput = bodyEl.querySelector('#authorWanTeamInput');
+    if (vertInput) {
+      vertInput.disabled = chosenLayer !== 'vertical';
+      vertInput.style.opacity = chosenLayer === 'vertical' ? '1' : '0.45';
+    }
+    if (teamInput) {
+      teamInput.disabled = chosenLayer !== 'team';
+      teamInput.style.opacity = chosenLayer === 'team' ? '1' : '0.45';
+    }
+  };
+
   const syncDestUi = () => {
     bodyEl.querySelectorAll('.rule-dest-option').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.dest === activeDest);
@@ -7461,6 +7475,7 @@ function openRuleAuthoringModal({
       wanBox.style.display = activeDest === 'wanreview' ? 'grid' : 'none';
     }
     if (prevBox) prevBox.classList.toggle('hidden', activeDest !== 'wanreview');
+    syncLayerInputsUi();
     confirmBtn.textContent =
       activeDest === 'wanreview'
         ? 'Open PR on ubitransports/wanreview ↗'
@@ -7501,16 +7516,22 @@ function openRuleAuthoringModal({
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Preview error');
         if (metaEl && data.item) {
+          metaEl.style.color = '';
           metaEl.textContent = `✓ Validated for ${data.item.relativePath} (id: ${data.item.id})`;
         }
         if (codeEl && data.item) {
           codeEl.textContent = data.item.markdown;
         }
       } catch (err) {
-        if (metaEl) metaEl.textContent = `Validation error: ${err.message}`;
+        if (metaEl) {
+          metaEl.style.color = 'var(--danger, #e5534b)';
+          metaEl.textContent = `⚠ ${err.message}`;
+        }
       }
     }, 180);
   };
+
+  bodyEl.querySelector('#authorWanLayerSelect')?.addEventListener('change', syncLayerInputsUi);
 
   bodyEl.querySelectorAll('.rule-dest-option').forEach((btn) => {
     btn.addEventListener('click', () => {

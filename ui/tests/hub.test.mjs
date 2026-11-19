@@ -3166,6 +3166,87 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
       fs.rmSync(tmpE2eRoot, { recursive: true, force: true });
     }
   });
+
+  test('Monorepo path-aware CODEOWNERS routing (2cloud-services) + Duplicate Rule ID/File Collision Guard + Word-Boundary Slugifier', async () => {
+    const tmpMonoWan = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-wan-monorepo-'));
+    try {
+      fs.mkdirSync(path.join(tmpMonoWan, 'rules', 'org'), { recursive: true });
+      fs.mkdirSync(path.join(tmpMonoWan, 'rules', 'verticals', 'wfwp-backend'), { recursive: true });
+      for (const sq of ['popcorn-back', 'pili-back', 'banana-back', 'papaya-back']) {
+        fs.mkdirSync(path.join(tmpMonoWan, 'rules', 'teams', sq), { recursive: true });
+        fs.writeFileSync(
+          path.join(tmpMonoWan, 'rules', 'teams', sq, '_layer.md'),
+          '---\nvertical: wfwp-backend\n---\n',
+          'utf8'
+        );
+      }
+      fs.writeFileSync(
+        path.join(tmpMonoWan, 'rules', 'org', 'no-secrets.md'),
+        '---\nid: org.no-secrets\ntitle: No Secrets\nseverity: high\nlocked: true\n---\n\nNo secrets.\n\n## Flag\n- Secrets.\n\n## Accept\n- Env.\n',
+        'utf8'
+      );
+
+      // Realistic 2cloud-services monorepo CODEOWNERS (no `*` catch-all, Billing/pili-back on line 1!)
+      const monorepoCodeowners = [
+        '/projects/services/wfwp-platform/src/Billing/ @ubitransports/pili-back',
+        '/projects/services/consumption/ @ubitransports/papaya-back',
+        '/projects/services/mobility-account/ @ubitransports/popcorn-back',
+        '/projects/services/passenger-information-network/ @ubitransports/banana-back',
+      ].join('\n');
+
+      // 1. PR touching PIN -> banana-back (NOT line 1 pili-back!)
+      const resPin = loadWanreviewRulesFromRepo(tmpMonoWan, 'popcorn-back', {
+        codeownersContent: monorepoCodeowners,
+        changedFiles: ['projects/services/passenger-information-network/src/Entity/Stop.php'],
+      });
+      assert.equal(resPin.team, 'banana-back');
+      assert.equal(resPin.resolutionSource, 'codeowners');
+
+      // 2. PR touching Mobility Account -> popcorn-back via codeowners
+      const resMa = loadWanreviewRulesFromRepo(tmpMonoWan, 'pili-back', {
+        codeownersContent: monorepoCodeowners,
+        changedFiles: ['projects/services/mobility-account/src/Dto/InputDto.php'],
+      });
+      assert.equal(resMa.team, 'popcorn-back');
+      assert.equal(resMa.resolutionSource, 'codeowners');
+
+      // 3. PR touching unowned `projects/common/` -> falls back to active `teamProfile` (`popcorn-back`) instead of line 1 (`pili-back`)!
+      const resCommon = loadWanreviewRulesFromRepo(tmpMonoWan, 'popcorn-back', {
+        codeownersContent: monorepoCodeowners,
+        changedFiles: ['projects/common/src/Identifier/Uuid.php'],
+      });
+      assert.equal(resCommon.team, 'popcorn-back');
+      assert.equal(resCommon.resolutionSource, 'teamProfile');
+
+      // 4. Duplicate Rule ID / File Collision Guard in `proposeRulePrToWanreview`
+      await assert.rejects(
+        () =>
+          proposeRulePrToWanreview({
+            dryRun: true,
+            layer: 'org',
+            severity: 'high',
+            rule: { title: 'No Secrets', body: '- Never commit secrets.' },
+            wanreviewRepoPath: tmpMonoWan,
+          }),
+        /already exists in ubitransports\/wanreview/
+      );
+
+      // 5. Long rule titles truncate cleanly on hyphen word boundaries (never chopping mid-word)
+      const longRule = convertHubRuleToWanreview(
+        {
+          title:
+            'Doctrine Events: Never Call EntityManager flush() Inside AsDoctrineListener postUpdate Subscribers When Computing Changesets',
+          body: '- Never call flush() inside postUpdate.',
+        },
+        { layer: 'vertical', vertical: 'wfwp-backend', statusOverride: 'proposed' }
+      );
+      assert.equal(longRule.valid, true);
+      assert.ok(longRule.stem.length <= 76);
+      assert.ok(!longRule.stem.endsWith('-sub') && !longRule.stem.endsWith('-po'));
+    } finally {
+      fs.rmSync(tmpMonoWan, { recursive: true, force: true });
+    }
+  });
 });
 
 
