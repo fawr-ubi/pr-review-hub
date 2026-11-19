@@ -47,6 +47,9 @@ import {
   convertHubRuleToWanreview,
   exportRulesToWanreviewDirectory,
   loadWanreviewRulesFromRepo,
+  parseTeamFromCodeownersContent,
+  proposeRulePrToWanreview,
+  ensureWanreviewRepoSynced,
 } from '../lib/wanreview.mjs';
 import {
   resolveProductContextForPr,
@@ -65,7 +68,14 @@ import {
 import { synthesizeCandidateRulesFromComments } from '../lib/onboarding.mjs';
 import { saveCandidateRules } from '../lib/rules.mjs';
 import { createHubServer, setCustomOverviewHandlerForTests } from '../server.mjs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsyncTest = promisify(execFile);
+
+// Isolate unit tests from any real ~/.config/pr-review-hub/wanreview clone or network auto-clone
+process.env.REVIEW_HUB_DISABLE_WANREVIEW_AUTOCLONE = '1';
+process.env.REVIEW_HUB_WANREVIEW_DIR = '';
 
 // =============================================================================
 // 1. Unit Tests: parseRepoRelativePath
@@ -794,16 +804,33 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
   });
 
   test('1-year team PR review comment onboarding synthesizes candidate rules and requires user approval/rejection before activation', async () => {
-    const commonFile = path.join(tmpRoot, 'common-dna.md');
+    const tmpWanOnboarding = path.join(tmpRoot, 'wanreview-onboarding');
+    fs.mkdirSync(path.join(tmpWanOnboarding, 'rules', 'org'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpWanOnboarding, 'rules', 'org', 'no-secrets.md'),
+      [
+        '---',
+        'id: org.no-secrets',
+        'title: Never commit secrets or credentials',
+        'severity: high',
+        'locked: true',
+        '---',
+        '',
+        'Never hardcode credentials.',
+        '',
+        '## Flag',
+        '- Committed secrets or API keys.',
+        '',
+        '## Accept',
+        '- Environment variables.',
+        '',
+      ].join('\n'),
+      'utf8'
+    );
     const dnaFile = path.join(tmpRoot, 'reviewer-dna.local.md');
     const candidateFile = path.join(tmpRoot, 'candidate-rules.local.json');
     const changelogFile = path.join(tmpRoot, 'changelog.local.md');
 
-    fs.writeFileSync(
-      commonFile,
-      `# Common DNA\n\n## 1. Architecture, Serialization & Clean Code\n- **SOLID — Dependency Inversion (DIP):** Always type-hint interfaces.\n`,
-      'utf8'
-    );
     fs.writeFileSync(
       dnaFile,
       `# Local DNA\n\n## 1. Architecture, Serialization & Clean Code\n`,
@@ -811,7 +838,7 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     );
     fs.writeFileSync(changelogFile, `# Changelog\n`, 'utf8');
 
-    process.env.REVIEW_HUB_COMMON_DNA_FILE = commonFile;
+    process.env.REVIEW_HUB_WANREVIEW_DIR = tmpWanOnboarding;
     process.env.REVIEW_HUB_DNA_FILE = dnaFile;
     process.env.REVIEW_HUB_CANDIDATES_FILE = candidateFile;
     process.env.REVIEW_HUB_CHANGELOG_FILE = changelogFile;
@@ -842,12 +869,12 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     assert.equal(synthesized.length, 3);
     saveCandidateRules(synthesized);
 
-    // 1. GET /api/rules returns common rules + pending candidate rules
+    // 1. GET /api/rules returns centralized wanreview rules + pending candidate rules
     const listRes = await fetch(`${baseUrl}/api/rules`);
     assert.equal(listRes.status, 200);
     const listData = await listRes.json();
     assert.equal(listData.candidates.length, 3);
-    assert.ok(listData.rules.some((r) => r.target === 'common'));
+    assert.ok(listData.rules.some((r) => r.target === 'wanreview' && r.wanreviewId === 'org.no-secrets'));
 
     // 2. Approve first candidate into Local DNA ('dna')
     const cand1 = listData.candidates[0];
@@ -886,7 +913,7 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     const teamsData = await teamsRes.json();
     assert.ok(Array.isArray(teamsData.teams));
 
-    delete process.env.REVIEW_HUB_COMMON_DNA_FILE;
+    process.env.REVIEW_HUB_WANREVIEW_DIR = '';
     delete process.env.REVIEW_HUB_DNA_FILE;
     delete process.env.REVIEW_HUB_CANDIDATES_FILE;
     delete process.env.REVIEW_HUB_CHANGELOG_FILE;
@@ -1415,8 +1442,10 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
     assert.ok(css.includes('.pr-thread-card.compact-review .pr-thread-header'));
     assert.ok(css.includes('.pr-thread-comment,'));
 
-    // 6. Multi-Team Profiles & 4-Layer Rule Architecture (GET/POST /api/teams/profiles & target: 'team')
-    assert.ok(html.includes('data-rule-target="team"'));
+    // 6. Multi-Team Profiles & Centralized wanreview + Personal (.local.md) Architecture
+    assert.ok(html.includes('data-rule-target="wanreview"'));
+    assert.ok(html.includes('data-rule-target="dna"'));
+    assert.ok(!html.includes('data-rule-target="team"'));
     assert.ok(js.includes('openTeamProfileModal'));
     assert.ok(js.includes('activeTeamProfileSelect'));
 
@@ -1443,7 +1472,8 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
       assert.equal(createdTeamData.profile.id, 'moneris-back');
       assert.equal(createdTeamData.activeTeamProfile.id, 'moneris-back');
 
-      const addTeamRuleRes = await fetch(`${baseUrl}/api/rules`, {
+      // Direct writes to legacy 'team' / 'common' targets are rejected in favor of wanreview PRs
+      const legacyTeamWriteRes = await fetch(`${baseUrl}/api/rules`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1454,12 +1484,9 @@ Commentaire en français qui ne doit jamais écraser le bloc anglais.
           body: 'Always attach an idempotency key when calling external payment gateway endpoints.',
         }),
       });
-      assert.equal(addTeamRuleRes.status, 200);
-      const teamRulesData = await addTeamRuleRes.json();
-      assert.equal(teamRulesData.ok, true);
-      assert.ok(
-        teamRulesData.teamRules.some((r) => r.title === 'Idempotent Payment Gateway Retries')
-      );
+      assert.equal(legacyTeamWriteRes.status, 500);
+      const legacyErrData = await legacyTeamWriteRes.json();
+      assert.ok(legacyErrData.error.includes('ubitransports/wanreview'));
     } finally {
       delete process.env.REVIEW_HUB_TEAMS_DIR;
     }
@@ -1589,25 +1616,25 @@ describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
       [
         `#!/bin/sh`,
         `printf '%s\\n' '{"event":"init"}'`,
-        `sleep 0.25`,
+        `sleep 0.3`,
         `printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"# Code Review: "}}'`,
-        `sleep 0.25`,
+        `sleep 0.3`,
         `printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"streamed "}}'`,
-        `sleep 0.25`,
+        `sleep 0.3`,
         `printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"ok"}}'`,
-        `sleep 0.25`,
+        `sleep 0.3`,
         `printf '%s\\n' '{"event":"result","result":{"response":"# Code Review: streamed ok"}}'`,
       ].join('\n'),
       { mode: 0o755 }
     );
 
-    // Total runtime >1000ms > inactivityTimeoutMs (650ms), yet succeeds because chunks reset heartbeat
+    // Total runtime >1200ms > inactivityTimeoutMs (850ms), yet succeeds because chunks reset heartbeat
     const streamedOut = await runCliPrompt({
       prompt: 'Short test prompt',
       cwd: tmpDir,
       agentCli: 'agy',
-      timeoutMs: 5000,
-      inactivityTimeoutMs: 650,
+      timeoutMs: 6000,
+      inactivityTimeoutMs: 850,
       maxRetries: 0,
       _customBinPath: streamBin,
     });
@@ -1652,23 +1679,44 @@ describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
     assert.ok(phases.some((p) => p.includes('Auto-retrying')));
   });
 
-  test('scope: "shared" excludes .local.md rules and enforces Zero-Waste prompt, while scope: "personal" includes .local.md without polluting shared store', async () => {
-    const commonDna = path.join(tmpDir, 'common-dna.md');
-    const teamDna = path.join(tmpDir, 'team-dna.md');
+  test('scope: "shared" resolves centralized wanreview rules while excluding .local.md, whereas scope: "personal" includes .local.md without polluting shared store', async () => {
+    const tmpWanScope = path.join(tmpDir, 'wanreview-scope');
+    fs.mkdirSync(path.join(tmpWanScope, 'rules', 'org'), { recursive: true });
+    fs.mkdirSync(path.join(tmpWanScope, 'rules', 'verticals', 'wfwp-backend'), { recursive: true });
+    fs.mkdirSync(path.join(tmpWanScope, 'rules', 'teams', 'popcorn-back'), { recursive: true });
+
+    fs.writeFileSync(
+      path.join(tmpWanScope, 'rules', 'org', 'no-secrets.md'),
+      '---\nid: org.no-secrets\ntitle: SHARED_ORG_RULE_01\nseverity: high\nlocked: true\n---\n\nNever hardcode secrets.\n\n## Flag\n- Secrets.\n\n## Accept\n- Env vars.\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(tmpWanScope, 'rules', 'verticals', 'wfwp-backend', 'tenant-isolation.md'),
+      '---\nid: wfwp-backend.tenant-isolation\ntitle: SHARED_VERTICAL_RULE_02\nseverity: high\n---\n\nIsolate tenant queries.\n\n## Flag\n- Unscoped queries.\n\n## Accept\n- Tenant-scoped queries.\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(tmpWanScope, 'rules', 'teams', 'popcorn-back', '_layer.md'),
+      '---\nvertical: wfwp-backend\n---\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(tmpWanScope, 'rules', 'teams', 'popcorn-back', 'popcorn-rule.md'),
+      '---\nid: popcorn-back.popcorn-rule\ntitle: SHARED_TEAM_RULE_03\nseverity: medium\n---\n\nPopcorn team convention.\n\n## Flag\n- Legacy helper.\n\n## Accept\n- Modern helper.\n',
+      'utf8'
+    );
+
     const teamFp = path.join(tmpDir, 'team-fp.md');
     const localDna = path.join(tmpDir, 'reviewer-dna.local.md');
     const localFp = path.join(tmpDir, 'false-positives.local.md');
     const reviewsDir = path.join(tmpDir, 'rule-scope-reviews');
     fs.mkdirSync(reviewsDir, { recursive: true });
 
-    fs.writeFileSync(commonDna, '## Common\n- **SHARED_COMMON_RULE_01:** Enforce strict types.\n', 'utf8');
-    fs.writeFileSync(teamDna, '## Team\n- **SHARED_TEAM_RULE_02:** Use API Platform processors.\n', 'utf8');
-    fs.writeFileSync(teamFp, '## Team Exceptions\n- **SHARED_TEAM_FP_03:** Legacy DTO allowed.\n', 'utf8');
+    fs.writeFileSync(teamFp, '## Team Exceptions\n- **SHARED_TEAM_FP_04:** Legacy DTO allowed.\n', 'utf8');
     fs.writeFileSync(localDna, '## Personal\n- **SECRET_LOCAL_DNA_RULE_99:** Personal preference only.\n', 'utf8');
     fs.writeFileSync(localFp, '## Personal Exceptions\n- **SECRET_LOCAL_FP_99:** Personal exception only.\n', 'utf8');
 
-    process.env.REVIEW_HUB_COMMON_DNA_FILE = commonDna;
-    process.env.REVIEW_HUB_TEAM_DNA_FILE = teamDna;
+    process.env.REVIEW_HUB_WANREVIEW_DIR = tmpWanScope;
     process.env.REVIEW_HUB_TEAM_FP_FILE = teamFp;
     process.env.REVIEW_HUB_DNA_FILE = localDna;
     process.env.REVIEW_HUB_FP_FILE = localFp;
@@ -1683,6 +1731,7 @@ describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
       githubOrg: 'ubitransports',
       githubUser: 'worker-bot',
       teamProfile: 'popcorn-back',
+      wanreviewRepoPath: tmpWanScope,
       projectsDir: tmpDir,
       reviewsDir,
       agentCli: 'agy',
@@ -1699,9 +1748,10 @@ describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
     assert.equal(capturedPrompts.length, 1);
     const sharedPrompt = capturedPrompts[0];
     assert.ok(sharedPrompt.includes('FAST ZERO-WASTE MODE'));
-    assert.ok(sharedPrompt.includes('SHARED_COMMON_RULE_01'));
-    assert.ok(sharedPrompt.includes('SHARED_TEAM_RULE_02'));
-    assert.ok(sharedPrompt.includes('SHARED_TEAM_FP_03'));
+    assert.ok(sharedPrompt.includes('SHARED_ORG_RULE_01'));
+    assert.ok(sharedPrompt.includes('SHARED_VERTICAL_RULE_02'));
+    assert.ok(sharedPrompt.includes('SHARED_TEAM_RULE_03'));
+    assert.ok(sharedPrompt.includes('SHARED_TEAM_FP_04'));
     assert.ok(!sharedPrompt.includes('SECRET_LOCAL_DNA_RULE_99'));
     assert.ok(!sharedPrompt.includes('SECRET_LOCAL_FP_99'));
     assert.equal(
@@ -1725,6 +1775,7 @@ describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
     await runPrReviewJob({ cfg, pr: personalPr, scope: 'personal' });
     assert.equal(capturedPrompts.length, 2);
     const personalPrompt = capturedPrompts[1];
+    assert.ok(personalPrompt.includes('SHARED_ORG_RULE_01'));
     assert.ok(personalPrompt.includes('SECRET_LOCAL_DNA_RULE_99'));
     assert.ok(personalPrompt.includes('SECRET_LOCAL_FP_99'));
     // Personal pass must NOT register a shared Hub artifact
@@ -1740,8 +1791,7 @@ describe('Shared Review Hub & Single-Worker Auto-Review Engine', () => {
     );
 
     setCustomAgentRunnerForTests(null);
-    delete process.env.REVIEW_HUB_COMMON_DNA_FILE;
-    delete process.env.REVIEW_HUB_TEAM_DNA_FILE;
+    process.env.REVIEW_HUB_WANREVIEW_DIR = '';
     delete process.env.REVIEW_HUB_TEAM_FP_FILE;
     delete process.env.REVIEW_HUB_DNA_FILE;
     delete process.env.REVIEW_HUB_FP_FILE;
@@ -2633,7 +2683,7 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
       const writtenFile = exportRes.files[0];
       assert.equal(
         writtenFile.relativePath,
-        'rules/teams/ubi-eng-popcorn/deprecated-getcustomuuid-ban.md'
+        'rules/teams/popcorn-back/deprecated-getcustomuuid-ban.md'
       );
       assert.equal(fs.existsSync(writtenFile.absolutePath), true);
 
@@ -2643,7 +2693,17 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
       );
       assert.equal(diskCheck.valid, true, `Exported markdown must pass resolve.py validation: ${diskCheck.errors.join(', ')}`);
 
-      // Verify HTTP endpoints (/api/agents, /api/wanreview/preview-export) and clean PR Queue UI
+      // Verify HTTP endpoints (/api/agents, /api/wanreview/preview-export, /api/wanreview/propose-pr) and clean PR Queue UI
+      const tmpCandFile = path.join(tmpWanDir, 'candidates.json');
+      process.env.REVIEW_HUB_CANDIDATES_FILE = tmpCandFile;
+      saveCandidateRules([
+        {
+          id: 'cand-export-1',
+          source: 'candidate',
+          title: 'Use Readonly DTO Classes',
+          body: '- Avoid mutable DTO properties.\n- Declare DTOs as readonly class.',
+        },
+      ]);
       saveConfig({ wanreviewRepoPath: tmpWanDir }, tmpCfgPath);
       const srv = createHubServer();
       await new Promise((r) => srv.listen(0, '127.0.0.1', r));
@@ -2666,7 +2726,7 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
         });
         assert.equal(previewRes.status, 200);
         const previewJson = await previewRes.json();
-        assert.ok(previewJson.files.length > 0, 'Preview export must return converted shared rules');
+        assert.ok(previewJson.files.length > 0, 'Preview export must return converted candidate rules');
         for (const f of previewJson.files) {
           assert.equal(f.valid, true);
         }
@@ -2682,7 +2742,7 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
           scorecardIdx > tabReportIdx && !(scorecardIdx > headerEndIdx && scorecardIdx < navTabsIdx),
           '#prScorecardPanel must live inside #tab-report rather than as a persistent top banner above tabs'
         );
-        assert.ok(html.includes('id="exportWanreviewBtn"'), 'Rules tab must include Export to wanreview button');
+        assert.ok(html.includes('id="syncWanreviewBtn"'), 'Rules tab must include Sync wanreview button');
         assert.ok(js.includes('function renderPrScorecardPanel()'), 'app.js must define renderPrScorecardPanel');
         assert.ok(js.includes('function focusAuditScorecardDetail()'), 'app.js must define focusAuditScorecardDetail on global score click');
         assert.ok(js.includes('function autoResizeFindingTextarea('), 'app.js must auto-expand AI proposal textareas without inner scrolling');
@@ -2700,6 +2760,7 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
           'PR Queue cards must remain clean without score badges'
         );
       } finally {
+        delete process.env.REVIEW_HUB_CANDIDATES_FILE;
         await new Promise((r) => srv.close(r));
       }
     } finally {
@@ -2800,6 +2861,309 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
       if (prevReviewsEnv !== undefined) process.env.REVIEWS_DIR = prevReviewsEnv;
       else delete process.env.REVIEWS_DIR;
       fs.rmSync(tmpSimDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Centralized wanreview E2E (A1-A5): resolve.py 4-layer parity, CODEOWNERS team override, UI rule badges with zero comment pollution, isolated worktree PR creation, and safe fast-forward sync', async () => {
+    const tmpE2eRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-wanreview-e2e-'));
+    const bareOriginDir = path.join(tmpE2eRoot, 'wanreview-origin.git');
+    const seedCloneDir = path.join(tmpE2eRoot, 'wanreview-seed');
+    const localWanCloneDir = path.join(tmpE2eRoot, 'wanreview-local');
+    const targetServiceRepoDir = path.join(tmpE2eRoot, 'target-repo');
+    const tmpReviewsDir = path.join(tmpE2eRoot, 'reviews');
+    const tmpCfgPath = path.join(tmpE2eRoot, 'config.json');
+
+    const prevCfgEnv = process.env.REVIEW_HUB_CONFIG;
+    const prevReviewsEnv = process.env.REVIEWS_DIR;
+    process.env.REVIEW_HUB_CONFIG = tmpCfgPath;
+    process.env.REVIEWS_DIR = tmpReviewsDir;
+
+    try {
+      fs.mkdirSync(tmpReviewsDir, { recursive: true });
+      fs.mkdirSync(path.join(targetServiceRepoDir, '.agent-review'), { recursive: true });
+
+      // 1. Create a real bare git origin + local clone mimicking ubitransports/wanreview (master branch, dot-namespaced IDs, omitted status -> enforced)
+      execFileSync('git', ['init', '--bare', bareOriginDir]);
+      execFileSync('git', ['clone', bareOriginDir, seedCloneDir]);
+      execFileSync('git', ['-C', seedCloneDir, 'checkout', '-b', 'master']);
+      execFileSync('git', ['-C', seedCloneDir, 'config', 'user.email', 'test@matawan.io']);
+      execFileSync('git', ['-C', seedCloneDir, 'config', 'user.name', 'Wanreview Test']);
+
+      fs.mkdirSync(path.join(seedCloneDir, 'rules', 'org'), { recursive: true });
+      fs.mkdirSync(path.join(seedCloneDir, 'rules', 'verticals', 'wfwp-backend'), { recursive: true });
+      fs.mkdirSync(path.join(seedCloneDir, 'rules', 'teams', 'popcorn-back'), { recursive: true });
+      fs.mkdirSync(path.join(seedCloneDir, 'rules', 'teams', 'pili-back'), { recursive: true });
+
+      fs.writeFileSync(
+        path.join(seedCloneDir, 'rules', 'org', 'no-secrets.md'),
+        '---\nid: org.no-secrets\ntitle: Never commit secrets or credentials\nseverity: high\nlocked: true\n---\n\nNever hardcode secrets.\n\n## Flag\n- API keys in source.\n\n## Accept\n- Env vars.\n',
+        'utf8'
+      );
+      // Notice omitted `status:` and dot-namespaced `id: wfwp-backend.tenant-isolation` inside `tenant-isolation.md` (real wanreview convention)
+      fs.writeFileSync(
+        path.join(seedCloneDir, 'rules', 'verticals', 'wfwp-backend', 'tenant-isolation.md'),
+        '---\nid: wfwp-backend.tenant-isolation\ntitle: Enforce multi-tenant isolation on queries\nseverity: medium\n---\n\nScope all queries by tenant.\n\n## Flag\n- Unscoped findAll().\n\n## Accept\n- Tenant filter enabled.\n',
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(seedCloneDir, 'rules', 'verticals', 'wfwp-backend', 'legacy-array-shape.md'),
+        '---\nid: wfwp-backend.legacy-array-shape\ntitle: Avoid untyped associative arrays\nseverity: low\nstatus: advisory\n---\n\nPrefer DTOs.\n\n## Flag\n- Raw array return.\n\n## Accept\n- Readonly DTO.\n',
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(seedCloneDir, 'rules', 'teams', 'popcorn-back', '_layer.md'),
+        '---\nvertical: wfwp-backend\n---\n',
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(seedCloneDir, 'rules', 'teams', 'popcorn-back', 'popcorn-rule.md'),
+        '---\nid: popcorn-back.popcorn-rule\ntitle: Popcorn specific check\nseverity: low\n---\n\nPopcorn check.\n\n## Flag\n- Popcorn anti-pattern.\n\n## Accept\n- Popcorn idiom.\n',
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(seedCloneDir, 'rules', 'teams', 'pili-back', '_layer.md'),
+        '---\nvertical: wfwp-backend\n---\n',
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(seedCloneDir, 'rules', 'teams', 'pili-back', 'pili-rule.md'),
+        '---\nid: pili-back.pili-rule\ntitle: Pili specific check\nseverity: medium\n---\n\nPili check.\n\n## Flag\n- Pili anti-pattern.\n\n## Accept\n- Pili idiom.\n',
+        'utf8'
+      );
+
+      execFileSync('git', ['-C', seedCloneDir, 'add', '.']);
+      execFileSync('git', ['-C', seedCloneDir, 'commit', '-m', 'chore: initial wanreview rules']);
+      execFileSync('git', ['-C', seedCloneDir, 'push', '-u', 'origin', 'master']);
+      execFileSync('git', ['--git-dir', bareOriginDir, 'symbolic-ref', 'HEAD', 'refs/heads/master']);
+
+      execFileSync('git', ['clone', bareOriginDir, localWanCloneDir]);
+      execFileSync('git', ['-C', localWanCloneDir, 'config', 'user.email', 'antoine@matawan.io']);
+      execFileSync('git', ['-C', localWanCloneDir, 'config', 'user.name', 'Antoine Test']);
+
+      // 2. Test A3: CODEOWNERS dynamic team override (`pili-back` overrides `popcorn-back`) + 4th layer `.agent-review/_layer.md` overrides/disable
+      fs.writeFileSync(
+        path.join(targetServiceRepoDir, '.agent-review', '_layer.md'),
+        [
+          '---',
+          'overrides:',
+          '  wfwp-backend.tenant-isolation:',
+          '    severity: high',
+          '  org.no-secrets:',
+          '    severity: low',
+          'disable:',
+          '  - wfwp-backend.legacy-array-shape',
+          '  - org.no-secrets',
+          '---',
+          '',
+        ].join('\n'),
+        'utf8'
+      );
+
+      const codeownersContent = [
+        '# Service CODEOWNERS',
+        '* @ubitransports/ubi-eng-pili',
+      ].join('\n');
+
+      assert.equal(
+        parseTeamFromCodeownersContent(codeownersContent, new Set(['popcorn-back', 'pili-back'])),
+        'pili-back'
+      );
+
+      const resolvedForPiliRepo = loadWanreviewRulesFromRepo(localWanCloneDir, 'popcorn-back', {
+        codeownersContent,
+        repoAgentReviewDir: path.join(targetServiceRepoDir, '.agent-review'),
+      });
+      assert.equal(resolvedForPiliRepo.available, true);
+      assert.equal(resolvedForPiliRepo.team, 'pili-back', 'CODEOWNERS must dynamically override fallback teamProfile');
+      assert.equal(resolvedForPiliRepo.resolutionSource, 'codeowners');
+      assert.equal(resolvedForPiliRepo.vertical, 'wfwp-backend');
+
+      const activeIds = resolvedForPiliRepo.rules.map((r) => r.wanreviewId);
+      assert.ok(activeIds.includes('org.no-secrets'), 'Locked org rule must survive disable');
+      assert.ok(activeIds.includes('wfwp-backend.tenant-isolation'));
+      assert.ok(activeIds.includes('pili-back.pili-rule'), 'Pili rule must be loaded via CODEOWNERS');
+      assert.ok(!activeIds.includes('popcorn-back.popcorn-rule'), 'Popcorn rule must NOT load on Pili-owned PR');
+      assert.ok(!activeIds.includes('wfwp-backend.legacy-array-shape'), 'Disabled vertical rule must be excluded');
+
+      const tenantRule = resolvedForPiliRepo.rules.find((r) => r.wanreviewId === 'wfwp-backend.tenant-isolation');
+      assert.equal(tenantRule.status, 'enforced', 'Omitted status in frontmatter must default to enforced');
+      assert.equal(tenantRule.severity, 'high', '4th layer .agent-review/_layer.md override must upgrade severity to high');
+      assert.equal(
+        tenantRule.url,
+        'https://github.com/ubitransports/wanreview/blob/master/rules/verticals/wfwp-backend/tenant-isolation.md'
+      );
+
+      const lockedOrgRule = resolvedForPiliRepo.rules.find((r) => r.wanreviewId === 'org.no-secrets');
+      assert.equal(lockedOrgRule.severity, 'high', 'Locked rule severity must NOT be downgraded to low by overrides');
+
+      // 3. Test A5: UI Rule Citations (matchedRules with GitHub URLs) while keeping finding.comment & customComment 100% clean human English
+      const reviewFilename = 'review-2cloud-services-5999.md';
+      const reviewMd = [
+        '# Code Review: `2cloud-services#5999` — Tenant Query Check',
+        '',
+        '## 1. Task Summary & Functional Problem Solved',
+        '- **Verdict:** 🟠 Request Changes',
+        '',
+        '## 3. Detailed Findings',
+        '',
+        '### 🔴 Blockers & Bugs',
+        '',
+        '#### #1 Missing tenant filter in `ContractRepository::findActive()`',
+        '- **Domain:** `security`',
+        '- **Rule:** `wfwp-backend.tenant-isolation`, `org.no-secrets`',
+        '- **File:** `src/Repository/ContractRepository.php:42-48`',
+        '- **Why it matters:** Queries across tenants leak customer contracts.',
+        '',
+        '**Ready-to-paste GitHub comment:**',
+        '````markdown',
+        '`findActive()` queries `Contract` without filtering by the current tenant, which can expose contracts across customer tenants. Could we scope the query builder with `->andWhere(\'c.customer = :customer\')`?',
+        '',
+        '**Triggered Rules:** [wfwp-backend.tenant-isolation](https://github.com/ubitransports/wanreview/blob/master/rules/verticals/wfwp-backend/tenant-isolation.md)',
+        '🤖 Wanreview automated check',
+        '````',
+        '',
+      ].join('\n');
+      fs.writeFileSync(path.join(tmpReviewsDir, reviewFilename), reviewMd, 'utf8');
+
+      saveConfig(
+        {
+          githubOrg: 'ubitransports',
+          githubUser: 'antoine-test',
+          teamProfile: 'popcorn-back',
+          wanreviewRepoPath: localWanCloneDir,
+          reviewsDir: tmpReviewsDir,
+        },
+        tmpCfgPath
+      );
+
+      const srv = createHubServer();
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+      const baseUrl = `http://127.0.0.1:${srv.address().port}`;
+      try {
+        const revRes = await fetch(`${baseUrl}/api/review?file=${encodeURIComponent(reviewFilename)}&prKey=2cloud-services%235999`);
+        assert.equal(revRes.status, 200);
+        const revData = await revRes.json();
+        assert.equal(revData.findings.length, 1);
+        const f1 = revData.findings[0];
+        assert.deepEqual(f1.ruleIds, ['wfwp-backend.tenant-isolation', 'org.no-secrets']);
+        assert.equal(f1.matchedRules.length, 2);
+        assert.equal(
+          f1.matchedRules[0].url,
+          'https://github.com/ubitransports/wanreview/blob/master/rules/verticals/wfwp-backend/tenant-isolation.md'
+        );
+        assert.ok(!f1.comment.includes('Triggered Rules'), 'Ready-to-paste GitHub comment must NOT contain Triggered Rules footer');
+        assert.ok(!f1.comment.includes('Wanreview'), 'Ready-to-paste GitHub comment must NOT contain Wanreview bot branding');
+        assert.ok(!f1.customComment.includes('Triggered Rules'));
+
+        // 4. Test A4 (dryRun via HTTP + live isolated git worktree PR creation against bare origin)
+        const dryRunRes = await fetch(`${baseUrl}/api/wanreview/propose-pr`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dryRun: true,
+            layer: 'vertical',
+            vertical: 'wfwp-backend',
+            severity: 'medium',
+            title: 'Avoid Deprecated getCustomUuid()',
+            body: '- Never call getCustomUuid() on entities.\n- Use NeedLegacyConversion or Uuid::buildFromCustomerAndId().',
+          }),
+        });
+        assert.equal(dryRunRes.status, 200);
+        const dryRunJson = await dryRunRes.json();
+        assert.equal(dryRunJson.dryRun, true);
+        assert.equal(dryRunJson.ruleId, 'wfwp-backend.avoid-deprecated-getcustomuuid');
+        assert.equal(
+          dryRunJson.relativePath,
+          'rules/verticals/wfwp-backend/avoid-deprecated-getcustomuuid.md'
+        );
+        const previewValidation = validateWanreviewRuleMarkdown(
+          dryRunJson.markdown,
+          'avoid-deprecated-getcustomuuid'
+        );
+        assert.equal(previewValidation.valid, true);
+        assert.equal(previewValidation.meta.status, 'proposed');
+      } finally {
+        await new Promise((r) => srv.close(r));
+      }
+
+      // Live isolated worktree test: add an untracked local file in localWanCloneDir to prove worktree isolation
+      fs.writeFileSync(path.join(localWanCloneDir, 'WIP-LOCAL-NOTE.txt'), 'keep untouched', 'utf8');
+      let capturedGhArgs = null;
+      const prResult = await proposeRulePrToWanreview({
+        rule: {
+          title: 'Avoid Deprecated getCustomUuid()',
+          body: '- Never call getCustomUuid() on entities.\n- Use NeedLegacyConversion or Uuid::buildFromCustomerAndId().',
+        },
+        layer: 'vertical',
+        vertical: 'wfwp-backend',
+        severity: 'medium',
+        status: 'proposed',
+        wanreviewRepoPath: localWanCloneDir,
+        sourcePrKey: '2cloud-services#5999',
+        execFn: async (cmd, args, opts) => {
+          if (cmd === 'gh') {
+            capturedGhArgs = args;
+            return { stdout: 'https://github.com/ubitransports/wanreview/pull/42\n', stderr: '' };
+          }
+          return execFileAsyncTest(cmd, args, opts);
+        },
+      });
+
+      assert.equal(prResult.ok, true);
+      assert.equal(prResult.prUrl, 'https://github.com/ubitransports/wanreview/pull/42');
+      assert.ok(Array.isArray(capturedGhArgs) && capturedGhArgs[0] === 'pr' && capturedGhArgs[1] === 'create');
+      // Verify main checkout is STILL on master and untouched, while remote bare origin received the pushed feature branch!
+      const currentMainBranch = execFileSync('git', ['-C', localWanCloneDir, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+        encoding: 'utf8',
+      }).trim();
+      assert.equal(currentMainBranch, 'master');
+      assert.equal(
+        fs.existsSync(path.join(localWanCloneDir, 'rules', 'verticals', 'wfwp-backend', 'avoid-deprecated-getcustomuuid.md')),
+        false,
+        'Main wanreview checkout must stay clean while PR branch was pushed from isolated worktree'
+      );
+      const pushedFileInOrigin = execFileSync(
+        'git',
+        ['--git-dir', bareOriginDir, 'show', `${prResult.branchName}:rules/verticals/wfwp-backend/avoid-deprecated-getcustomuuid.md`],
+        { encoding: 'utf8' }
+      );
+      assert.ok(pushedFileInOrigin.includes('id: wfwp-backend.avoid-deprecated-getcustomuuid'));
+      assert.ok(pushedFileInOrigin.includes('status: proposed'));
+      fs.unlinkSync(path.join(localWanCloneDir, 'WIP-LOCAL-NOTE.txt'));
+
+      // 5. Test A1: Safe fast-forward sync (`ensureWanreviewRepoSynced`)
+      fs.writeFileSync(
+        path.join(seedCloneDir, 'rules', 'org', 'no-eval.md'),
+        '---\nid: org.no-eval\ntitle: Never use dynamic eval()\nseverity: high\n---\n\nBan eval.\n\n## Flag\n- eval().\n\n## Accept\n- Safe parser.\n',
+        'utf8'
+      );
+      execFileSync('git', ['-C', seedCloneDir, 'add', '.']);
+      execFileSync('git', ['-C', seedCloneDir, 'commit', '-m', 'feat(org): add org.no-eval rule']);
+      execFileSync('git', ['-C', seedCloneDir, 'push', 'origin', 'master']);
+
+      // Dirty tracked file -> must skip pull safely (`skipped-dirty`)
+      fs.appendFileSync(path.join(localWanCloneDir, 'rules', 'org', 'no-secrets.md'), '\n', 'utf8');
+      const dirtySync = await ensureWanreviewRepoSynced(
+        { wanreviewRepoPath: localWanCloneDir, projectsDir: tmpE2eRoot },
+        { pull: true, allowAutoClone: false }
+      );
+      assert.equal(dirtySync.action, 'skipped-dirty');
+      assert.equal(fs.existsSync(path.join(localWanCloneDir, 'rules', 'org', 'no-eval.md')), false);
+
+      // Clean working tree on master -> fast-forwards cleanly!
+      execFileSync('git', ['-C', localWanCloneDir, 'checkout', '--', 'rules/org/no-secrets.md']);
+      const cleanSync = await ensureWanreviewRepoSynced(
+        { wanreviewRepoPath: localWanCloneDir, projectsDir: tmpE2eRoot },
+        { pull: true, allowAutoClone: false }
+      );
+      assert.equal(cleanSync.action, 'pulled');
+      assert.equal(fs.existsSync(path.join(localWanCloneDir, 'rules', 'org', 'no-eval.md')), true);
+    } finally {
+      if (prevCfgEnv !== undefined) process.env.REVIEW_HUB_CONFIG = prevCfgEnv;
+      else delete process.env.REVIEW_HUB_CONFIG;
+      if (prevReviewsEnv !== undefined) process.env.REVIEWS_DIR = prevReviewsEnv;
+      else delete process.env.REVIEWS_DIR;
+      fs.rmSync(tmpE2eRoot, { recursive: true, force: true });
     }
   });
 });

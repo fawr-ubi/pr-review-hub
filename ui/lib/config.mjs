@@ -385,7 +385,7 @@ function normalizeDomainAgentsField(rawAgents, fallback = DEFAULT_DOMAIN_AGENTS_
 }
 
 function detectLocalWanreviewRepo(projectsDir = '') {
-  if (process.env.REVIEW_HUB_WANREVIEW_DIR) {
+  if (process.env.REVIEW_HUB_WANREVIEW_DIR !== undefined) {
     return expandHome(process.env.REVIEW_HUB_WANREVIEW_DIR);
   }
   const candidates = [
@@ -494,7 +494,7 @@ export function loadConfig(customConfigFile = '') {
       merged.projectsDir = expandHome(merged.projectsDir || defaults.projectsDir);
       merged.reviewsDir = expandHome(merged.reviewsDir || defaults.reviewsDir);
       merged.wanreviewRepoPath = expandHome(
-        merged.wanreviewRepoPath ?? defaults.wanreviewRepoPath ?? ''
+        merged.wanreviewRepoPath || defaults.wanreviewRepoPath || ''
       );
       merged.domainAgents = normalizeDomainAgentsField(saved.domainAgents, defaults.domainAgents);
       return merged;

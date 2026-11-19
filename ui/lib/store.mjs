@@ -136,6 +136,7 @@ export function saveReviewArtifact({
   reviewedBy = '',
   scorecard = null,
   productContext = null,
+  wanreview = null,
 }) {
   const effectiveCfg = cfg || loadConfig();
   const prNum = Number(number);
@@ -170,6 +171,7 @@ export function saveReviewArtifact({
     reviewedAt: nowIso,
     scorecard: scorecard || null,
     productContext: productContext || null,
+    wanreview: wanreview || null,
   };
   writeJsonAtomic(legacyMetaPath, metadata);
 

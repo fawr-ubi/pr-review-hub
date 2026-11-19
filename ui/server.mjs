@@ -58,6 +58,7 @@ import {
   deleteRule,
   decideCandidateRule,
   approveAllCandidateRules,
+  removeCandidateRuleById,
   syncCombinedReferenceFiles,
   buildRulesLookupMap,
 } from './lib/rules.mjs';
@@ -77,6 +78,8 @@ import {
 import {
   mapHubTeamToWanreview,
   exportRulesToWanreviewDirectory,
+  ensureWanreviewRepoSynced,
+  proposeRulePrToWanreview,
 } from './lib/wanreview.mjs';
 import { bootstrapTeamCandidateRules } from './lib/onboarding.mjs';
 import {
@@ -805,6 +808,63 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
+function enrichFindingMatchedRules(finding, rulesLookup) {
+  const candidateRuleIds =
+    Array.isArray(finding.ruleIds) && finding.ruleIds.length > 0
+      ? finding.ruleIds
+      : finding.ruleId
+      ? [finding.ruleId]
+      : [];
+  if (candidateRuleIds.length === 0) return [];
+
+  return candidateRuleIds.map((rid) => {
+    const cleanId = String(rid || '').trim();
+    const shortStem = cleanId.split('.').pop() || '';
+    const hit =
+      (rulesLookup && (rulesLookup.get(cleanId) || (shortStem && rulesLookup.get(shortStem)))) ||
+      null;
+    if (hit) {
+      return {
+        id: hit.wanreviewId || cleanId,
+        title: hit.title || cleanId,
+        url: hit.url || null,
+        layer: hit.layerSpec || hit.layer || 'wanreview',
+        severity: hit.severity || 'medium',
+        status: hit.status || 'enforced',
+        locked: Boolean(hit.locked),
+      };
+    }
+
+    let fallbackUrl = null;
+    const dotParts = cleanId.split('.');
+    if (dotParts.length === 2 && dotParts[0] && dotParts[1]) {
+      const [ns, stem] = dotParts;
+      if (ns === 'org') {
+        fallbackUrl = `https://github.com/ubitransports/wanreview/blob/master/rules/org/${stem}.md`;
+      } else if (
+        ns === 'wfwp-backend' ||
+        ns.endsWith('-web') ||
+        ns.endsWith('-kotlin') ||
+        ns.startsWith('qa-')
+      ) {
+        fallbackUrl = `https://github.com/ubitransports/wanreview/blob/master/rules/verticals/${ns}/${stem}.md`;
+      } else {
+        fallbackUrl = `https://github.com/ubitransports/wanreview/blob/master/rules/teams/${ns}/${stem}.md`;
+      }
+    }
+
+    return {
+      id: cleanId,
+      title: cleanId,
+      url: fallbackUrl,
+      layer: dotParts.length === 2 ? dotParts[0] : 'rule',
+      severity: 'medium',
+      status: 'enforced',
+      locked: false,
+    };
+  });
+}
+
 export function createHubServer(options = {}) {
   try {
     ensureConfigBootstrapped();
@@ -815,6 +875,20 @@ export function createHubServer(options = {}) {
     const initialCfg = loadConfig();
     syncCombinedReferenceFiles(initialCfg.teamProfile);
     hydrateLocalStateFromSharedStore(initialCfg);
+    if (
+      !options.scheduler &&
+      !process.env.REVIEW_HUB_CONFIG &&
+      process.env.REVIEW_HUB_DISABLE_WANREVIEW_AUTOCLONE !== '1'
+    ) {
+      ensureWanreviewRepoSynced(initialCfg, { pull: true, allowAutoClone: true })
+        .then((syncRes) => {
+          if (syncRes?.available && syncRes.repoPath && !initialCfg.wanreviewRepoPath) {
+            saveConfig({ wanreviewRepoPath: syncRes.repoPath });
+          }
+          syncCombinedReferenceFiles(initialCfg.teamProfile);
+        })
+        .catch(() => {});
+    }
   } catch {
     // ignore startup sync error
   }
@@ -1071,6 +1145,9 @@ export function createHubServer(options = {}) {
           return sendJson(res, 404, { error: 'Review file not found' });
         }
 
+        const effectiveRulesTeam =
+          reviewMetadata?.wanreview?.team || reviewMetadata?.teamProfile || cfg.teamProfile;
+        const rulesLookup = buildRulesLookupMap(effectiveRulesTeam);
         const rawFindings = parseFindingsFromMarkdown(markdown);
 
         const aiFindings = rawFindings.map((f) => {
@@ -1083,6 +1160,7 @@ export function createHubServer(options = {}) {
           return {
             ...f,
             domain: inferDomainForFinding(f),
+            matchedRules: enrichFindingMatchedRules(f, rulesLookup),
             cid,
             ...mergedState,
           };
@@ -1090,7 +1168,6 @@ export function createHubServer(options = {}) {
 
         const parsedMdScorecard = parseScorecardBlockFromMarkdown(markdown);
         const storedScorecard = reviewMetadata?.scorecard || parsedMdScorecard || null;
-        const rulesLookup = buildRulesLookupMap(cfg.teamProfile);
         const liveScorecard = computeBoundedScorecard({
           rawDomains: storedScorecard?.domains || {},
           findings: aiFindings,
@@ -1158,6 +1235,7 @@ export function createHubServer(options = {}) {
             if (sharedArt?.markdown) md = sharedArt.markdown;
           }
           if (md) {
+            const diffRulesLookup = buildRulesLookupMap(cfg.teamProfile);
             resolvedFindings = parseFindingsFromMarkdown(md).map((f) => {
               const cid = `${prKey}::${f.id}`;
               const mergedState = mergeCollaborativeAndLocalFindingState({
@@ -1168,6 +1246,7 @@ export function createHubServer(options = {}) {
               const resolution = resolveFindingAgainstDiff(f, files);
               return {
                 ...f,
+                matchedRules: enrichFindingMatchedRules(f, diffRulesLookup),
                 ...resolution,
                 cid,
                 ...mergedState,
@@ -1688,6 +1767,84 @@ export function createHubServer(options = {}) {
         return sendJson(res, 200, { ok: true, saved, productContext: ctx });
       }
 
+      if (req.method === 'POST' && pathname === '/api/wanreview/sync') {
+        const reqBody = await readRequestBody(req);
+        const pull = reqBody.pull !== false;
+        const syncRes = await ensureWanreviewRepoSynced(cfg, {
+          pull,
+          allowAutoClone: true,
+        });
+        let activeCfg = cfg;
+        if (syncRes.available && syncRes.repoPath && syncRes.repoPath !== cfg.wanreviewRepoPath) {
+          activeCfg = saveConfig({ wanreviewRepoPath: syncRes.repoPath });
+        }
+        syncCombinedReferenceFiles(activeCfg.teamProfile);
+        const rulesState = listAllRules(reqBody.teamProfile || activeCfg.teamProfile);
+        return sendJson(res, 200, {
+          ok: Boolean(syncRes.ok),
+          sync: syncRes,
+          config: activeCfg,
+          ...rulesState,
+        });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/wanreview/propose-pr') {
+        const reqBody = await readRequestBody(req);
+        const teamParam = reqBody.teamProfile || cfg.teamProfile || 'popcorn-back';
+        const mapped = mapHubTeamToWanreview(teamParam);
+        const dryRun = Boolean(reqBody.dryRun);
+        const rulePayload =
+          reqBody.rule && typeof reqBody.rule === 'object'
+            ? reqBody.rule
+            : {
+                title: reqBody.title || '',
+                body: reqBody.body || reqBody.description || '',
+                severity: reqBody.severity || '',
+              };
+
+        if (!String(rulePayload.title || '').trim() || !String(rulePayload.body || '').trim()) {
+          return sendJson(res, 400, {
+            error: 'Rule title and description/body are required to propose a wanreview rule.',
+          });
+        }
+
+        let targetWanreviewDir = String(reqBody.wanreviewRepoPath || cfg.wanreviewRepoPath || '').trim();
+        if (!dryRun && (!targetWanreviewDir || !fs.existsSync(path.join(targetWanreviewDir, '.git')))) {
+          const syncRes = await ensureWanreviewRepoSynced(cfg, {
+            pull: true,
+            allowAutoClone: true,
+          });
+          if (syncRes.available && syncRes.repoPath) {
+            targetWanreviewDir = syncRes.repoPath;
+            saveConfig({ wanreviewRepoPath: targetWanreviewDir });
+          }
+        }
+
+        const prRes = await proposeRulePrToWanreview({
+          rule: rulePayload,
+          layer: reqBody.layer || 'vertical',
+          vertical: reqBody.vertical || mapped.vertical || 'wfwp-backend',
+          team: reqBody.team || mapped.team || 'popcorn-back',
+          severity: reqBody.severity || '',
+          status: reqBody.status || 'proposed',
+          locked: Boolean(reqBody.locked),
+          customId: reqBody.customId || '',
+          wanreviewRepoPath: targetWanreviewDir,
+          sourcePrKey: reqBody.sourcePrKey || '',
+          dryRun,
+        });
+
+        if (!dryRun && reqBody.candidateId) {
+          removeCandidateRuleById(reqBody.candidateId);
+        }
+
+        const rulesState = listAllRules(teamParam);
+        return sendJson(res, 200, {
+          ...prRes,
+          ...rulesState,
+        });
+      }
+
       if (
         req.method === 'POST' &&
         (pathname === '/api/wanreview/preview-export' || pathname === '/api/wanreview/export')
@@ -1698,15 +1855,13 @@ export function createHubServer(options = {}) {
         const rulesState = listAllRules(teamParam);
         const mapped = mapHubTeamToWanreview(rulesState.activeTeamProfile?.id || teamParam);
         const pool = [
-          ...(rulesState.commonRules || []),
-          ...(rulesState.teamRules || []),
           ...(rulesState.dnaRules || []),
           ...(rulesState.candidateRules || []),
         ];
         const requestedIds = Array.isArray(reqBody.ruleIds) ? new Set(reqBody.ruleIds) : null;
         const selectedRules = requestedIds
           ? pool.filter((r) => requestedIds.has(r.id))
-          : pool.filter((r) => r.source === 'common' || r.source === 'team');
+          : pool;
 
         const targetRootDir = String(reqBody.targetRootDir || cfg.wanreviewRepoPath || '').trim();
         if (writeToDisk && !targetRootDir) {
@@ -1721,7 +1876,7 @@ export function createHubServer(options = {}) {
           targetRootDir,
           layer: reqBody.layer || '',
           vertical: reqBody.vertical || mapped.vertical || 'wfwp-backend',
-          team: reqBody.team || mapped.team || 'ubi-eng-popcorn',
+          team: reqBody.team || mapped.team || 'popcorn-back',
           statusOverride: reqBody.statusOverride || '',
           allowPersonalPromotion: Boolean(reqBody.allowPersonalPromotion),
           writeToDisk,
@@ -1911,12 +2066,27 @@ export function createHubServer(options = {}) {
       if (req.method === 'POST' && pathname === '/api/sync') {
         await pullSharedStore(cfg).catch(() => {});
         const defaultSyncScript = path.join(SKILL_ROOT_DIR, 'scripts', 'sync-queue.sh');
-        let scanResult;
-        if (
+        const usesCustomTestSyncScript = Boolean(
           cfg.syncScript &&
-          path.resolve(cfg.syncScript) !== path.resolve(defaultSyncScript) &&
-          fs.existsSync(cfg.syncScript)
-        ) {
+            path.resolve(cfg.syncScript) !== path.resolve(defaultSyncScript) &&
+            fs.existsSync(cfg.syncScript)
+        );
+        let wanreviewSync = null;
+        if (!usesCustomTestSyncScript) {
+          wanreviewSync = await ensureWanreviewRepoSynced(cfg, {
+            pull: true,
+            allowAutoClone:
+              !process.env.REVIEW_HUB_CONFIG &&
+              process.env.REVIEW_HUB_DISABLE_WANREVIEW_AUTOCLONE !== '1',
+          }).catch(() => null);
+          if (wanreviewSync?.available && wanreviewSync.repoPath && !cfg.wanreviewRepoPath) {
+            saveConfig({ wanreviewRepoPath: wanreviewSync.repoPath });
+          }
+          syncCombinedReferenceFiles(cfg.teamProfile);
+        }
+
+        let scanResult;
+        if (usesCustomTestSyncScript) {
           const { stdout } = await execFileAsync(cfg.syncScript, ['scan'], {
             maxBuffer: 20 * 1024 * 1024,
             timeout: 120000,
@@ -1933,6 +2103,7 @@ export function createHubServer(options = {}) {
         return sendJson(res, 200, {
           ok: true,
           scanResult,
+          wanreviewSync,
           autoEnqueued,
           state: buildStateResponse(scheduler),
         });

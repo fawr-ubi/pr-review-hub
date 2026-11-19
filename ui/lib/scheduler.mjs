@@ -8,6 +8,7 @@ import {
   pullSharedStore,
   hydrateLocalStateFromSharedStore,
 } from './store.mjs';
+import { ensureWanreviewRepoSynced } from './wanreview.mjs';
 
 function readLocalOpenPrs(reviewsDir) {
   try {
@@ -357,6 +358,16 @@ export class AutoReviewScheduler {
     let enqueuedCount = 0;
 
     try {
+      // 0. Fast-forward centralized ubitransports/wanreview rules when running real GitHub syncs
+      if (this.scanPrQueueFn === scanPrQueue) {
+        await ensureWanreviewRepoSynced(cfg, {
+          pull: true,
+          allowAutoClone:
+            !process.env.REVIEW_HUB_CONFIG &&
+            process.env.REVIEW_HUB_DISABLE_WANREVIEW_AUTOCLONE !== '1',
+        }).catch(() => {});
+      }
+
       // 1. Pull latest shared artifacts from GitSharedStore if configured
       await this.pullStoreFn(cfg).catch(() => {});
 

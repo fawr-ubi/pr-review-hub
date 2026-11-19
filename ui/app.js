@@ -1585,6 +1585,29 @@ async function selectPr(prKey, broadcast = true) {
   }
 }
 
+function renderFindingMatchedRulesHtml(finding) {
+  const matched = Array.isArray(finding?.matchedRules) ? finding.matchedRules : [];
+  if (matched.length === 0) return '';
+  return matched
+    .map((r) => {
+      const ruleId = String(r.id || '').trim();
+      if (!ruleId) return '';
+      const tipParts = [
+        r.title && r.title !== ruleId ? r.title : '',
+        r.layer ? `layer: ${r.layer}` : '',
+        r.severity ? `severity: ${r.severity}` : '',
+        r.status ? `status: ${r.status}` : '',
+      ].filter(Boolean);
+      const tooltip = tipParts.join(' · ') || ruleId;
+      if (r.url) {
+        return `<a href="${escapeHtml(r.url)}" target="_blank" rel="noopener" class="wanreview-rule-badge" title="${escapeHtml(tooltip)}">${escapeHtml(ruleId)} &#8599;</a>`;
+      }
+      return `<span class="wanreview-rule-badge" title="${escapeHtml(tooltip)}">${escapeHtml(ruleId)}</span>`;
+    })
+    .filter(Boolean)
+    .join('');
+}
+
 function renderReportFindingsQuickBar() {
   const barEl = document.getElementById('reportFindingsQuickBar');
   if (!barEl) return;
@@ -1645,12 +1668,14 @@ function renderReportFindingsQuickBar() {
                 const domTag = f.domain
                   ? `<span class="domain-pill domain-pill-${escapeHtml(f.domain)}">${escapeHtml(f.domain)}</span>`
                   : '';
+                const rulesTags = renderFindingMatchedRulesHtml(f);
                 return `
             <div class="report-finding-row ${sev.cardClass} ${f.dismissed ? 'dismissed' : ''}">
               <div class="report-finding-main">
                 <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
                 <a href="#report-finding-${idx}" class="finding-id-link qbar-jump-btn" data-idx="${idx}" title="Jump to detailed section ${escapeHtml(f.id)}">${escapeHtml(f.id)}</a>
                 ${domTag}
+                ${rulesTags}
                 ${f.category ? `<span class="finding-cat-pill">${formatInlineCodeHtml(f.category)}</span>` : ''}
                 <span class="report-finding-title">${formatInlineCodeHtml(f.title)}</span>
               </div>
@@ -2030,6 +2055,8 @@ function upgradeReportFindingsInDom(container, findings) {
       <div class="report-detail-header-left">
         <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
         <span class="finding-id">${escapeHtml(finding.id)}</span>
+        ${finding.domain ? `<span class="domain-pill domain-pill-${escapeHtml(finding.domain)}">${escapeHtml(finding.domain)}</span>` : ''}
+        ${renderFindingMatchedRulesHtml(finding)}
         ${finding.category ? `<span class="finding-cat-pill">${formatInlineCodeHtml(finding.category)}</span>` : ''}
         <span class="report-detail-title">${formatInlineCodeHtml(finding.title)}</span>
       </div>
@@ -2077,7 +2104,14 @@ function upgradeReportFindingsInDom(container, findings) {
         finding.filePath
       ) {
         li.remove();
-      } else if (label === 'category' || label === 'catégorie') {
+      } else if (
+        label === 'category' ||
+        label === 'catégorie' ||
+        label === 'domain' ||
+        label === 'rule' ||
+        label === 'rules' ||
+        label === 'rule id'
+      ) {
         li.remove();
       } else if (/ready-to-paste|commentaire prêt|suggestion prête/i.test(label)) {
         li.remove();
@@ -2870,6 +2904,7 @@ function renderFindingsTab() {
               <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
               ${domainId ? `<span class="domain-pill domain-pill-${escapeHtml(domainId)}" title="Domain Agent: ${escapeHtml(domainId)}">${escapeHtml(domainId)}</span>` : ''}
               <span class="finding-id">${escapeHtml(f.id)}</span>
+              ${renderFindingMatchedRulesHtml(f)}
               ${f.category ? `<span class="finding-cat-pill">${formatInlineCodeHtml(f.category)}</span>` : ''}
               <span class="finding-title">${formatInlineCodeHtml(f.title)}</span>
               ${f.dismissed ? `<span class="badge">FALSE POSITIVE${f.dismissedBy ? ` · @${escapeHtml(f.dismissedBy)}` : ''}</span>` : ''}
@@ -5451,88 +5486,17 @@ async function promptAddRuleFromFinding(finding) {
   if (state.dnaSections.length === 0) {
     await loadRules();
   }
-
-  const defaultSections =
-    state.dnaSections.length > 0
-      ? state.dnaSections
-      : [
-          '1. Architecture, Serialization & Clean Code',
-          '2. Multi-Tenant, Security & Voter Isolation (Critical)',
-          '3. Database, Migrations & Performance',
-          '4. PHP 8.2+ & Symfony Idioms',
-          '5. Testing Standards (PHPUnit & Behat)',
-          '6. Naming, Typos & Boy Scout Hygiene',
-        ];
-
   const cleanTitle = stripEmojis(finding.title || 'New Engineering Rule');
   const suggestedBody = (finding.customComment || finding.comment || '').trim();
+  const sourcePrKey = pr ? `${pr.repo}#${pr.number} (${finding.id})` : finding.id || '';
 
-  const modal = document.getElementById('githubModal');
-  const titleEl = document.getElementById('modalTitle');
-  const bodyEl = document.getElementById('modalBody');
-  const confirmBtn = document.getElementById('confirmModalBtn');
-
-  titleEl.textContent = `Add Agent Rule from ${finding.id}`;
-  confirmBtn.textContent = 'Add to reviewer-dna.md';
-
-  bodyEl.innerHTML = `
-    <div style="display:flex;flex-direction:column;gap:10px;">
-      <p class="meta-text" style="margin:0;">
-        Extracts this finding into a permanent rule (in English) in <code>references/reviewer-dna.md</code> for future reviews.
-      </p>
-      <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">DNA Section:</label>
-        <select id="modalRuleSectionSelect" class="search-input">
-          ${defaultSections.map((sec) => `<option value="${escapeHtml(sec)}">${escapeHtml(sec)}</option>`).join('')}
-        </select>
-      </div>
-      <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Rule Title (English):</label>
-        <input type="text" id="modalRuleTitleInput" class="search-input" value="${escapeHtml(cleanTitle)}" />
-      </div>
-      <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Instruction for Agent (English):</label>
-        <textarea id="modalRuleBodyInput" class="finding-textarea" style="min-height:110px;">${escapeHtml(suggestedBody)}</textarea>
-      </div>
-    </div>
-  `;
-
-  modal.classList.remove('hidden');
-
-  confirmBtn.onclick = async () => {
-    const section = document.getElementById('modalRuleSectionSelect').value.trim();
-    const title = document.getElementById('modalRuleTitleInput').value.trim();
-    const body = document.getElementById('modalRuleBodyInput').value.trim();
-    if (!title || !body) {
-      showToast('Title and description are required.');
-      return;
-    }
-
-    confirmBtn.disabled = true;
-    try {
-      const res = await fetch('/api/rules', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          target: 'dna',
-          section,
-          title,
-          body,
-          source: pr ? `${pr.repo}#${pr.number} (${finding.id})` : finding.id,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Error adding rule');
-      modal.classList.add('hidden');
-      await loadRules();
-      showToast(`Rule "${title}" added to reviewer-dna.md.`);
-    } catch (err) {
-      showToast(`Error: ${err.message}`, 4500);
-    } finally {
-      confirmBtn.disabled = false;
-      confirmBtn.textContent = 'Confirm';
-    }
-  };
+  openRuleAuthoringModal({
+    initialDestination: 'local',
+    title: cleanTitle,
+    body: suggestedBody,
+    sourcePrKey,
+    headingLabel: `Add Rule from ${finding.id}`,
+  });
 }
 
 // =============================================================================
@@ -6880,10 +6844,11 @@ async function loadRules() {
     }
     state.teamProfiles = data.teamProfiles || [];
     state.activeTeamProfile = data.activeTeamProfile || null;
+    if (data.wanreview) {
+      state.wanreviewInfo = data.wanreview;
+    }
     state.rules = data.rules || [];
     state.candidateRules = data.candidates || [];
-    state.commonSections = data.commonSections || [];
-    state.teamSections = data.teamSections || [];
     state.dnaSections = data.dnaSections || [];
     state.fpSections = data.fpSections || [];
 
@@ -6904,16 +6869,6 @@ async function loadRules() {
 
     const candCountEl = document.getElementById('rulesCandidateCount');
     if (candCountEl) candCountEl.textContent = String(state.candidateRules.length);
-
-    const commonCountEl = document.getElementById('rulesCommonCount');
-    if (commonCountEl) {
-      commonCountEl.textContent = String(state.rules.filter((r) => r.target === 'common').length);
-    }
-
-    const teamCountEl = document.getElementById('rulesTeamCount');
-    if (teamCountEl) {
-      teamCountEl.textContent = String(state.rules.filter((r) => r.target === 'team').length);
-    }
 
     const dnaCountEl = document.getElementById('rulesDnaCount');
     if (dnaCountEl) {
@@ -6946,11 +6901,29 @@ function renderRulesTab() {
   };
   const profiles = state.teamProfiles || [];
 
+  const wanInfo = state.wanreviewInfo || {};
+  const wanStatusStrip = wanInfo.available
+    ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:6px;padding:6px 10px;border-radius:4px;background:var(--bg-app);border:1px solid var(--border-subtle);font-size:11.5px;">
+         <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+           <span class="badge badge-pass">ubitransports/wanreview</span>
+           <span><strong>${Number(wanInfo.count || 0)}</strong> active shared rules resolved (<code>org &rarr; ${escapeHtml(wanInfo.vertical || 'wfwp-backend')} &rarr; ${escapeHtml(wanInfo.team || activeProfile.id)}</code>)</span>
+           ${wanInfo.commitSha ? `<span class="badge badge-mono" title="${escapeHtml(wanInfo.repoPath || '')}">${escapeHtml(wanInfo.commitSha)}</span>` : ''}
+         </span>
+         <span style="display:flex;align-items:center;gap:8px;">
+           <span class="meta-text">Per-PR CODEOWNERS auto-resolution active</span>
+           <a href="https://github.com/ubitransports/wanreview" target="_blank" rel="noopener" class="wanreview-rule-badge">Open Repo &#8599;</a>
+         </span>
+       </div>`
+    : `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:6px;padding:6px 10px;border-radius:4px;background:var(--bg-app);border:1px solid var(--border-subtle);font-size:11.5px;">
+         <span><strong>ubitransports/wanreview</strong> is not cloned locally yet. Click <strong>Sync wanreview</strong> to load all shared company &amp; vertical rules.</span>
+         <button type="button" id="bannerSyncWanreviewBtn" class="btn btn-sync btn-xs">Sync wanreview</button>
+       </div>`;
+
   const teamProfileBannerHtml = `
     <div class="rule-card" style="border-left:3px solid var(--status-pass);background:var(--bg-elevated);margin-bottom:10px;">
       <div class="rule-card-header" style="flex-wrap:wrap;gap:10px;">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-          <span class="badge badge-pass">ACTIVE TEAM AGENT</span>
+          <span class="badge badge-pass">DEFAULT SQUAD PROFILE</span>
           <select id="activeTeamProfileSelect" class="search-input" style="min-width:260px;font-weight:600;">
             ${profiles
               .map(
@@ -6968,6 +6941,7 @@ function renderRulesTab() {
           <button type="button" id="createNewTeamProfileBtn" class="btn btn-primary btn-xs">+ New Team Profile</button>
         </div>
       </div>
+      ${wanStatusStrip}
       ${
         activeProfile.agentInstructions || activeProfile.description
           ? `<div class="rule-card-body" style="margin-top:6px;font-size:12px;">
@@ -7026,11 +7000,10 @@ function renderRulesTab() {
         <div class="rule-card-header">
           <div class="rule-card-title-group">
             <span class="badge badge-severity-question">TEAM ONBOARDING (1 YEAR)</span>
-            <span class="rule-card-title">${candidateItems.length} candidate rule(s) synthesized from GitHub history — Validation required before activation</span>
+            <span class="rule-card-title">${candidateItems.length} candidate rule(s) synthesized from GitHub history — Propose to wanreview or save locally</span>
           </div>
           <div style="display:flex;gap:6px;">
-            <button id="approveAllCandidatesTeamBtn" class="btn btn-secondary btn-xs">Approve All (Team DNA)</button>
-            <button id="approveAllCandidatesLocalBtn" class="btn btn-primary btn-xs">Approve All (Local DNA)</button>
+            <button id="approveAllCandidatesLocalBtn" class="btn btn-primary btn-xs">Save All to Personal (.local.md)</button>
           </div>
         </div>
       </div>
@@ -7050,14 +7023,13 @@ function renderRulesTab() {
           <div class="rule-card" style="border-left:3px solid var(--accent);" data-idx="${idx}">
             <div class="rule-card-header">
               <div class="rule-card-title-group">
-                <span class="badge badge-severity-question">CANDIDATE TO VALIDATE</span>
+                <span class="badge badge-severity-question">CANDIDATE</span>
                 <span class="rule-section-pill">${escapeHtml(r.section || '1. Architecture, Serialization & Clean Code')}</span>
                 <span class="rule-card-title">${escapeHtml(r.title)}</span>
               </div>
               <div style="display:flex;gap:6px;align-items:center;">
-                <button class="btn btn-primary btn-xs approve-candidate-dna-btn" data-idx="${idx}" title="Approve and add to personal references/reviewer-dna.local.md">Approve (Local)</button>
-                <button class="btn btn-secondary btn-xs approve-candidate-team-btn" data-idx="${idx}" title="Approve and add to shared team profile references/teams/${escapeHtml(activeProfile.id)}/team-dna.md">Approve (Team)</button>
-                <button class="btn btn-secondary btn-xs approve-candidate-common-btn" data-idx="${idx}" title="Approve and add to shared references/common-dna.md">Approve (Common)</button>
+                <button class="btn btn-primary btn-xs propose-candidate-wanreview-btn" data-idx="${idx}" title="Open a Pull Request on ubitransports/wanreview with status: proposed">Propose PR to wanreview &#8599;</button>
+                <button class="btn btn-secondary btn-xs approve-candidate-dna-btn" data-idx="${idx}" title="Save locally into personal references/reviewer-dna.local.md">Save Personal (.local)</button>
                 <button class="btn btn-ghost btn-xs edit-candidate-btn" data-idx="${idx}">Edit</button>
                 <button class="btn btn-ghost btn-xs reject-candidate-btn" data-idx="${idx}">Reject</button>
               </div>
@@ -7069,21 +7041,13 @@ function renderRulesTab() {
 
       const badgeLabel =
         r.target === 'wanreview'
-          ? `WANREVIEW (${String(r.layer || 'org').toUpperCase()})`
-          : r.target === 'common'
-          ? 'COMMON DNA'
-          : r.target === 'team'
-          ? `TEAM DNA (${activeProfile.id.toUpperCase()})`
+          ? `WANREVIEW (${String(r.layerSpec || r.layer || 'org').toUpperCase()})`
           : r.target === 'dna'
-          ? 'LOCAL DNA'
-          : 'FALSE POSITIVE';
+          ? 'PERSONAL (.LOCAL)'
+          : 'FALSE POSITIVE (.LOCAL)';
       const badgeClass =
         r.target === 'wanreview'
           ? 'badge-pass'
-          : r.target === 'common'
-          ? 'badge-severity-nit'
-          : r.target === 'team'
-          ? 'badge-peer'
           : r.target === 'dna'
           ? 'badge-severity-ok'
           : 'badge-severity-major';
@@ -7094,17 +7058,26 @@ function renderRulesTab() {
             <div class="rule-card-title-group">
               <span class="badge ${badgeClass}">${escapeHtml(badgeLabel)}</span>
               ${r.domain ? `<span class="domain-pill domain-pill-${escapeHtml(r.domain)}">${escapeHtml(r.domain)}</span>` : ''}
+              ${r.wanreviewId && r.target === 'wanreview' ? `<span class="badge badge-mono">${escapeHtml(r.wanreviewId)}</span>` : ''}
+              ${r.severity && r.target === 'wanreview' ? `<span class="badge badge-mono">${escapeHtml(r.severity)}</span>` : ''}
               ${r.locked ? `<span class="badge badge-severity-blocker" title="Immutable locked organization rule">LOCKED</span>` : ''}
               ${r.status && r.status !== 'enforced' ? `<span class="badge badge-mono">${escapeHtml(r.status)}</span>` : ''}
-              <span class="rule-section-pill">${escapeHtml(r.section)}</span>
+              ${r.target !== 'wanreview' ? `<span class="rule-section-pill">${escapeHtml(r.section)}</span>` : ''}
               <span class="rule-card-title">${escapeHtml(r.title)}</span>
             </div>
             <div style="display:flex;gap:6px;align-items:center;">
               ${r.startLine ? `<span class="meta-text">L${r.startLine}</span>` : ''}
               ${
                 r.readOnly
-                  ? `<span class="meta-text" title="${escapeHtml(r.filePath || '')}">Synced from wanreview</span>`
-                  : `<button class="btn btn-ghost btn-xs edit-rule-btn" data-idx="${idx}">Edit</button>
+                  ? r.url
+                    ? `<a href="${escapeHtml(r.url)}" target="_blank" rel="noopener" class="wanreview-rule-badge" title="${escapeHtml(r.filePath || '')}">View in wanreview &#8599;</a>`
+                    : `<span class="meta-text" title="${escapeHtml(r.filePath || '')}">Synced from wanreview</span>`
+                  : `${
+                      r.target === 'dna'
+                        ? `<button class="btn btn-secondary btn-xs promote-rule-wanreview-btn" data-idx="${idx}" title="Propose this personal rule to ubitransports/wanreview via Pull Request">Propose to wanreview &#8599;</button>`
+                        : ''
+                    }
+                     <button class="btn btn-ghost btn-xs edit-rule-btn" data-idx="${idx}">Edit</button>
                      <button class="btn btn-ghost btn-xs delete-rule-btn" data-idx="${idx}">Remove</button>`
               }
             </div>
@@ -7122,10 +7095,6 @@ function renderRulesTab() {
     await decideCandidateRuleAction({ action: 'approve-all', target: 'dna' });
   });
 
-  document.getElementById('approveAllCandidatesTeamBtn')?.addEventListener('click', async () => {
-    await decideCandidateRuleAction({ action: 'approve-all', target: 'team' });
-  });
-
   listEl.querySelectorAll('.approve-candidate-dna-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const rule = filtered[Number(btn.dataset.idx)];
@@ -7133,17 +7102,31 @@ function renderRulesTab() {
     });
   });
 
-  listEl.querySelectorAll('.approve-candidate-team-btn').forEach((btn) => {
-    btn.addEventListener('click', async () => {
+  listEl.querySelectorAll('.propose-candidate-wanreview-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
       const rule = filtered[Number(btn.dataset.idx)];
-      if (rule) await decideCandidateRuleAction({ id: rule.id, action: 'approve', target: 'team' });
+      if (!rule) return;
+      openRuleAuthoringModal({
+        initialDestination: 'wanreview',
+        title: rule.title || '',
+        body: rule.body || '',
+        candidateId: rule.id,
+        sourcePrKey: (rule.sourcePrs || []).slice(0, 3).join(', '),
+        headingLabel: 'Propose Candidate Rule to ubitransports/wanreview',
+      });
     });
   });
 
-  listEl.querySelectorAll('.approve-candidate-common-btn').forEach((btn) => {
-    btn.addEventListener('click', async () => {
+  listEl.querySelectorAll('.promote-rule-wanreview-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
       const rule = filtered[Number(btn.dataset.idx)];
-      if (rule) await decideCandidateRuleAction({ id: rule.id, action: 'approve', target: 'common' });
+      if (!rule) return;
+      openRuleAuthoringModal({
+        initialDestination: 'wanreview',
+        title: rule.title || '',
+        body: rule.body || '',
+        headingLabel: 'Promote Personal Rule to ubitransports/wanreview',
+      });
     });
   });
 
@@ -7203,6 +7186,36 @@ function bindTeamProfileBannerEvents() {
   document.getElementById('createNewTeamProfileBtn')?.addEventListener('click', () => {
     openTeamProfileModal(null);
   });
+
+  document.getElementById('bannerSyncWanreviewBtn')?.addEventListener('click', () => {
+    triggerWanreviewSyncFromUi();
+  });
+}
+
+async function triggerWanreviewSyncFromUi() {
+  const btn = document.getElementById('syncWanreviewBtn');
+  if (btn) btn.disabled = true;
+  showToast('Syncing centralized rules from ubitransports/wanreview…');
+  try {
+    const res = await fetch('/api/wanreview/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pull: true }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.sync?.error || data.sync?.reason || data.error || 'wanreview sync failed');
+    }
+    if (data.config) state.config = data.config;
+    await loadRules();
+    const count = data.wanreview?.count ?? 0;
+    const sha = data.sync?.commitSha ? ` (${data.sync.commitSha})` : '';
+    showToast(`Synced ubitransports/wanreview${sha} — ${count} active rules loaded.`);
+  } catch (err) {
+    showToast(`wanreview sync error: ${err.message}`, 4500);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function openTeamProfileModal(existingProfile = null) {
@@ -7220,11 +7233,7 @@ function openTeamProfileModal(existingProfile = null) {
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:10px;">
       <p class="meta-text" style="margin:0;">
-        Team profiles are stored in <code>references/teams/&lt;team-id&gt;/</code> (` +
-    '`profile.json`' +
-    ` + ` +
-    '`team-dna.md`' +
-    `) so each team can version its own agent instructions and review rules in Git without conflicts.
+        Squad profiles are stored in <code>references/teams/&lt;team-id&gt;/profile.json</code> (GitHub teams, tech stack, and system focus), while shared review rules come centrally from <code>ubitransports/wanreview</code>.
       </p>
       <div style="display:grid;grid-template-columns:1fr 1.5fr;gap:10px;">
         <div>
@@ -7325,6 +7334,26 @@ async function decideCandidateRuleAction(payload) {
 }
 
 function openCandidateEditorModal(candidateRule) {
+  openRuleAuthoringModal({
+    initialDestination: 'wanreview',
+    title: candidateRule.title || '',
+    body: candidateRule.body || '',
+    section: candidateRule.section || '',
+    candidateId: candidateRule.id,
+    sourcePrKey: (candidateRule.sourcePrs || []).slice(0, 3).join(', '),
+    headingLabel: 'Edit & Approve Candidate Rule',
+  });
+}
+
+function openRuleAuthoringModal({
+  initialDestination = 'local',
+  title = '',
+  body = '',
+  section = '',
+  candidateId = '',
+  sourcePrKey = '',
+  headingLabel = 'Add Engineering Review Rule',
+} = {}) {
   const sections =
     state.dnaSections.length > 0
       ? state.dnaSections
@@ -7337,73 +7366,272 @@ function openCandidateEditorModal(candidateRule) {
           '6. Naming, Typos & Boy Scout Hygiene',
         ];
 
+  const mapping = state.wanreviewMapping || {
+    vertical: state.wanreviewInfo?.vertical || 'wfwp-backend',
+    team: state.wanreviewInfo?.team || state.activeTeamProfile?.id || 'popcorn-back',
+  };
+
   const modal = document.getElementById('githubModal');
   const titleEl = document.getElementById('modalTitle');
   const bodyEl = document.getElementById('modalBody');
   const confirmBtn = document.getElementById('confirmModalBtn');
-  const activeProfileId = state.activeTeamProfile?.id || state.config?.teamProfile || 'popcorn-back';
 
-  titleEl.textContent = `Edit & Approve Candidate Rule`;
-  confirmBtn.textContent = 'Approve Rule';
+  let activeDest = initialDestination === 'wanreview' ? 'wanreview' : 'local';
+  titleEl.textContent = headingLabel;
 
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:10px;">
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Target:</label>
-        <select id="candidateTargetSelect" class="search-input">
-          <option value="dna">Local Personal DNA (references/reviewer-dna.local.md)</option>
-          <option value="team">Team DNA (references/teams/${escapeHtml(activeProfileId)}/team-dna.md)</option>
-          <option value="common">Common Org DNA (references/common-dna.md)</option>
-        </select>
+        <label style="display:block;font-weight:600;font-size:12px;margin-bottom:5px;">Rule Destination:</label>
+        <div class="rule-dest-switcher">
+          <button type="button" class="rule-dest-option ${activeDest === 'local' ? 'active' : ''}" data-dest="local">
+            <strong>1. Personal Rule (.local.md)</strong>
+            <span>Saves immediately to gitignored <code>reviewer-dna.local.md</code> for your Personal Passes.</span>
+          </button>
+          <button type="button" class="rule-dest-option ${activeDest === 'wanreview' ? 'active' : ''}" data-dest="wanreview">
+            <strong>2. Propose to ubitransports/wanreview &#8599;</strong>
+            <span>Validates against <code>resolve.py</code> (<code>status: proposed</code>) and opens a GitHub PR from an isolated worktree.</span>
+          </button>
+        </div>
       </div>
-      <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Section:</label>
-        <select id="candidateSectionSelect" class="search-input">
+
+      <div id="authorRuleLocalFields" class="${activeDest === 'local' ? '' : 'hidden'}">
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Personal DNA Section:</label>
+        <select id="authorRuleSectionSelect" class="search-input">
           ${sections
             .map(
               (sec) =>
-                `<option value="${escapeHtml(sec)}" ${candidateRule.section === sec ? 'selected' : ''}>${escapeHtml(sec)}</option>`
+                `<option value="${escapeHtml(sec)}" ${section === sec ? 'selected' : ''}>${escapeHtml(sec)}</option>`
             )
             .join('')}
         </select>
       </div>
+
+      <div id="authorRuleWanreviewFields" class="${activeDest === 'wanreview' ? '' : 'hidden'}" style="display:grid;grid-template-columns:1.2fr 1fr 1fr 0.9fr;gap:8px;">
+        <label style="font-size:11.5px;font-weight:600;">Target Layer
+          <select id="authorWanLayerSelect" class="search-input" style="width:100%;margin-top:4px;">
+            <option value="vertical" selected>vertical (shared across squads)</option>
+            <option value="team">team (squad-specific)</option>
+            <option value="org">org (company-wide)</option>
+          </select>
+        </label>
+        <label style="font-size:11.5px;font-weight:600;">Vertical
+          <input type="text" id="authorWanVerticalInput" class="search-input" style="width:100%;margin-top:4px;" value="${escapeHtml(mapping.vertical || 'wfwp-backend')}" />
+        </label>
+        <label style="font-size:11.5px;font-weight:600;">Team Slug
+          <input type="text" id="authorWanTeamInput" class="search-input" style="width:100%;margin-top:4px;" value="${escapeHtml(mapping.team || 'popcorn-back')}" />
+        </label>
+        <label style="font-size:11.5px;font-weight:600;">Severity
+          <select id="authorWanSeveritySelect" class="search-input" style="width:100%;margin-top:4px;">
+            <option value="medium" selected>medium</option>
+            <option value="high">high</option>
+            <option value="low">low</option>
+          </select>
+        </label>
+      </div>
+
       <div>
         <label style="display:block;font-weight:500;margin-bottom:4px;">Rule Title (English):</label>
-        <input type="text" id="candidateTitleInput" class="search-input" value="${escapeHtml(candidateRule.title || '')}" />
+        <input type="text" id="authorRuleTitleInput" class="search-input" value="${escapeHtml(title)}" placeholder="E.g.: Strict Tenant Isolation in Custom QueryBuilders" />
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Instruction (English):</label>
-        <textarea id="candidateBodyInput" class="finding-textarea" style="min-height:110px;">${escapeHtml(candidateRule.body || '')}</textarea>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Flag &amp; Accept Guidance (English):</label>
+        <textarea id="authorRuleBodyInput" class="finding-textarea" rows="${computeAutoTextareaRows(body, 4, 14)}" placeholder="Describe what to flag and what compliant pattern to accept (## Flag / ## Accept are auto-structured if omitted)…">${escapeHtml(body)}</textarea>
+      </div>
+
+      <div id="authorWanPreviewContainer" class="${activeDest === 'wanreview' ? '' : 'hidden'}">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+          <span id="authorWanPreviewMeta" class="meta-text" style="font-size:11.5px;">resolve.py preview…</span>
+        </div>
+        <div id="authorWanPreviewCode" class="wanreview-preview-code" style="max-height:175px;">Enter a title and description above to preview the generated wanreview Markdown…</div>
       </div>
     </div>
   `;
 
+  const syncDestUi = () => {
+    bodyEl.querySelectorAll('.rule-dest-option').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.dest === activeDest);
+    });
+    const localBox = bodyEl.querySelector('#authorRuleLocalFields');
+    const wanBox = bodyEl.querySelector('#authorRuleWanreviewFields');
+    const prevBox = bodyEl.querySelector('#authorWanPreviewContainer');
+    if (localBox) localBox.classList.toggle('hidden', activeDest !== 'local');
+    if (wanBox) {
+      wanBox.classList.toggle('hidden', activeDest !== 'wanreview');
+      wanBox.style.display = activeDest === 'wanreview' ? 'grid' : 'none';
+    }
+    if (prevBox) prevBox.classList.toggle('hidden', activeDest !== 'wanreview');
+    confirmBtn.textContent =
+      activeDest === 'wanreview'
+        ? 'Open PR on ubitransports/wanreview ↗'
+        : 'Save to reviewer-dna.local.md';
+    if (activeDest === 'wanreview') {
+      refreshDryRunPreview();
+    }
+  };
+
+  let previewTimer = null;
+  const refreshDryRunPreview = () => {
+    if (activeDest !== 'wanreview') return;
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(async () => {
+      const curTitle = bodyEl.querySelector('#authorRuleTitleInput')?.value.trim() || '';
+      const curBody = bodyEl.querySelector('#authorRuleBodyInput')?.value.trim() || '';
+      const metaEl = bodyEl.querySelector('#authorWanPreviewMeta');
+      const codeEl = bodyEl.querySelector('#authorWanPreviewCode');
+      if (!curTitle || !curBody) {
+        if (metaEl) metaEl.textContent = 'Waiting for title & description…';
+        return;
+      }
+      try {
+        const res = await fetch('/api/wanreview/propose-pr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dryRun: true,
+            title: curTitle,
+            body: curBody,
+            layer: bodyEl.querySelector('#authorWanLayerSelect')?.value || 'vertical',
+            vertical: bodyEl.querySelector('#authorWanVerticalInput')?.value.trim() || 'wfwp-backend',
+            team: bodyEl.querySelector('#authorWanTeamInput')?.value.trim() || 'popcorn-back',
+            severity: bodyEl.querySelector('#authorWanSeveritySelect')?.value || 'medium',
+            status: 'proposed',
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Preview error');
+        if (metaEl && data.item) {
+          metaEl.textContent = `✓ Validated for ${data.item.relativePath} (id: ${data.item.id})`;
+        }
+        if (codeEl && data.item) {
+          codeEl.textContent = data.item.markdown;
+        }
+      } catch (err) {
+        if (metaEl) metaEl.textContent = `Validation error: ${err.message}`;
+      }
+    }, 180);
+  };
+
+  bodyEl.querySelectorAll('.rule-dest-option').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      activeDest = btn.dataset.dest === 'wanreview' ? 'wanreview' : 'local';
+      syncDestUi();
+    });
+  });
+
+  bodyEl
+    .querySelectorAll(
+      '#authorRuleTitleInput, #authorRuleBodyInput, #authorWanLayerSelect, #authorWanVerticalInput, #authorWanTeamInput, #authorWanSeveritySelect'
+    )
+    .forEach((el) => {
+      el.addEventListener('input', refreshDryRunPreview);
+      el.addEventListener('change', refreshDryRunPreview);
+    });
+
   modal.classList.remove('hidden');
+  syncDestUi();
 
   confirmBtn.onclick = async () => {
-    const target = document.getElementById('candidateTargetSelect').value;
-    const section = document.getElementById('candidateSectionSelect').value.trim();
-    const title = document.getElementById('candidateTitleInput').value.trim();
-    const body = document.getElementById('candidateBodyInput').value.trim();
-    if (!title || !body) {
-      showToast('Title and description are required.');
+    const curTitle = bodyEl.querySelector('#authorRuleTitleInput')?.value.trim() || '';
+    const curBody = bodyEl.querySelector('#authorRuleBodyInput')?.value.trim() || '';
+    if (!curTitle || !curBody) {
+      showToast('Rule title and description are required.');
       return;
     }
+
     confirmBtn.disabled = true;
-    await decideCandidateRuleAction({
-      id: candidateRule.id,
-      action: 'approve',
-      target,
-      section,
-      title,
-      body,
-    });
-    confirmBtn.disabled = false;
-    modal.classList.add('hidden');
+    try {
+      if (activeDest === 'local') {
+        const chosenSec = bodyEl.querySelector('#authorRuleSectionSelect')?.value.trim() || '';
+        if (candidateId) {
+          await decideCandidateRuleAction({
+            id: candidateId,
+            action: 'approve',
+            target: 'dna',
+            section: chosenSec,
+            title: curTitle,
+            body: curBody,
+          });
+        } else {
+          const res = await fetch('/api/rules', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              target: 'dna',
+              section: chosenSec,
+              title: curTitle,
+              body: curBody,
+              source: sourcePrKey || 'PR Review Hub UI',
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'Error saving personal rule');
+          await loadRules();
+          showToast(`Personal rule "${curTitle}" saved to reviewer-dna.local.md.`);
+        }
+        modal.classList.add('hidden');
+      } else {
+        confirmBtn.textContent = 'Creating branch & opening PR…';
+        const res = await fetch('/api/wanreview/propose-pr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dryRun: false,
+            title: curTitle,
+            body: curBody,
+            layer: bodyEl.querySelector('#authorWanLayerSelect')?.value || 'vertical',
+            vertical: bodyEl.querySelector('#authorWanVerticalInput')?.value.trim() || 'wfwp-backend',
+            team: bodyEl.querySelector('#authorWanTeamInput')?.value.trim() || 'popcorn-back',
+            severity: bodyEl.querySelector('#authorWanSeveritySelect')?.value || 'medium',
+            status: 'proposed',
+            sourcePrKey,
+            candidateId: candidateId || '',
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to open PR on wanreview');
+        await loadRules();
+        if (data.prUrl) {
+          bodyEl.innerHTML = `
+            <div style="display:flex;flex-direction:column;gap:10px;padding:6px 0;">
+              <p style="margin:0;font-size:13.5px;">
+                <strong>Pull Request opened on <code>ubitransports/wanreview</code>!</strong>
+              </p>
+              <p class="meta-text" style="margin:0;">
+                Rule <code>${escapeHtml(data.item?.id || curTitle)}</code> was committed on isolated branch <code>${escapeHtml(data.branch || '')}</code> with <code>status: proposed</code>.
+              </p>
+              <div>
+                <a href="${escapeHtml(data.prUrl)}" target="_blank" rel="noopener" class="btn btn-primary btn-sm">Open Pull Request on GitHub &#8599;</a>
+              </div>
+            </div>
+          `;
+          confirmBtn.textContent = 'Close';
+          confirmBtn.disabled = false;
+          confirmBtn.onclick = () => {
+            modal.classList.add('hidden');
+          };
+          showToast(`Opened wanreview PR for ${data.item?.id || curTitle}!`, 5000);
+          return;
+        }
+        modal.classList.add('hidden');
+        showToast(`Proposed rule "${curTitle}" to ubitransports/wanreview.`);
+      }
+    } catch (err) {
+      showToast(`Error: ${err.message}`, 5000);
+    } finally {
+      confirmBtn.disabled = false;
+      if (!modal.classList.contains('hidden') && confirmBtn.textContent !== 'Close') {
+        syncDestUi();
+      }
+    }
   };
 }
 
 function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
+  if (!existingRule && defaultTarget === 'dna') {
+    openRuleAuthoringModal({ initialDestination: 'local' });
+    return;
+  }
   const isEdit = Boolean(existingRule);
   const target = existingRule ? existingRule.target : defaultTarget;
   const sections =
@@ -7411,16 +7639,6 @@ function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
       ? state.fpSections.length > 0
         ? state.fpSections
         : ['1. Architecture & Intentional Patterns', '2. Framework & Tooling Guarantees', '3. Scope & Legacy Exceptions']
-      : target === 'common'
-      ? state.commonSections.length > 0
-        ? state.commonSections
-        : [
-            '1. Architecture, Serialization & Clean Code',
-            '2. Security, Tenant Isolation & Access Control',
-            '3. Database, Migrations & Performance',
-            '4. Language & Framework Idioms',
-            '5. Automated Testing Standards',
-          ]
       : state.dnaSections.length > 0
       ? state.dnaSections
       : [
@@ -7438,22 +7656,16 @@ function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
   const confirmBtn = document.getElementById('confirmModalBtn');
 
   titleEl.textContent = isEdit
-    ? `Edit Rule: ${existingRule.title}`
-    : target === 'false-positive'
-    ? 'Add False Positive (false-positives.local.md)'
-    : 'Add Agent Rule';
-  confirmBtn.textContent = isEdit ? 'Update' : 'Add Rule';
-
-  const activeProfileId = state.activeTeamProfile?.id || state.config?.teamProfile || 'popcorn-back';
+    ? `Edit Personal Rule: ${existingRule.title}`
+    : 'Add False Positive (false-positives.local.md)';
+  confirmBtn.textContent = isEdit ? 'Update' : 'Add False Positive';
 
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:10px;">
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Target File:</label>
-        <select id="editorRuleTargetSelect" class="search-input" ${isEdit ? 'disabled' : ''}>
-          <option value="dna" ${target === 'dna' ? 'selected' : ''}>Local Personal DNA (references/reviewer-dna.local.md)</option>
-          <option value="team" ${target === 'team' ? 'selected' : ''}>Team DNA (references/teams/${escapeHtml(activeProfileId)}/team-dna.md)</option>
-          <option value="common" ${target === 'common' ? 'selected' : ''}>Common Org DNA (references/common-dna.md)</option>
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Local File:</label>
+        <select id="editorRuleTargetSelect" class="search-input" disabled>
+          <option value="dna" ${target === 'dna' ? 'selected' : ''}>Personal Rules (references/reviewer-dna.local.md)</option>
           <option value="false-positive" ${target === 'false-positive' ? 'selected' : ''}>False Positives (references/false-positives.local.md)</option>
         </select>
       </div>
@@ -7469,8 +7681,8 @@ function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
         </select>
       </div>
       <div>
-        <label style="display:block;font-weight:500;margin-bottom:4px;">Rule Title (English):</label>
-        <input type="text" id="editorRuleTitleInput" class="search-input" value="${escapeHtml(existingRule?.title || '')}" placeholder="E.g.: Strict DateTimeImmutable Usage" />
+        <label style="display:block;font-weight:500;margin-bottom:4px;">Title (English):</label>
+        <input type="text" id="editorRuleTitleInput" class="search-input" value="${escapeHtml(existingRule?.title || '')}" placeholder="E.g.: Intentional Legacy Adapter Pattern" />
       </div>
       <div>
         <label style="display:block;font-weight:500;margin-bottom:4px;">Description / Instruction (English):</label>
@@ -7482,7 +7694,7 @@ function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
   modal.classList.remove('hidden');
 
   confirmBtn.onclick = async () => {
-    const selectedTarget = document.getElementById('editorRuleTargetSelect')?.value || target;
+    const selectedTarget = target;
     const section = document.getElementById('editorRuleSectionSelect').value.trim();
     const title = document.getElementById('editorRuleTitleInput').value.trim();
     const body = document.getElementById('editorRuleBodyInput').value.trim();
@@ -7506,7 +7718,7 @@ function openRuleEditorModal(existingRule = null, defaultTarget = 'dna') {
       if (!res.ok) throw new Error(data.error || 'Error saving rule');
       modal.classList.add('hidden');
       await loadRules();
-      showToast(isEdit ? `Rule "${title}" updated.` : `Rule "${title}" added.`);
+      showToast(isEdit ? `Rule "${title}" updated.` : `False positive "${title}" added.`);
     } catch (err) {
       showToast(`Error: ${err.message}`, 4500);
     } finally {
@@ -7526,9 +7738,7 @@ function promptDeleteRule(rule) {
   confirmBtn.textContent = 'Delete permanently';
 
   const targetFileLabel =
-    rule.target === 'common'
-      ? 'references/common-dna.md'
-      : rule.target === 'false-positive'
+    rule.target === 'false-positive'
       ? 'references/false-positives.local.md'
       : 'references/reviewer-dna.local.md';
 
@@ -7613,8 +7823,12 @@ document.getElementById('rulesSearchInput')?.addEventListener('input', (e) => {
   renderRulesTab();
 });
 
+document.getElementById('syncWanreviewBtn')?.addEventListener('click', () => {
+  triggerWanreviewSyncFromUi();
+});
+
 document.getElementById('addDnaRuleBtn')?.addEventListener('click', () => {
-  openRuleEditorModal(null, 'dna');
+  openRuleAuthoringModal({ initialDestination: 'local' });
 });
 
 document.getElementById('addFpRuleBtn')?.addEventListener('click', () => {
@@ -8628,11 +8842,12 @@ async function openWanreviewExportModal() {
 
   const mapping = state.wanreviewMapping || {
     vertical: 'wfwp-backend',
-    team: 'ubi-eng-popcorn',
+    team: 'popcorn-back',
   };
-  const exportableRules = (state.rules || []).filter(
-    (r) => r.target === 'common' || r.target === 'team' || r.target === 'dna'
-  );
+  const exportableRules = [
+    ...(state.candidateRules || []).map((c) => ({ ...c, target: 'candidate' })),
+    ...(state.rules || []).filter((r) => r.target === 'dna'),
+  ];
 
   titleEl.textContent = 'Surgical Rule Export to ubitransports/wanreview';
   confirmBtn.textContent = 'Write Selected .md Files to Clone';
@@ -8655,7 +8870,7 @@ async function openWanreviewExportModal() {
           <input type="text" id="wanExportVerticalInput" class="search-input" style="width:100%;margin-top:4px;" value="${escapeHtml(mapping.vertical || 'wfwp-backend')}" />
         </label>
         <label style="font-size:11.5px;font-weight:600;">Team Slug
-          <input type="text" id="wanExportTeamInput" class="search-input" style="width:100%;margin-top:4px;" value="${escapeHtml(mapping.team || 'ubi-eng-popcorn')}" />
+          <input type="text" id="wanExportTeamInput" class="search-input" style="width:100%;margin-top:4px;" value="${escapeHtml(mapping.team || 'popcorn-back')}" />
         </label>
         <label style="font-size:11.5px;font-weight:600;">Rule Status
           <select id="wanExportStatusSelect" class="search-input" style="width:100%;margin-top:4px;">
@@ -8704,7 +8919,7 @@ async function openWanreviewExportModal() {
       ruleIds,
       layer: bodyEl.querySelector('#wanExportLayerSelect')?.value || '',
       vertical: bodyEl.querySelector('#wanExportVerticalInput')?.value?.trim() || 'wfwp-backend',
-      team: bodyEl.querySelector('#wanExportTeamInput')?.value?.trim() || 'ubi-eng-popcorn',
+      team: bodyEl.querySelector('#wanExportTeamInput')?.value?.trim() || 'popcorn-back',
       statusOverride: bodyEl.querySelector('#wanExportStatusSelect')?.value || 'proposed',
       allowPersonalPromotion: hasPersonalChecked,
     };
@@ -8780,7 +8995,7 @@ async function openWanreviewExportModal() {
           targetRootDir,
           layer: bodyEl.querySelector('#wanExportLayerSelect')?.value || '',
           vertical: bodyEl.querySelector('#wanExportVerticalInput')?.value?.trim() || 'wfwp-backend',
-          team: bodyEl.querySelector('#wanExportTeamInput')?.value?.trim() || 'ubi-eng-popcorn',
+          team: bodyEl.querySelector('#wanExportTeamInput')?.value?.trim() || 'popcorn-back',
           statusOverride: bodyEl.querySelector('#wanExportStatusSelect')?.value || 'proposed',
           allowPersonalPromotion: hasPersonalChecked,
         }),

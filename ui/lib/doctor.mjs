@@ -184,15 +184,20 @@ export async function runDoctor(cfg = {}) {
       : `${reviewsDir} (Ready — click "Sync GitHub" to fetch open PRs)`,
   });
 
-  // 7. Active Team Profile & 4-Layer Rules
-  let rulesSummary = { common: 0, team: 0, personal: 0, falsePositives: 0 };
+  // 7. Active Team Profile & Centralized wanreview + Personal Rules
+  let rulesSummary = { wanreview: 0, personal: 0, falsePositives: 0 };
+  let wanreviewInfo = { available: false, repoPath: '', commitSha: null, vertical: null, team: null, count: 0 };
   let activeTeamName = cfg.teamProfile || 'popcorn-back';
+  let hasActiveTeamProfile = false;
   try {
     const bundle = listAllRules(cfg.teamProfile || 'popcorn-back');
     activeTeamName = bundle.activeTeamProfile?.name || activeTeamName;
+    hasActiveTeamProfile = Boolean(bundle.activeTeamProfile?.id);
+    if (bundle.wanreview) {
+      wanreviewInfo = bundle.wanreview;
+    }
     rulesSummary = {
-      common: (bundle.commonRules || []).length,
-      team: (bundle.teamRules || []).length,
+      wanreview: Number(bundle.wanreview?.count || (bundle.wanreviewRules || []).length),
       personal: (bundle.dnaRules || []).length,
       falsePositives: (bundle.falsePositives || []).length,
     };
@@ -202,8 +207,18 @@ export async function runDoctor(cfg = {}) {
   checks.push({
     id: 'teamProfile',
     label: `Team Agent Profile (${cfg.teamProfile || 'popcorn-back'})`,
-    ok: rulesSummary.common + rulesSummary.team > 0,
-    detail: `${activeTeamName} — ${rulesSummary.common} Common, ${rulesSummary.team} Team, ${rulesSummary.personal} Personal, ${rulesSummary.falsePositives} False-Positive rules`,
+    ok: hasActiveTeamProfile,
+    detail: `${activeTeamName} — ${rulesSummary.wanreview} wanreview shared, ${rulesSummary.personal} Personal (.local), ${rulesSummary.falsePositives} False-Positive rules`,
+  });
+  checks.push({
+    id: 'wanreview',
+    label: 'Centralized Rules Engine (ubitransports/wanreview)',
+    ok: true,
+    optional: !wanreviewInfo.available,
+    detail: wanreviewInfo.available
+      ? `${wanreviewInfo.repoPath} (${wanreviewInfo.commitSha ? `commit ${wanreviewInfo.commitSha} · ` : ''}${wanreviewInfo.count} active rules resolved for ${wanreviewInfo.vertical}/${wanreviewInfo.team})`
+      : 'Not synced locally yet — click "Sync" in the Hub to auto-clone ubitransports/wanreview',
+    fixHint: 'gh repo clone ubitransports/wanreview ~/.config/pr-review-hub/wanreview',
   });
 
   // 8. Agent Skill Registration (Symlink to ~/.gemini/config/skills/my-review & ~/.claude/skills/my-review)

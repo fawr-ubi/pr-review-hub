@@ -30,6 +30,7 @@ import {
   upsertScorecardInMarkdown,
 } from './scoring.mjs';
 import { resolveProductContextForPr } from './jira.mjs';
+import { ensureWanreviewRepoSynced } from './wanreview.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -1015,6 +1016,91 @@ async function fetchPrContextFromGithub(cfg, pr, repoPath = '') {
   };
 }
 
+async function loadTargetRepoRuleContext(cfg, pr, repoPath = '', headSha = '') {
+  const codeownersCandidates = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
+  let codeownersContent = '';
+  let repoAgentReviewDir = '';
+  let repoLayerMarkdown = '';
+
+  if (repoPath && fs.existsSync(repoPath)) {
+    const hasGit = fs.existsSync(path.join(repoPath, '.git'));
+    if (hasGit && headSha && headSha !== 'HEAD') {
+      for (const relPath of codeownersCandidates) {
+        try {
+          const { stdout } = await execFileAsync(
+            'git',
+            ['-C', repoPath, 'show', `${headSha}:${relPath}`],
+            { timeout: 2500, maxBuffer: 1024 * 1024 }
+          );
+          if (stdout && stdout.trim()) {
+            codeownersContent = stdout;
+            break;
+          }
+        } catch {
+          // try next candidate
+        }
+      }
+      try {
+        const { stdout } = await execFileAsync(
+          'git',
+          ['-C', repoPath, 'show', `${headSha}:.agent-review/_layer.md`],
+          { timeout: 2500, maxBuffer: 512 * 1024 }
+        );
+        if (stdout && stdout.trim()) {
+          repoLayerMarkdown = stdout;
+        }
+      } catch {
+        // optional
+      }
+    }
+
+    if (!codeownersContent) {
+      for (const relPath of codeownersCandidates) {
+        const diskFile = path.join(repoPath, relPath);
+        if (fs.existsSync(diskFile)) {
+          try {
+            codeownersContent = fs.readFileSync(diskFile, 'utf8');
+            if (codeownersContent.trim()) break;
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+
+    const diskAgentReviewDir = path.join(repoPath, '.agent-review');
+    if (fs.existsSync(diskAgentReviewDir)) {
+      repoAgentReviewDir = diskAgentReviewDir;
+    }
+  }
+
+  if (!codeownersContent && !customAgentRunner && cfg?.githubOrg && pr?.repo) {
+    const repoSlug = `${cfg.githubOrg}/${pr.repo}`;
+    for (const relPath of ['.github/CODEOWNERS', 'CODEOWNERS']) {
+      try {
+        const { stdout } = await execFileAsync(
+          'gh',
+          ['api', `repos/${repoSlug}/contents/${relPath}`, '--jq', '.content'],
+          { timeout: 5000 }
+        );
+        const b64 = String(stdout || '').replace(/\s+/g, '');
+        if (b64) {
+          codeownersContent = Buffer.from(b64, 'base64').toString('utf8');
+          if (codeownersContent.trim()) break;
+        }
+      } catch {
+        // ignore missing CODEOWNERS on remote
+      }
+    }
+  }
+
+  return {
+    codeownersContent,
+    repoAgentReviewDir,
+    repoLayerMarkdown,
+  };
+}
+
 function formatFindingMarkdownBlock(finding, index) {
   const numId = `#${index + 1}`;
   const dom = inferDomainForFinding(finding);
@@ -1032,14 +1118,20 @@ function formatFindingMarkdownBlock(finding, index) {
 
   const cleanExplanation = String(finding.explanation || '')
     .replace(/^- \*\*Domain:\*\*\s*.+$/gim, '')
-    .replace(/^- \*\*Rule(?:\s+ID)?:\*\*\s*.+$/gim, '')
+    .replace(/^- \*\*Rules?(?:\s+IDs?)?:\*\*\s*.+$/gim, '')
     .replace(/\*\*Ready-to-paste GitHub comment[\s\S]*$/i, '')
     .replace(/#{3,4}\s*Ready-to-paste GitHub comment[\s\S]*$/i, '')
     .trim();
 
   const lines = [heading, `- **Domain:** ${dom}`];
-  if (finding.ruleId) {
-    lines.push(`- **Rule:** \`${finding.ruleId}\``);
+  const ruleIdsList =
+    Array.isArray(finding.ruleIds) && finding.ruleIds.length > 0
+      ? finding.ruleIds
+      : finding.ruleId
+      ? [finding.ruleId]
+      : [];
+  if (ruleIdsList.length > 0) {
+    lines.push(`- **Rule:** ${ruleIdsList.map((id) => `\`${id}\``).join(', ')}`);
   }
   if (cleanExplanation) {
     if (/^- \*\*/.test(cleanExplanation)) {
@@ -1182,19 +1274,43 @@ export async function runPrReviewJob({
       repoPath
     );
 
+    let effectiveWanreviewPath = cfg.wanreviewRepoPath || '';
+    if (!effectiveWanreviewPath || !fs.existsSync(path.join(effectiveWanreviewPath, 'rules'))) {
+      const syncWan = await ensureWanreviewRepoSynced(cfg, {
+        pull: false,
+        allowAutoClone: Boolean(!customAgentRunner),
+      });
+      if (syncWan.available && syncWan.repoPath) {
+        effectiveWanreviewPath = syncWan.repoPath;
+      }
+    }
+
+    const repoRuleContext = await loadTargetRepoRuleContext(cfg, pr, repoPath, headSha);
+    const ruleResolveOptions = {
+      ...repoRuleContext,
+      ...(effectiveWanreviewPath ? { wanreviewRepoPath: effectiveWanreviewPath } : {}),
+    };
+
     const rulesBundle =
       normalizedScope === 'personal'
-        ? getPersonalReviewRulesBundle(cfg.teamProfile)
-        : getSharedReviewRulesBundle(cfg.teamProfile);
-    const { activeTeam, rulesMarkdown: combinedRulesText, falsePositivesMarkdown: fpRulesText } =
-      rulesBundle;
+        ? getPersonalReviewRulesBundle(cfg.teamProfile, ruleResolveOptions)
+        : getSharedReviewRulesBundle(cfg.teamProfile, ruleResolveOptions);
+    const {
+      activeTeam,
+      wanreview: resolvedWanreview,
+      rulesMarkdown: combinedRulesText,
+      falsePositivesMarkdown: fpRulesText,
+    } = rulesBundle;
 
     const readSafe = (p) => (p && fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim() : '');
     const checklistText = readSafe(path.join(SKILL_ROOT, 'references/review-checklist.md'));
     const templateText = readSafe(path.join(SKILL_ROOT, 'assets/review-artifact-template.md'));
 
+    const wanreviewScopeBadge = resolvedWanreview?.available
+      ? ` wanreview Rules: ${resolvedWanreview.rules.length} active (${resolvedWanreview.vertical} / ${resolvedWanreview.team}, via ${resolvedWanreview.resolutionSource}).`
+      : '';
     const teamContextLine = activeTeam
-      ? `Active Team Profile: "${activeTeam.name}" (${activeTeam.id}) [Scope: ${normalizedScope.toUpperCase()}]. Tech Stack: ${(activeTeam.techStack || []).join(', ') || 'General'}.${activeTeam.agentInstructions ? ` Team Agent Focus: ${activeTeam.agentInstructions}` : ''}`
+      ? `Active Team Profile: "${activeTeam.name}" (${activeTeam.id}) [Scope: ${normalizedScope.toUpperCase()}].${wanreviewScopeBadge} Tech Stack: ${(activeTeam.techStack || []).join(', ') || 'General'}.${activeTeam.agentInstructions ? ` Team Agent Focus: ${activeTeam.agentInstructions}` : ''}`
       : '';
 
     const maxDiffChars = 110000;
@@ -1249,7 +1365,7 @@ export async function runPrReviewJob({
           `FAST ZERO-WASTE SINGLE-AGENT MODE (CRITICAL):`,
           `1. Evaluate EXCLUSIVELY the "${singleDomainId}" domain rubric below. Ignore unrelated domains (other agents handle them separately).`,
           `2. DO NOT run \`gh\`, \`git\`, \`docker\`, tests, or ANY shell command (\`run_command\` is FORBIDDEN), and DO NOT call file-writing tools.`,
-          `3. Every finding you report MUST include \`- **Domain:** ${singleDomainId}\` (and \`- **Rule:** <rule-id>\` when tied to a named rule) plus a single English "Ready-to-paste GitHub comment:" block.`,
+          `3. Every finding you report MUST include \`- **Domain:** ${singleDomainId}\` (and \`- **Rule:** \`<exact-wanreview-rule-id>\`\` in the metadata bullets when tied to an active \`[rule-id]\` rule, e.g. \`wfwp-backend.tenant-isolation\`) plus a single natural English "Ready-to-paste GitHub comment:" block (keep the ready-to-paste comment 100% human — NEVER append \`Triggered Rules:\` or bot headers inside the ready-to-paste comment).`,
           `4. At the very end of your Markdown output, you MUST append an HTML comment \`<!-- SCORECARD_JSON ... -->\` grading "${singleDomainId}" (\`applicable\`: boolean, \`rawScore\`: integer 0-100 or null if N/A, \`summary\`: concise 1-sentence justification).`,
           `Output 100% English Markdown starting with "# ${activeAgents[0]?.title || singleDomainId} Deep Audit: ${pr.repo}#${pr.number}" and "## 2. Review Findings". Never publish any comment to GitHub.`,
           `\n--- Target Domain Agent Rubric ---\n${domainRubricBlock}`,
@@ -1277,7 +1393,7 @@ export async function runPrReviewJob({
           `2. DO NOT read SKILL.md, DO NOT read reference rule files from disk, DO NOT run \`gh\`, \`git\`, \`docker\`, tests, or ANY shell command (\`run_command\` is FORBIDDEN), and DO NOT call file-writing tools.`,
           `3. LOCAL BRANCH WARNING: The local workspace directory is checked out on the developer's own working branch, NOT on this PR's head commit (${headSha}). Newly added or modified files in this PR will NOT match on disk — rely directly on the inline Unified Git Diff below.`,
           `4. STRICT TOOL BUDGET (HARD MAX: 3 READ-ONLY CALLS TOTAL): Only read an existing unchanged base class/interface on disk if strictly required to confirm a Blocker/Major contract bug, and NEVER exceed 3 file reads total. Synthesize and return your complete Markdown review immediately.`,
-          `5. MULTI-DOMAIN SCORING REQUIREMENTS: Tag EVERY finding with \`- **Domain:** <security|product|quality|performance|testing>\` (and \`- **Rule:** <rule-id>\` if matching an active rule), and append a trailing \`<!-- SCORECARD_JSON ... -->\` block at the very end evaluating each active domain (\`applicable\`, \`rawScore\` 0-100, \`summary\`).`,
+          `5. MULTI-DOMAIN SCORING & RULE CITATIONS: Tag EVERY finding with \`- **Domain:** <security|product|quality|performance|testing>\` (and \`- **Rule:** \`<exact-wanreview-rule-id>\`\` in the metadata bullets whenever a finding matches an active \`[rule-id]\` rule from \`wanreview\`, e.g. \`wfwp-backend.tenant-isolation\`), keep the \`Ready-to-paste GitHub comment:\` fence 100% natural human prose (NO \`Triggered Rules:\` footer or bot branding inside the comment), and append a trailing \`<!-- SCORECARD_JSON ... -->\` block at the very end evaluating each active domain (\`applicable\`, \`rawScore\` 0-100, \`summary\`).`,
           `Output the complete Markdown review report in 100% English directly as your response text, starting with "# Code Review: ${pr.repo}#${pr.number} — ${pr.title || ''}" and "## 1. Task Summary & Functional Problem Solved" (Business & Functional Problem Solved, Technical & Feature Solution, Jira & Scope Compliance), and providing a single English "Ready-to-paste GitHub comment:" block per finding.`,
           `Never publish any comment to GitHub.`,
           templateText ? `\n--- Output Markdown Template ---\n${templateText}` : '',
@@ -1347,7 +1463,7 @@ export async function runPrReviewJob({
     }
 
     const nowIso = new Date().toISOString();
-    const rulesLookup = buildRulesLookupMap(activeTeam?.id || cfg.teamProfile);
+    const rulesLookup = buildRulesLookupMap(activeTeam?.id || cfg.teamProfile, ruleResolveOptions);
     const parsedScorecardBlock = parseScorecardBlockFromMarkdown(md);
     let finalFindings = [];
     let rawDomains = {};
@@ -1476,6 +1592,17 @@ export async function runPrReviewJob({
       reviewedBy: cfg.githubUser || 'worker',
       scorecard,
       productContext: effectiveProductMeta,
+      wanreview: resolvedWanreview?.available
+        ? {
+            repoPath: resolvedWanreview.repoPath,
+            commitSha: resolvedWanreview.commitSha || null,
+            branch: resolvedWanreview.branch || 'master',
+            vertical: resolvedWanreview.vertical || null,
+            team: resolvedWanreview.team || null,
+            resolutionSource: resolvedWanreview.resolutionSource || 'teamProfile',
+            count: (resolvedWanreview.rules || []).length,
+          }
+        : null,
     });
 
     const defaultSyncScript = path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh');
@@ -1688,7 +1815,9 @@ export function dismissFindingAsFalsePositive({
   uiStateFile,
 }) {
   const refPaths = getReferencePaths(cfg?.teamProfile || '');
-  const usePersonalFp = Boolean(process.env.REVIEW_HUB_FP_FILE) || scope === 'personal';
+  const hasExplicitTeamFp = Boolean(process.env.REVIEW_HUB_TEAM_FP_FILE);
+  const usePersonalFp =
+    Boolean(process.env.REVIEW_HUB_FP_FILE) || scope === 'personal' || !hasExplicitTeamFp;
   const fpPath = process.env.REVIEW_HUB_FP_FILE
     ? process.env.REVIEW_HUB_FP_FILE
     : usePersonalFp

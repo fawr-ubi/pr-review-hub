@@ -227,6 +227,24 @@ if [[ ! -f "${TARGET_SKILL_DIR}/references/changelog.local.md" ]]; then
   printf "# Review Memory Changelog\n\n---\n" > "${TARGET_SKILL_DIR}/references/changelog.local.md"
 fi
 
+# 5b. Sync Centralized Shared Engineering Rules (ubitransports/wanreview)
+echo ""
+echo "📚 Syncing centralized engineering rules from ubitransports/wanreview..."
+WANREVIEW_SYNC_PATH="$(node --input-type=module -e "
+  import { ensureWanreviewRepoSynced } from '${TARGET_SKILL_DIR}/ui/lib/wanreview.mjs';
+  const res = await ensureWanreviewRepoSynced(
+    { projectsDir: process.argv[1] },
+    { pull: true, allowAutoClone: true }
+  );
+  if (res.available && res.repoPath) {
+    process.stderr.write('   🟢 wanreview ready at ' + res.repoPath + (res.commitSha ? ' (' + res.commitSha + ')' : '') + '\n');
+    console.log(res.repoPath);
+  } else {
+    process.stderr.write('   🟡 wanreview sync deferred (' + (res.error || res.reason || 'offline') + ')\n');
+    console.log('');
+  }
+" "${PROJECTS_DIR}" || echo "")"
+
 # 6. Write config.json & Synchronize Combined Rules + Skill Symlinks
 node --input-type=module -e "
   import path from 'node:path';
@@ -237,6 +255,7 @@ node --input-type=module -e "
   const teams = (process.argv[4] || '').split(',').map((s) => s.trim()).filter(Boolean);
   const prefixes = (process.argv[9] || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
   const role = process.argv[7] === 'worker' ? 'worker' : 'reader';
+  const wanreviewDir = (process.argv[13] || '').trim();
 
   saveConfig({
     githubUser: process.argv[2],
@@ -248,6 +267,7 @@ node --input-type=module -e "
     autoReviewEnabled: role === 'worker',
     sharedStoreRepo: '',
     projectsDir: process.argv[8],
+    ...(wanreviewDir ? { wanreviewRepoPath: wanreviewDir } : {}),
     reviewsDir: process.argv[10],
     jiraBaseUrl: 'https://ubitransport.atlassian.net/browse',
     jiraPrefixes: prefixes,
@@ -260,7 +280,7 @@ node --input-type=module -e "
   if (process.argv[12] !== '1') {
     ensureSkillSymlinks();
   }
-" "${TARGET_SKILL_DIR}" "${GITHUB_USER}" "${GITHUB_ORG}" "${RAW_TEAMS}" "${TEAM_PROFILE}" "${AGENT_CLI}" "${HUB_ROLE}" "${PROJECTS_DIR}" "${RAW_PREFIXES}" "${REVIEWS_DIR_RESOLVED}" "${DEFAULT_PORT}" "${IS_SECONDARY_CLONE}"
+" "${TARGET_SKILL_DIR}" "${GITHUB_USER}" "${GITHUB_ORG}" "${RAW_TEAMS}" "${TEAM_PROFILE}" "${AGENT_CLI}" "${HUB_ROLE}" "${PROJECTS_DIR}" "${RAW_PREFIXES}" "${REVIEWS_DIR_RESOLVED}" "${DEFAULT_PORT}" "${IS_SECONDARY_CLONE}" "${WANREVIEW_SYNC_PATH}"
 
 # 7. Create Double-Clickable macOS Finder Launcher
 LAUNCHER="${REVIEWS_DIR_RESOLVED}/Open Review Hub.command"

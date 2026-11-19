@@ -194,14 +194,71 @@ export function parseFindingsFromMarkdown(markdown, repoHint = '') {
 
     const bodyCategoryMatch = rawBody.match(/^- \*\*Category:\*\*\s*(.+)$/im);
     const bodyDomainMatch = rawBody.match(/^- \*\*Domain:\*\*\s*([a-zA-Z0-9_-]+)/im);
-    const bodyRuleMatch = rawBody.match(/^- \*\*Rule(?:\s+ID)?:\*\*\s*`?([a-zA-Z0-9_-]+)`?/im);
+    const bodyRuleLineMatch = rawBody.match(/^- \*\*Rules?(?:\s+IDs?)?:\*\*\s*(.+)$/im);
     const category =
       (bodyCategoryMatch ? bodyCategoryMatch[1].trim() : null) ||
       currentFinding.category ||
       null;
 
+    const parseRuleTokens = (rawText = '') => {
+      const ignored = new Set([
+        'none',
+        'n/a',
+        'na',
+        'null',
+        'general',
+        'custom',
+        'triggered',
+        'rule',
+        'rules',
+        'wanreview',
+        'http',
+        'https',
+        'github.com',
+        'blob',
+        'master',
+        'main',
+      ]);
+      const withoutLinks = String(rawText || '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+      const cleaned = withoutLinks.replace(/<!--[\s\S]*?-->/g, '');
+      const matches = cleaned.match(/[a-z0-9]+(?:[._-][a-z0-9]+)+/gi) || [];
+      const seen = new Set();
+      const out = [];
+      for (const tok of matches) {
+        const norm = tok.replace(/^[.-]+|[.-]+$/g, '');
+        if (!norm || ignored.has(norm.toLowerCase())) continue;
+        if (!seen.has(norm)) {
+          seen.add(norm);
+          out.push(norm);
+        }
+      }
+      return out;
+    };
+
+    // Strip any accidental bot/Triggered Rules footer from the ready-to-paste human comment
+    let sanitizedComment = String(currentFinding.comment || '').trim();
+    const triggeredLineMatch = sanitizedComment.match(/\*\*Triggered Rules?:\*\*\s*([^\r\n]+)/i);
+    const footerRuleIds = triggeredLineMatch ? parseRuleTokens(triggeredLineMatch[1]) : [];
+    const triggeredFooterMatch = sanitizedComment.match(
+      /(?:\r?\n)*\*\*Triggered Rules?:\*\*[\s\S]*$/i
+    );
+    if (triggeredFooterMatch) {
+      sanitizedComment = sanitizedComment.slice(0, triggeredFooterMatch.index).trim();
+    }
+    sanitizedComment = sanitizedComment
+      .replace(/^🤖\s*Wanreview[^\r\n]*\r?\n*/i, '')
+      .replace(/\r?\n*🤖\s*Wanreview[^\r\n]*$/i, '')
+      .trim();
+
     let explicitDomain = bodyDomainMatch ? bodyDomainMatch[1].trim().toLowerCase() : null;
-    let explicitRuleId = bodyRuleMatch ? bodyRuleMatch[1].trim() : null;
+    const mergedRuleIds = [];
+    for (const rid of [
+      ...(bodyRuleLineMatch ? parseRuleTokens(bodyRuleLineMatch[1]) : []),
+      ...footerRuleIds,
+    ]) {
+      if (!mergedRuleIds.includes(rid)) mergedRuleIds.push(rid);
+    }
+    const parsedRuleIds = mergedRuleIds;
     if (category) {
       const catParts = category.split(/[:/·|]/).map((s) => s.trim()).filter(Boolean);
       const firstToken = (catParts[0] || '').toLowerCase();
@@ -210,24 +267,27 @@ export function parseFindingsFromMarkdown(markdown, repoHint = '') {
         ['security', 'product', 'quality', 'performance', 'testing'].includes(firstToken)
       ) {
         explicitDomain = firstToken;
-        if (!explicitRuleId && catParts[1] && /^[a-z0-9-]+$/.test(catParts[1])) {
-          explicitRuleId = catParts[1];
+        if (parsedRuleIds.length === 0 && catParts[1] && /^[a-z0-9_.-]+$/i.test(catParts[1])) {
+          parsedRuleIds.push(catParts[1]);
         }
       }
     }
+    const uniqueRuleIds = [...new Set(parsedRuleIds)];
+    const explicitRuleId = uniqueRuleIds[0] || null;
 
     findings.push({
       id: currentFinding.id,
       title: sanitizeFindingTitle(currentFinding.title) || currentFinding.title,
       category,
       domain: explicitDomain || null,
-      ruleId: explicitRuleId || null,
+      ruleId: explicitRuleId,
+      ruleIds: uniqueRuleIds,
       severity: currentFinding.severity,
       filePath: currentFinding.filePath,
       startLine: currentFinding.startLine,
       endLine: currentFinding.endLine,
       explanation: rawBody,
-      comment: currentFinding.comment.trim(),
+      comment: sanitizedComment || currentFinding.title,
     });
     currentFinding = null;
   };

@@ -21,13 +21,13 @@ Your mission is to audit Pull Requests (from colleagues or the user's own branch
 
 ---
 
-## 4-Layer Rule & Multi-Team Agent Architecture
+## Centralized `wanreview` + Personal Local Rule Architecture
 
-To allow any developer or engineering team to pull updates (`git pull`) without Git merge conflicts while maintaining both shared team profiles and personal rules:
-1. **Layer 1 — Versioned Cross-Team Base (`references/common-dna.md`):** Universal SOLID, Security, Clean Code, and Testing standards shared across all teams.
-2. **Layer 2 — Versioned Team Agent Profiles (`references/teams/<teamProfile>/`):** Per-team directory containing `profile.json` (tech stack, watched GitHub teams, agent skills, custom agent instructions) and `team-dna.md` (shared team rules, e.g., `popcorn-back`, `frontend-web`, `mobile-kotlin`, `qa-automation`).
-3. **Layer 3 — Personal Local Rules (`references/reviewer-dna.local.md` & `references/false-positives.local.md`, gitignored):** Personal overrides and false-positive exceptions. Automatically combined with `common-dna.md` and `teams/<teamProfile>/team-dna.md` into `references/reviewer-dna.md` and `references/false-positives.md`.
-4. **Layer 4 — Candidate Rules Staging Queue (`references/candidate-rules.local.json`, gitignored):** Candidate rules extracted from the last 1 year (`365 days`) of team PR review comments on GitHub, awaiting explicit human validation or rejection in Tab `5. Agent Rules -> Candidates`.
+To share a single versioned source of truth across CI and human reviews while keeping personal rules conflict-free:
+1. **Layer 1 — Centralized Shared Rules (`ubitransports/wanreview`):** Automatically cloned and synced at `~/.config/pr-review-hub/wanreview` (or `<projectsDir>/wanreview`). Resolved dynamically per PR across `org -> vertical -> team -> target-repo/.agent-review` with 100% parity with `wanreview/tools/resolve.py` (detecting the owning team from `CODEOWNERS` or falling back to `teamProfile`).
+2. **Layer 2 — Team Agent Profiles (`references/teams/<teamProfile>/profile.json`):** Per-team metadata (tech stack, watched GitHub teams, agent skills, custom domain instructions).
+3. **Layer 3 — Personal Local Rules (`references/reviewer-dna.local.md` & `references/false-positives.local.md`, gitignored):** Personal overrides and false-positive exceptions. Automatically combined with resolved `wanreview` rules into gitignored `references/reviewer-dna.md` and `references/false-positives.md`.
+4. **Layer 4 — Candidate Rules Staging Queue (`references/candidate-rules.local.json`, gitignored):** Candidate rules extracted from the last 1 year (`365 days`) of team PR review comments on GitHub, awaiting explicit human validation into `reviewer-dna.local.md` or direct PR contribution to `ubitransports/wanreview` (`5. Agent Rules -> Candidates`).
 
 ---
 
@@ -45,8 +45,8 @@ Determine which mode applies based on the user's request:
 
 ### Step 1: Load Your Configuration & Standards
 Before analyzing any diff, read your configuration and knowledge base:
-1. Read `config.json` (if present) to resolve `githubUser`, `githubOrg`, `githubTeams`, `teamProfile` (default `popcorn-back`), `agentCli`, `projectsDir`, `reviewsDir`, `jiraBaseUrl`, and `jiraPrefixes`.
-2. Read [`references/common-dna.md`](./references/common-dna.md), `references/teams/<teamProfile>/profile.json`, `references/teams/<teamProfile>/team-dna.md`, and [`references/reviewer-dna.local.md`](./references/reviewer-dna.local.md) (or combined [`references/reviewer-dna.md`](./references/reviewer-dna.md)).
+1. Read `config.json` (if present) to resolve `githubUser`, `githubOrg`, `githubTeams`, `teamProfile` (default `popcorn-back`), `wanreviewRepoPath` (default `~/.config/pr-review-hub/wanreview`), `agentCli`, `projectsDir`, `reviewsDir`, `jiraBaseUrl`, and `jiraPrefixes`.
+2. Read the combined [`references/reviewer-dna.md`](./references/reviewer-dna.md) (synced from `ubitransports/wanreview` + [`references/reviewer-dna.local.md`](./references/reviewer-dna.local.md)), or resolve rules directly from `wanreviewRepoPath/rules/` (`org` + vertical + team + target repo `.agent-review/_layer.md`) alongside `references/teams/<teamProfile>/profile.json`.
 3. Read [`references/false-positives.local.md`](./references/false-positives.local.md) (or [`references/false-positives.md`](./references/false-positives.md)) for patterns and exceptions you must **never** flag.
 
 ### Step 2: Gather Full Context (Diff + Jira + Surrounding Code)
@@ -115,9 +115,9 @@ Evaluate the changes thoroughly against your loaded DNA rules:
 When the user replies with feedback on a review:
 1. **Analyze the Signal:**
    - **Rejected finding / False positive:** Formulate a clear, scoped exception rule for `references/false-positives.local.md` explaining *what* not to flag and *why*.
-   - **Missed issue / New preference / Style tweak:** Formulate a concise, actionable rule for the appropriate section in `references/reviewer-dna.local.md` (or `references/common-dna.md` if cross-team).
+   - **Missed issue / New preference / Style tweak:** Formulate a concise, actionable rule for `references/reviewer-dna.local.md` (personal) or propose a Markdown rule PR (`status: proposed`) to `ubitransports/wanreview` if shared across a team/vertical/org.
 2. **Propose the Memory Patch (Wait for Validation):**
-   - Present the exact Markdown diff and ask for explicit confirmation before editing the reference files.
+   - Present the exact Markdown diff and ask for explicit confirmation before editing local reference files or opening a `wanreview` PR.
 3. **Persist Upon Confirmation:**
    - Apply the edits and log the date, PR reference, and summary in `references/changelog.local.md`.
 
@@ -128,7 +128,7 @@ When the user replies with feedback on a review:
 When onboarding a new developer or team onto PR Review Hub:
 1. Analyze the last **1 year (`365 days`)** of PR review comments across the configured `githubTeams` and `githubUser` (via `POST /api/rules/bootstrap` in the UI or `bootstrapTeamCandidateRules()` in `ui/lib/onboarding.mjs`).
 2. Synthesize recurring review patterns into **Candidate Rules** stored in `references/candidate-rules.local.json`.
-3. Present the candidate rules in Tab `5. Règles Agent -> À valider` (or in the chat) so the user/team can **validate** (into `reviewer-dna.local.md` or `common-dna.md`), **edit**, or **reject** each rule before it becomes active.
+3. Present the candidate rules in Tab `5. Agent Rules -> Candidates` (or in the chat) so the user/team can **validate locally** (into `reviewer-dna.local.md`), **propose as a PR to `ubitransports/wanreview`**, **edit**, or **reject** each rule before it becomes active.
 
 ---
 

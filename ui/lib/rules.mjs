@@ -33,7 +33,6 @@ export function listTeamProfiles() {
     if (!entry.isDirectory()) continue;
     const id = entry.name;
     const profilePath = path.join(teamsDir, id, 'profile.json');
-    const dnaPath = path.join(teamsDir, id, 'team-dna.md');
     let meta = {
       id,
       name: id,
@@ -54,8 +53,7 @@ export function listTeamProfiles() {
     }
     profiles.push({
       ...meta,
-      dnaPath,
-      hasDnaFile: fs.existsSync(dnaPath),
+      profilePath,
     });
   }
   return profiles.sort((a, b) => a.name.localeCompare(b.name));
@@ -68,23 +66,19 @@ export function getActiveTeamProfile(requestedProfileId = '') {
   const found = profiles.find((p) => p.id === targetId);
   if (found) return found;
   if (profiles.length > 0) return profiles[0];
-  const fallbackDir = path.join(getTeamsDir(), targetId || 'default-team');
+  const fallbackId = targetId || 'popcorn-back';
+  const fallbackDir = path.join(getTeamsDir(), fallbackId);
   fs.mkdirSync(fallbackDir, { recursive: true });
-  const dnaPath = path.join(fallbackDir, 'team-dna.md');
-  if (!fs.existsSync(dnaPath)) {
-    fs.writeFileSync(dnaPath, `# Team Reviewer DNA (${targetId || 'default-team'})\n\n---\n`, 'utf8');
-  }
   return {
-    id: targetId || 'default-team',
-    name: targetId || 'Default Team',
+    id: fallbackId,
+    name: fallbackId,
     description: '',
     githubTeams: [],
     repos: [],
     techStack: [],
     agentSkills: [],
     agentInstructions: '',
-    dnaPath,
-    hasDnaFile: true,
+    profilePath: path.join(fallbackDir, 'profile.json'),
   };
 }
 
@@ -105,7 +99,6 @@ export function saveTeamProfile({
   const teamDir = path.join(getTeamsDir(), cleanId);
   fs.mkdirSync(teamDir, { recursive: true });
   const profilePath = path.join(teamDir, 'profile.json');
-  const dnaPath = path.join(teamDir, 'team-dna.md');
 
   const normalizeList = (val) =>
     Array.isArray(val)
@@ -127,21 +120,7 @@ export function saveTeamProfile({
   };
 
   fs.writeFileSync(profilePath, JSON.stringify(profileData, null, 2) + '\n', 'utf8');
-  if (!fs.existsSync(dnaPath)) {
-    const initialDna = [
-      `# Team Reviewer DNA — ${profileData.name}`,
-      '',
-      profileData.description || `Shared team-level code review rules for ${profileData.name}.`,
-      '',
-      '---',
-      '',
-      '## 1. Architecture, Serialization & Clean Code',
-      '',
-    ].join('\n');
-    fs.writeFileSync(dnaPath, initialDna, 'utf8');
-  }
-
-  syncCombinedReferenceFiles();
+  syncCombinedReferenceFiles(cleanId);
   return getActiveTeamProfile(cleanId);
 }
 
@@ -157,21 +136,17 @@ export function getReferencePaths(teamProfileId = '') {
   const localFpDefault = path.join(refDir, 'false-positives.local.md');
   const localChangelogDefault = path.join(refDir, 'changelog.local.md');
 
-  // Auto-migrate or bootstrap .local.md files if missing
+  // Bootstrap personal .local.md files from .example.md if missing
   if (!process.env.REVIEW_HUB_DNA_FILE && !fs.existsSync(localDnaDefault)) {
-    const src = fs.existsSync(legacyDnaPath)
-      ? legacyDnaPath
-      : path.join(refDir, 'reviewer-dna.example.md');
-    if (fs.existsSync(src)) {
-      fs.copyFileSync(src, localDnaDefault);
+    const exampleSrc = path.join(refDir, 'reviewer-dna.example.md');
+    if (fs.existsSync(exampleSrc)) {
+      fs.copyFileSync(exampleSrc, localDnaDefault);
     }
   }
   if (!process.env.REVIEW_HUB_FP_FILE && !fs.existsSync(localFpDefault)) {
-    const src = fs.existsSync(legacyFpPath)
-      ? legacyFpPath
-      : path.join(refDir, 'false-positives.example.md');
-    if (fs.existsSync(src)) {
-      fs.copyFileSync(src, localFpDefault);
+    const exampleSrc = path.join(refDir, 'false-positives.example.md');
+    if (fs.existsSync(exampleSrc)) {
+      fs.copyFileSync(exampleSrc, localFpDefault);
     }
   }
   if (!process.env.REVIEW_HUB_CHANGELOG_FILE && !fs.existsSync(localChangelogDefault)) {
@@ -183,12 +158,9 @@ export function getReferencePaths(teamProfileId = '') {
   }
 
   const activeTeam = getActiveTeamProfile(teamProfileId);
-  const commonDnaPath =
-    process.env.REVIEW_HUB_COMMON_DNA_FILE || path.join(refDir, 'common-dna.md');
-  const teamDnaPath = process.env.REVIEW_HUB_TEAM_DNA_FILE || activeTeam.dnaPath;
+  const teamDir = path.join(getTeamsDir(), activeTeam.id);
   const teamFpPath =
-    process.env.REVIEW_HUB_TEAM_FP_FILE ||
-    path.join(path.dirname(teamDnaPath), 'false-positives.md');
+    process.env.REVIEW_HUB_TEAM_FP_FILE || path.join(teamDir, 'false-positives.md');
   const dnaPath = process.env.REVIEW_HUB_DNA_FILE || localDnaDefault;
   const fpPath = process.env.REVIEW_HUB_FP_FILE || localFpDefault;
   const changelogPath = process.env.REVIEW_HUB_CHANGELOG_FILE || localChangelogDefault;
@@ -196,8 +168,6 @@ export function getReferencePaths(teamProfileId = '') {
     process.env.REVIEW_HUB_CANDIDATES_FILE || path.join(refDir, 'candidate-rules.local.json');
 
   return {
-    commonDnaPath,
-    teamDnaPath,
     teamFpPath,
     activeTeam,
     dnaPath,
@@ -214,52 +184,67 @@ function readSafeTrim(filePath) {
   return filePath && fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8').trim() : '';
 }
 
-function formatWanreviewRulesForPrompt(wanreviewRules = []) {
+export function formatWanreviewRulesForPrompt(wanreviewRules = [], wanreviewMeta = {}) {
   const active = (wanreviewRules || []).filter((r) => WANREVIEW_ACTIVE_STATUSES.has(r.status));
   if (active.length === 0) return '';
+  const scopeLabel = [
+    wanreviewMeta.vertical ? `vertical: ${wanreviewMeta.vertical}` : '',
+    wanreviewMeta.team ? `team: ${wanreviewMeta.team}` : '',
+    wanreviewMeta.resolutionSource ? `resolved via: ${wanreviewMeta.resolutionSource}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  const header = scopeLabel
+    ? `# Shared Engineering Rules (wanreview — ${scopeLabel})`
+    : '# Shared Engineering Rules (wanreview)';
   const blocks = active.map(
     (r) =>
-      `### [${r.wanreviewId}] ${r.title} (layer: ${r.layer} · domain: ${r.domain} · severity: ${r.severity} · status: ${r.status}${r.locked ? ' · LOCKED' : ''})\n${r.body}`
+      `### [${r.wanreviewId}] ${r.title} (layer: ${r.layerSpec || r.layer} · domain: ${r.domain} · severity: ${r.severity} · status: ${r.status}${r.locked ? ' · LOCKED' : ''})\n${r.body}`
   );
-  return `# Shared Company Rules (wanreview)\n\n${blocks.join('\n\n---\n\n')}`;
+  return `${header}\n\n${blocks.join('\n\n---\n\n')}`;
 }
 
 /**
- * Returns ONLY shared, deterministic rules for a Team Profile (`wanreview` + `common-dna.md` + `team-dna.md` + team `false-positives.md`).
- * Strictly excludes `.local.md` personal files so shared Hub reviews remain identical across all teammates.
+ * Returns ONLY shared, deterministic rules resolved from `ubitransports/wanreview`
+ * (`org -> vertical -> team -> repo`), plus optional shared team `false-positives.md`.
+ * Strictly excludes `.local.md` personal files so shared Hub reviews remain identical across teammates.
  */
-export function getSharedReviewRulesBundle(teamProfileId = '') {
+export function getSharedReviewRulesBundle(teamProfileId = '', resolveOptions = {}) {
   const cfg = loadConfig();
-  const { commonDnaPath, teamDnaPath, teamFpPath, activeTeam } = getReferencePaths(teamProfileId);
-  const wanreview = loadWanreviewRulesFromRepo(cfg.wanreviewRepoPath, activeTeam.id);
-  const wanreviewMd = formatWanreviewRulesForPrompt(wanreview.rules);
-  const commonMd = readSafeTrim(commonDnaPath);
-  const teamMd = readSafeTrim(teamDnaPath);
+  const { teamFpPath, activeTeam } = getReferencePaths(teamProfileId);
+  const effectiveWanreviewPath = resolveOptions.wanreviewRepoPath ?? cfg.wanreviewRepoPath;
+  const wanreview = loadWanreviewRulesFromRepo(
+    effectiveWanreviewPath,
+    activeTeam.id,
+    resolveOptions
+  );
+  const wanreviewMd = formatWanreviewRulesForPrompt(wanreview.rules, wanreview);
   const teamFpMd = readSafeTrim(teamFpPath);
 
   return {
     scope: 'shared',
     activeTeam,
     wanreview,
-    commonDnaPath,
-    teamDnaPath,
     teamFpPath,
-    rulesMarkdown: [wanreviewMd, commonMd, teamMd].filter(Boolean).join('\n\n---\n\n'),
+    rulesMarkdown: wanreviewMd,
     falsePositivesMarkdown: teamFpMd,
   };
 }
 
 /**
- * Returns shared rules PLUS the developer's local `.local.md` preferences for personal/pre-PR passes.
+ * Returns shared `wanreview` rules PLUS the developer's personal `.local.md` preferences
+ * (`reviewer-dna.local.md` + `false-positives.local.md`) for personal / pre-PR self-review passes.
  */
-export function getPersonalReviewRulesBundle(teamProfileId = '') {
+export function getPersonalReviewRulesBundle(teamProfileId = '', resolveOptions = {}) {
   const cfg = loadConfig();
-  const { commonDnaPath, teamDnaPath, teamFpPath, dnaPath, fpPath, activeTeam } =
-    getReferencePaths(teamProfileId);
-  const wanreview = loadWanreviewRulesFromRepo(cfg.wanreviewRepoPath, activeTeam.id);
-  const wanreviewMd = formatWanreviewRulesForPrompt(wanreview.rules);
-  const commonMd = readSafeTrim(commonDnaPath);
-  const teamMd = readSafeTrim(teamDnaPath);
+  const { teamFpPath, dnaPath, fpPath, activeTeam } = getReferencePaths(teamProfileId);
+  const effectiveWanreviewPath = resolveOptions.wanreviewRepoPath ?? cfg.wanreviewRepoPath;
+  const wanreview = loadWanreviewRulesFromRepo(
+    effectiveWanreviewPath,
+    activeTeam.id,
+    resolveOptions
+  );
+  const wanreviewMd = formatWanreviewRulesForPrompt(wanreview.rules, wanreview);
   const localMd = readSafeTrim(dnaPath);
   const teamFpMd = readSafeTrim(teamFpPath);
   const localFpMd = readSafeTrim(fpPath);
@@ -268,30 +253,29 @@ export function getPersonalReviewRulesBundle(teamProfileId = '') {
     scope: 'personal',
     activeTeam,
     wanreview,
-    commonDnaPath,
-    teamDnaPath,
     teamFpPath,
     dnaPath,
     fpPath,
-    rulesMarkdown: [wanreviewMd, commonMd, teamMd, localMd].filter(Boolean).join('\n\n---\n\n'),
+    rulesMarkdown: [wanreviewMd, localMd].filter(Boolean).join('\n\n---\n\n'),
     falsePositivesMarkdown: [teamFpMd, localFpMd].filter(Boolean).join('\n\n---\n\n'),
   };
 }
 
 /**
- * Keeps legacy `references/reviewer-dna.md` and `references/false-positives.md` synchronized
- * on disk (both gitignored) by combining `common-dna.md` + `teams/<team>/team-dna.md` + `reviewer-dna.local.md`
- * so any external skill invocation reading `references/reviewer-dna.md` automatically gets all layers.
+ * Keeps gitignored `references/reviewer-dna.md` and `references/false-positives.md` synchronized
+ * on disk by combining resolved `wanreview` rules + personal `reviewer-dna.local.md` so standalone
+ * CLI invocations of the `my-review` skill outside the Hub UI also enforce `wanreview` rules.
  */
 export function syncCombinedReferenceFiles(teamProfileId = '') {
   if (process.env.REVIEW_HUB_DNA_FILE || process.env.REVIEW_HUB_FP_FILE) return;
-  const { commonDnaPath, teamDnaPath, teamFpPath, dnaPath, fpPath, legacyDnaPath, legacyFpPath } =
+  const cfg = loadConfig();
+  const { activeTeam, teamFpPath, dnaPath, fpPath, legacyDnaPath, legacyFpPath } =
     getReferencePaths(teamProfileId);
   try {
-    const commonMd = readSafeTrim(commonDnaPath);
-    const teamMd = readSafeTrim(teamDnaPath);
+    const wanreview = loadWanreviewRulesFromRepo(cfg.wanreviewRepoPath, activeTeam.id);
+    const wanreviewMd = formatWanreviewRulesForPrompt(wanreview.rules, wanreview);
     const localMd = readSafeTrim(dnaPath);
-    const combinedDna = [commonMd, teamMd, localMd].filter(Boolean).join('\n\n---\n\n') + '\n';
+    const combinedDna = [wanreviewMd, localMd].filter(Boolean).join('\n\n---\n\n') + '\n';
     if (combinedDna.trim()) {
       fs.writeFileSync(legacyDnaPath, combinedDna, 'utf8');
     }
@@ -316,7 +300,7 @@ function computeRuleId(source, section, title, index) {
 }
 
 /**
- * Parses a Markdown reference file (reviewer-dna.local.md, common-dna.md, or false-positives.local.md)
+ * Parses a personal Markdown reference file (`reviewer-dna.local.md` or `false-positives.local.md`)
  * into top-level bullet rules grouped by `## Section`.
  */
 export function parseRulesMarkdown(markdown, source = 'dna') {
@@ -351,12 +335,7 @@ export function parseRulesMarkdown(markdown, source = 'dna') {
 
     const body = bodyLines.join('\n').trim();
     const id = computeRuleId(source, activeRule.section, title, rules.length);
-    const layer =
-      source === 'common'
-        ? 'vertical'
-        : source === 'team' || source === 'team-false-positive'
-        ? 'team'
-        : 'local';
+    const layer = source === 'team-false-positive' ? 'team' : 'local';
     const baseRule = {
       id,
       wanreviewId: slugifyWanreviewRuleId(title),
@@ -479,18 +458,23 @@ export function saveCandidateRules(candidates = []) {
   return candidates;
 }
 
-export function listAllRules(teamProfileId = '') {
+export function removeCandidateRuleById(candidateId = '') {
+  if (!candidateId) return null;
+  const candidates = loadCandidateRules();
+  const idx = candidates.findIndex((c) => c.id === candidateId);
+  if (idx === -1) return null;
+  const [removed] = candidates.splice(idx, 1);
+  saveCandidateRules(candidates);
+  return removed;
+}
+
+export function listAllRules(teamProfileId = '', resolveOptions = {}) {
   const cfg = loadConfig();
-  const { commonDnaPath, teamDnaPath, teamFpPath, activeTeam, dnaPath, fpPath } =
-    getReferencePaths(teamProfileId);
-  const commonMd = fs.existsSync(commonDnaPath) ? fs.readFileSync(commonDnaPath, 'utf8') : '';
-  const teamMd = fs.existsSync(teamDnaPath) ? fs.readFileSync(teamDnaPath, 'utf8') : '';
+  const { teamFpPath, activeTeam, dnaPath, fpPath } = getReferencePaths(teamProfileId);
   const teamFpMd = fs.existsSync(teamFpPath) ? fs.readFileSync(teamFpPath, 'utf8') : '';
   const dnaMd = fs.existsSync(dnaPath) ? fs.readFileSync(dnaPath, 'utf8') : '';
   const fpMd = fs.existsSync(fpPath) ? fs.readFileSync(fpPath, 'utf8') : '';
 
-  const commonParsed = parseRulesMarkdown(commonMd, 'common');
-  const teamParsed = parseRulesMarkdown(teamMd, 'team');
   const teamFpParsed = parseRulesMarkdown(teamFpMd, 'team-false-positive');
   const dnaParsed = parseRulesMarkdown(dnaMd, 'dna');
   const fpParsed = parseRulesMarkdown(fpMd, 'false-positive');
@@ -501,7 +485,12 @@ export function listAllRules(teamProfileId = '') {
     status: c.status || 'proposed',
     wanreviewId: c.wanreviewId || slugifyWanreviewRuleId(c.title || c.id || ''),
   }));
-  const wanreviewState = loadWanreviewRulesFromRepo(cfg.wanreviewRepoPath, activeTeam.id);
+
+  const effectiveWanreviewPath = resolveOptions.wanreviewRepoPath ?? cfg.wanreviewRepoPath;
+  const wanreviewState = loadWanreviewRulesFromRepo(effectiveWanreviewPath, activeTeam.id, {
+    includeProposed: true,
+    ...resolveOptions,
+  });
   const teamProfiles = listTeamProfiles();
 
   return {
@@ -510,18 +499,23 @@ export function listAllRules(teamProfileId = '') {
     wanreview: {
       available: wanreviewState.available,
       repoPath: wanreviewState.repoPath,
+      commitSha: wanreviewState.commitSha || null,
+      branch: wanreviewState.branch || 'master',
       vertical: wanreviewState.vertical || null,
       team: wanreviewState.team || null,
-      count: wanreviewState.rules.length,
+      resolutionSource: wanreviewState.resolutionSource || 'teamProfile',
+      availableTeams: wanreviewState.availableTeams || [],
+      count: (wanreviewState.activeRules || wanreviewState.rules || []).length,
+      totalCount: (wanreviewState.rules || []).length,
     },
     wanreviewRules: wanreviewState.rules,
-    commonSections: commonParsed.sections,
-    teamSections: teamParsed.sections,
+    commonSections: [],
+    teamSections: [],
     teamFpSections: teamFpParsed.sections,
     dnaSections: dnaParsed.sections,
     fpSections: fpParsed.sections,
-    commonRules: commonParsed.rules,
-    teamRules: teamParsed.rules,
+    commonRules: [],
+    teamRules: [],
     teamFalsePositives: teamFpParsed.rules,
     dnaRules: dnaParsed.rules,
     falsePositives: fpParsed.rules,
@@ -530,30 +524,35 @@ export function listAllRules(teamProfileId = '') {
     rules: [
       ...wanreviewState.rules,
       ...dnaParsed.rules,
-      ...teamParsed.rules,
-      ...commonParsed.rules,
       ...teamFpParsed.rules,
       ...fpParsed.rules,
     ],
   };
 }
 
-export function buildRulesLookupMap(teamProfileId = '') {
-  const all = listAllRules(teamProfileId);
+export function buildRulesLookupMap(teamProfileId = '', resolveOptions = {}) {
+  const all = listAllRules(teamProfileId, resolveOptions);
   const map = new Map();
   for (const r of [...(all.rules || []), ...(all.candidateRules || [])]) {
     if (r.id) map.set(r.id, r);
-    if (r.wanreviewId) map.set(r.wanreviewId, r);
+    if (r.wanreviewId) {
+      map.set(r.wanreviewId, r);
+      const shortStem = String(r.wanreviewId).split('.').pop();
+      if (shortStem && !map.has(shortStem)) {
+        map.set(shortStem, r);
+      }
+    }
   }
   return map;
 }
 
 function resolveTargetFilePath(target, teamProfileId = '') {
-  const { commonDnaPath, teamDnaPath, teamFpPath, activeTeam, dnaPath, fpPath } =
-    getReferencePaths(teamProfileId);
-  if (target === 'common') return { filePath: commonDnaPath, label: 'common-dna.md' };
-  if (target === 'team')
-    return { filePath: teamDnaPath, label: `teams/${activeTeam.id}/team-dna.md` };
+  if (target === 'common' || target === 'team' || target === 'wanreview') {
+    throw new Error(
+      'Shared rules are managed centrally in ubitransports/wanreview. Use "Propose to wanreview" to open a Pull Request, or choose "Personal (.local.md)" for local rules.'
+    );
+  }
+  const { teamFpPath, activeTeam, dnaPath, fpPath } = getReferencePaths(teamProfileId);
   if (target === 'team-false-positive') {
     if (!fs.existsSync(teamFpPath)) {
       fs.mkdirSync(path.dirname(teamFpPath), { recursive: true });
@@ -565,8 +564,8 @@ function resolveTargetFilePath(target, teamProfileId = '') {
     }
     return { filePath: teamFpPath, label: `teams/${activeTeam.id}/false-positives.md` };
   }
-  if (target === 'false-positive') return { filePath: fpPath, label: 'false-positives.md' };
-  return { filePath: dnaPath, label: 'reviewer-dna.md' };
+  if (target === 'false-positive') return { filePath: fpPath, label: 'false-positives.local.md' };
+  return { filePath: dnaPath, label: 'reviewer-dna.local.md' };
 }
 
 export function addRule({
@@ -633,13 +632,7 @@ export function addRule({
   syncCombinedReferenceFiles(teamProfile);
   logChangelogEntry(
     changelogPath,
-    target === 'false-positive'
-      ? 'Added False Positive'
-      : target === 'common'
-      ? 'Added Common DNA rule'
-      : target === 'team'
-      ? 'Added Team DNA rule'
-      : 'Added DNA rule',
+    target === 'false-positive' ? 'Added False Positive' : 'Added DNA rule',
     label,
     cleanTitle,
     cleanPrKey
@@ -724,7 +717,9 @@ export function deleteRule({ id, target = 'dna', teamProfile = '' }) {
 }
 
 /**
- * Validates ("approve") or rejects ("reject") a candidate rule extracted from the 1-year team PR history.
+ * Validates ("approve" into personal `.local.md`) or rejects ("reject") a candidate rule
+ * extracted from the 1-year team PR history. Shared rules are proposed to `ubitransports/wanreview`
+ * via `proposeRulePrToWanreview` + `removeCandidateRuleById`.
  */
 export function decideCandidateRule({
   id,
@@ -748,14 +743,7 @@ export function decideCandidateRule({
   saveCandidateRules(candidates);
 
   if (effectiveDecision === 'approve') {
-    const resolvedTarget =
-      target === 'common'
-        ? 'common'
-        : target === 'team'
-        ? 'team'
-        : target === 'false-positive'
-        ? 'false-positive'
-        : 'dna';
+    const resolvedTarget = target === 'false-positive' ? 'false-positive' : 'dna';
     addRule({
       target: resolvedTarget,
       teamProfile,
@@ -771,7 +759,7 @@ export function decideCandidateRule({
 
 export function approveAllCandidateRules({ target = 'dna', teamProfile = '' } = {}) {
   const candidates = loadCandidateRules();
-  const resolvedTarget = target === 'common' ? 'common' : target === 'team' ? 'team' : 'dna';
+  const resolvedTarget = target === 'false-positive' ? 'false-positive' : 'dna';
   for (const candidate of candidates) {
     addRule({
       target: resolvedTarget,

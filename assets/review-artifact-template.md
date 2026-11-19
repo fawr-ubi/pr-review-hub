@@ -36,10 +36,11 @@
 
 #### `#1` — [{{SHORT_TITLE}}](file://{{ABSOLUTE_FILE_PATH}}#L{{START_LINE}}-L{{END_LINE}})
 - **Domain:** {{DOMAIN}} <!-- security | product | quality | performance | testing -->
+- **Rule:** `{{WANREVIEW_RULE_ID}}` <!-- exact wanreview rule id if triggered (e.g. wfwp-backend.tenant-isolation); omit line if general -->
 - **Why it matters:** {{EXPLANATION_FOR_ANTOINE}}
 - **Ready-to-paste GitHub comment:**
 ````markdown
-{{GITHUB_COMMENT_IN_ANTOINE_VOICE}}
+{{NATURAL_HUMAN_GITHUB_COMMENT_NO_BOT_FOOTER}}
 ````
 
 ---

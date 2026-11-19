@@ -99,7 +99,7 @@ Click any PR (or press `j`/`k` + `Enter`) to open the review workspace:
    - **Single-line or Multi-line Inline Comments**: Click `+` on any line, or **click-and-drag across multiple line numbers** to open the inline comment composer immediately on mouse release.
    - **Full-Screen Focus Diff (`z`)**: Hides all topbars for 100% vertical code reading.
 4. **`4. AI Proposals` (`4`)**: Review, edit, or dismiss AI-generated and manual inline comments before publishing them to GitHub.
-5. **`5. Agent Rules` (`5`)**: Manage the 4-layer rule engine (`Common DNA`, `Team DNA`, `Local DNA`, `False Positives`, and `Candidates`).
+5. **`5. Agent Rules` (`5`)**: Manage the centralized `ubitransports/wanreview` rule catalog (`org -> vertical -> team -> repo`), 5 Domain Agents, Candidate rules, Personal `.local` rules, and False Positives — and open rule PRs directly to `wanreview` in 1 click.
 
 > **Tip — Side-by-Side Split View (`s`)**: Press `s` (or click `Split (s)`) to display any two tabs side by side (e.g. `1. Audit Report` on the left + `3. Git Diff` on the right). `Shift+Click` any tab to open it in the right-hand pane.
 
@@ -140,26 +140,27 @@ pr-review-hub/
 ├── package.json                      # Zero-dependency ESM scripts (start, test, sync, doctor, package, setup)
 ├── install.sh                        # Interactive 1-minute onboarding CLI
 ├── references/
-│   ├── common-dna.md                 # Layer 1: Versioned organization-wide engineering baseline
 │   ├── review-checklist.md           # Systematic multi-layer checklist injected into every AI review
-│   ├── review-artifact-template.md   # Standardized Markdown report structure for AI reviews
-│   ├── teams/                        # Layer 2: Versioned per-team Agent Profiles & Team DNA packs
-│   │   ├── popcorn-back/             #   ├── PHP 8.3 / Symfony / API Platform / 2cloud backend profile
+│   ├── teams/                        # Versioned per-team Agent Profiles (`profile.json` metadata)
+│   │   ├── popcorn-back/             #   ├── Popcorn PHP 8.3 / Symfony / API Platform squad profile
+│   │   ├── pili-back/                #   ├── Pili PHP 8.3 / Symfony / API Platform squad profile
+│   │   ├── banana-back/              #   ├── Banana PHP 8.3 / Symfony / API Platform squad profile
+│   │   ├── papaya-back/              #   ├── Papaya PHP 8.3 / Symfony / API Platform squad profile
 │   │   ├── frontend-web/             #   ├── TypeScript / Vue 3 / Angular frontend profile
 │   │   ├── mobile-kotlin/            #   ├── Android / Kotlin / Clean Architecture mobile profile
 │   │   └── qa-automation/            #   └── Cypress / TypeScript / Behat QA profile
-│   ├── reviewer-dna.local.md         # Layer 3: Personal local rules (gitignored, zero merge conflicts)
-│   ├── false-positives.local.md      # Layer 3: Personal false-positive exceptions (gitignored)
-│   └── candidate-rules.local.json    # Layer 4: Candidate rules mined from 1-year GitHub PR history
+│   ├── reviewer-dna.local.md         # Personal local rules (gitignored, zero merge conflicts)
+│   ├── false-positives.local.md      # Personal false-positive exceptions (gitignored)
+│   └── candidate-rules.local.json    # Candidate rules mined from 1-year GitHub PR history
 └── ui/                               # Local HTTP server & 5-tab Web UI
 ```
 
-### How to Create or Customize a Team Profile:
+> **Centralized Shared Rules (`ubitransports/wanreview`):** Shared engineering, vertical (`wfwp-backend`), and squad rules are resolved dynamically per PR from `~/.config/pr-review-hub/wanreview` (auto-cloned and fast-forward synced on `./install.sh`, startup, and `Sync`), matching `wanreview/tools/resolve.py` (`org -> vertical -> team -> .agent-review`).
+
+### How to Propose Shared Rules or Customize a Team Profile:
 1. Go to tab **`5. Agent Rules`** in the UI (`http://localhost:4242`).
-2. Click **`+ New Team Profile`** (or **`Configure Team Agent`** on the banner):
-   - Set your team slug (e.g. `moneris-back`), display name, tech stack tags, watched GitHub teams, and custom instructions for the AI review agent.
-3. Click **`Scan Team PRs (1y)`** to analyze the last 365 days of your team's GitHub PR review comments and approve the best rules directly into **`Team DNA`** (`references/teams/<team-id>/team-dna.md`).
-4. Commit and push `references/teams/<team-id>/` so every teammate inherits the profile on `git pull`.
+2. Click **`+ Rule`** (or **`Propose PR to wanreview ↗`** on any Candidate or Personal rule) to either save a personal `.local.md` rule or open a `resolve.py`-validated Pull Request (`status: proposed`) directly on `ubitransports/wanreview`.
+3. Click **`+ New Team Profile`** to configure custom squad metadata (`profile.json` — watched GitHub teams, tech stack, and custom instructions).
 
 ---
 
