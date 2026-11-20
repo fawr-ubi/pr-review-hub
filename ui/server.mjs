@@ -119,9 +119,167 @@ function getAppVersion() {
 
 const prOverviewCache = new Map();
 let customOverviewHandlerForTests = null;
+let customGithubPublishHandlerForTests = null;
 
 export function setCustomOverviewHandlerForTests(fn) {
   customOverviewHandlerForTests = fn;
+}
+
+export function setCustomGithubPublishHandlerForTests(fn) {
+  customGithubPublishHandlerForTests = fn;
+}
+
+function normalizeFindingFingerprintText(str = '') {
+  return String(str || '')
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')
+    .replace(/[`*_>#~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+export function computeFindingFingerprint(finding = {}) {
+  const cleanPath = String(finding.filePath || '').replace(/^\/+/, '').trim().toLowerCase();
+  const cleanTitle = normalizeFindingFingerprintText(finding.title || '');
+  if (!cleanPath && !cleanTitle) return '';
+  return `${cleanPath}::${cleanTitle}`;
+}
+
+function resolveSavedEntriesForFinding(prKey, finding, commentsMap = {}, sharedMap = {}, allFindings = []) {
+  const cid = `${prKey}::${finding.id}`;
+  const fp = computeFindingFingerprint(finding);
+  const safeComments = commentsMap && typeof commentsMap === 'object' ? commentsMap : {};
+  const safeShared = sharedMap && typeof sharedMap === 'object' ? sharedMap : {};
+  const direct = safeComments[cid];
+
+  if (direct) {
+    if (!direct.fingerprint || !fp || direct.fingerprint === fp) {
+      return { localEntry: direct, sharedEntry: safeShared[cid] };
+    }
+    // Positional cid has a different fingerprint (e.g. AI re-review reordered or replaced findings).
+    // Do NOT apply old positional state to a brand-new finding with a different fingerprint!
+  } else if (!fp || safeShared[cid]) {
+    // No local fingerprint recorded at cid -> check if another slot in safeComments actually owns fp
+    if (fp) {
+      const prefix = `${prKey}::#`;
+      for (const [k, entry] of Object.entries(safeComments)) {
+        if (!k.startsWith(prefix) || k.includes('::#M') || !entry) continue;
+        if (entry.fingerprint && entry.fingerprint === fp) {
+          return { localEntry: entry, sharedEntry: safeShared[k] };
+        }
+      }
+    }
+    return { localEntry: undefined, sharedEntry: safeShared[cid] };
+  }
+
+  if (fp) {
+    const prefix = `${prKey}::#`;
+    for (const [k, entry] of Object.entries(safeComments)) {
+      if (!k.startsWith(prefix) || k.includes('::#M') || !entry) continue;
+      if (entry.fingerprint && entry.fingerprint === fp) {
+        return { localEntry: entry, sharedEntry: safeShared[k] };
+      }
+    }
+  }
+
+  return { localEntry: undefined, sharedEntry: undefined };
+}
+
+function normalizeCommentBodyForMatch(raw = '') {
+  return String(raw || '')
+    .replace(/`{3,}[a-z0-9_-]*\r?\n?/gi, ' ')
+    .replace(/`{3,}/g, ' ')
+    .replace(/[`*_>#~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Reconciles Hub findings against live/cached GitHub PR comments & review threads.
+ * If a comment was published manually on GitHub (e.g. Copy Markdown -> pasted on github.com),
+ * automatically marks it as posted so batch PR review never re-posts it.
+ */
+export function reconcileFindingsWithOverviewData(findings = [], overviewData = null, currentUser = '') {
+  if (!overviewData || typeof overviewData !== 'object' || !Array.isArray(findings) || findings.length === 0) {
+    return { reconciledCids: [] };
+  }
+  const ghEntries = [];
+  for (const t of overviewData.reviewThreads || []) {
+    for (const c of t?.comments || []) {
+      const norm = normalizeCommentBodyForMatch(c?.body);
+      if (norm.length >= 12) {
+        ghEntries.push({
+          norm,
+          path: String(t.path || '').replace(/^\/+/, ''),
+          line: Number(t.line || t.startLine || 0) || null,
+          authorLogin: c.authorLogin || '',
+          createdAt: c.createdAt || null,
+          url: c.url || null,
+          isInline: true,
+        });
+      }
+    }
+  }
+  for (const c of overviewData.generalComments || []) {
+    const norm = normalizeCommentBodyForMatch(c?.body);
+    if (norm.length >= 12) {
+      ghEntries.push({
+        norm,
+        path: '',
+        line: null,
+        authorLogin: c.authorLogin || '',
+        createdAt: c.createdAt || null,
+        url: c.url || null,
+        isInline: false,
+      });
+    }
+  }
+
+  if (ghEntries.length === 0) return { reconciledCids: [] };
+
+  const userLower = String(currentUser || '').trim().toLowerCase();
+  const reconciledCids = [];
+
+  for (const f of findings) {
+    if (!f || f.posted || f.dismissed) continue;
+    const normCustom = normalizeCommentBodyForMatch(f.customComment || '');
+    const normDefault = normalizeCommentBodyForMatch(f.comment || '');
+    const candidates = [normCustom, normDefault].filter((s) => s.length >= 12);
+    if (candidates.length === 0) continue;
+
+    const fPath = String(f.filePath || '').replace(/^\/+/, '');
+    const match = ghEntries.find((gh) => {
+      const exactBody = candidates.some((cand) => gh.norm === cand);
+      if (exactBody) return true;
+      const substantialContainment = candidates.some(
+        (cand) =>
+          cand.length >= 28 &&
+          gh.norm.length >= 28 &&
+          (gh.norm.includes(cand) || cand.includes(gh.norm))
+      );
+      if (!substantialContainment) return false;
+      if (!fPath || !gh.isInline) {
+        return !userLower || String(gh.authorLogin || '').toLowerCase() === userLower;
+      }
+      return (
+        gh.path === fPath ||
+        gh.path.endsWith('/' + fPath) ||
+        fPath.endsWith('/' + gh.path)
+      );
+    });
+
+    if (match) {
+      f.posted = true;
+      f.postedBy = match.authorLogin || currentUser || 'github';
+      f.postedAt = match.createdAt || new Date().toISOString();
+      f.postedUrl = match.url || f.postedUrl || null;
+      f.autoReconciledFromGitHub = true;
+      if (f.cid) reconciledCids.push(f.cid);
+    }
+  }
+
+  return { reconciledCids };
 }
 
 function getOverviewCacheFilePath(cacheDir, repo, number) {
@@ -643,6 +801,14 @@ export function buildStateResponse(schedulerInstance = null) {
     ? fs.readdirSync(archiveDir).filter((f) => f.startsWith('review-') && f.endsWith('.md'))
     : [];
 
+  const currentUserLower = String(cfg.githubUser || '').trim().toLowerCase();
+  const mappedWanTeam = mapHubTeamToWanreview(cfg.teamProfile)?.team || '';
+  const watchedTeamsSet = new Set(
+    [...(Array.isArray(cfg.githubTeams) ? cfg.githubTeams : []), cfg.teamProfile, mappedWanTeam]
+      .map((s) => String(s || '').trim().replace(/^[^/]+\//, '').toLowerCase())
+      .filter(Boolean)
+  );
+
   const prs = Object.entries(prsMap).map(([key, pr]) => {
     const reviewFile = pr.reviewFile || '';
     const isArchivedFile = Boolean(reviewFile && archivedFiles.includes(reviewFile));
@@ -663,13 +829,19 @@ export function buildStateResponse(schedulerInstance = null) {
           parsed = parseFindingsFromMarkdown(md);
           _findingsFileCache.set(fullPath, { mtimeMs: stats.mtimeMs, parsed });
         }
-        
+
         findingsCount = parsed.length;
         for (const f of parsed) {
-          const cid = `${key}::${f.id}`;
+          const { localEntry, sharedEntry } = resolveSavedEntriesForFinding(
+            key,
+            f,
+            uiState.comments,
+            sharedFindings,
+            parsed
+          );
           const merged = mergeCollaborativeAndLocalFindingState({
-            sharedEntry: sharedFindings[cid],
-            localEntry: uiState.comments?.[cid],
+            sharedEntry,
+            localEntry,
           });
           if (merged.posted) postedCount++;
           if (merged.dismissed) dismissedCount++;
@@ -704,10 +876,14 @@ export function buildStateResponse(schedulerInstance = null) {
     const approvedBy = [];
     const changesRequestedBy = [];
     const commentedBy = [];
+    let myLatestOpinionatedReview = null;
     for (const rev of latestReviews) {
       if (!rev || !rev.login) continue;
       // Skip bots
       if (/^(ci-cd-matawan|dependabot|renovate|github-actions)/i.test(rev.login)) continue;
+      if (currentUserLower && String(rev.login).toLowerCase() === currentUserLower) {
+        myLatestOpinionatedReview = rev;
+      }
       const personLabel = formatPersonDisplayName({ login: rev.login, name: rev.name });
       if (rev.state === 'APPROVED' && !approvedBy.includes(personLabel)) {
         approvedBy.push(personLabel);
@@ -718,9 +894,24 @@ export function buildStateResponse(schedulerInstance = null) {
       }
     }
 
-    const pendingReviewers = (Array.isArray(pr.pendingReviewers) ? pr.pendingReviewers : [])
+    const rawPendingReviewers = (Array.isArray(pr.pendingReviewers) ? pr.pendingReviewers : []).filter(Boolean);
+    const pendingReviewerItems = rawPendingReviewers
+      .map((req) => {
+        if (typeof req === 'string') {
+          return { login: req, name: req, isTeam: false };
+        }
+        return {
+          login: req.login || req.name || '',
+          name: req.name || req.login || '',
+          isTeam: Boolean(req.isTeam),
+        };
+      })
+      .filter((r) => r.login);
+
+    const pendingReviewers = rawPendingReviewers
       .map((req) => {
         if (!req) return null;
+        if (typeof req === 'string') return req;
         if (req.isTeam) {
           return req.name || req.login;
         }
@@ -730,6 +921,50 @@ export function buildStateResponse(schedulerInstance = null) {
         });
       })
       .filter(Boolean);
+
+    const isArchived = Boolean(pr.state !== 'OPEN' || isArchivedFile);
+    const isDraftBool = Boolean(pr.isDraft);
+    const isMyPrBool =
+      (Boolean(currentUserLower) && String(pr.author || '').toLowerCase() === currentUserLower) ||
+      pr.reviewMode === 'Self-Review';
+
+    const reviewedByMe = Boolean(
+      (myLatestOpinionatedReview &&
+        (myLatestOpinionatedReview.state === 'APPROVED' ||
+          myLatestOpinionatedReview.state === 'CHANGES_REQUESTED')) ||
+        (pr.lastGithubReviewSha && pr.headRefOid && pr.lastGithubReviewSha === pr.headRefOid)
+    );
+
+    const reviewAskedDirect = Boolean(
+      !isArchived &&
+        !isDraftBool &&
+        !isMyPrBool &&
+        currentUserLower &&
+        pendingReviewerItems.some(
+          (r) => !r.isTeam && String(r.login || '').toLowerCase() === currentUserLower
+        )
+    );
+
+    const reviewAskedTeams =
+      !isArchived && !isDraftBool && !isMyPrBool
+        ? pendingReviewerItems
+            .filter(
+              (r) =>
+                r.isTeam &&
+                watchedTeamsSet.has(String(r.login || r.name || '').replace(/^[^/]+\//, '').toLowerCase())
+            )
+            .map((r) => String(r.login || r.name || '').replace(/^[^/]+\//, ''))
+        : [];
+
+    const hasActiveOpinionByMe = Boolean(
+      myLatestOpinionatedReview &&
+        (myLatestOpinionatedReview.state === 'APPROVED' ||
+          myLatestOpinionatedReview.state === 'CHANGES_REQUESTED')
+    );
+
+    const reviewAskedTeam = Boolean(reviewAskedTeams.length > 0 && !hasActiveOpinionByMe);
+    const isReviewAsked = Boolean(reviewAskedDirect || reviewAskedTeam);
+    const reviewAskedSource = reviewAskedDirect ? 'direct' : reviewAskedTeam ? 'team' : null;
 
     const codeOwnersRules = loadRepoCodeOwners(projectsDir, pr.repo);
     const mergeReadiness = computeMergeReadiness({
@@ -742,7 +977,7 @@ export function buildStateResponse(schedulerInstance = null) {
     return {
       ...pr,
       key,
-      isDraft: Boolean(pr.isDraft),
+      isDraft: isDraftBool,
       jiraKey: resolvedJira || pr.jiraKey || '—',
       authorInitials,
       authorDisplayName,
@@ -750,6 +985,13 @@ export function buildStateResponse(schedulerInstance = null) {
       changesRequestedBy,
       commentedBy,
       pendingReviewers,
+      pendingReviewerItems,
+      isReviewAsked,
+      reviewAskedDirect,
+      reviewAskedTeam,
+      reviewAskedSource,
+      reviewAskedTeams,
+      reviewedByMe,
       mergeReadiness,
       requiredOwnerTeams: mergeReadiness.requiredOwnerTeams,
       isMergeable: mergeReadiness.isMergeable,
@@ -759,7 +1001,7 @@ export function buildStateResponse(schedulerInstance = null) {
       worktreePath: worktreeMounted ? wtPath : null,
       runningJob,
       lastFailedJob,
-      isArchived: Boolean(pr.state !== 'OPEN' || isArchivedFile),
+      isArchived,
       hasReviewFile: Boolean(hasActiveFile || isArchivedFile),
       findingsCount,
       postedCount,
@@ -899,7 +1141,7 @@ export function createHubServer(options = {}) {
     try {
       const urlObj = new URL(req.url, 'http://localhost');
       const pathname = urlObj.pathname;
-      const { cfg, reviewsDir, archiveDir, stateFile, uiStateFile } = getPaths();
+      const { cfg, reviewsDir, archiveDir, cacheDir, stateFile, uiStateFile } = getPaths();
       const projectsDir = getProjectsDir(cfg);
 
       if (req.method === 'GET' && pathname === '/api/state') {
@@ -1152,9 +1394,16 @@ export function createHubServer(options = {}) {
 
         const aiFindings = rawFindings.map((f) => {
           const cid = `${prKey}::${f.id}`;
+          const { localEntry, sharedEntry } = resolveSavedEntriesForFinding(
+            prKey,
+            f,
+            uiState.comments,
+            sharedFindings,
+            rawFindings
+          );
           const mergedState = mergeCollaborativeAndLocalFindingState({
-            sharedEntry: sharedFindings[cid],
-            localEntry: uiState.comments?.[cid],
+            sharedEntry,
+            localEntry,
             defaultComment: f.comment,
           });
           return {
@@ -1165,6 +1414,40 @@ export function createHubServer(options = {}) {
             ...mergedState,
           };
         });
+
+        const allCombinedFindings = [...aiFindings, ...manualFindings];
+        if (prKey && prKey.includes('#')) {
+          const [prRepo, prNumStr] = prKey.split('#');
+          const memOv = prOverviewCache.get(prKey)?.data || null;
+          const diskOv = !memOv
+            ? readJsonSafe(getOverviewCacheFilePath(cacheDir, prRepo, Number(prNumStr)), null)?.data || null
+            : null;
+          const ovData = memOv || diskOv;
+          if (ovData) {
+            const { reconciledCids } = reconcileFindingsWithOverviewData(
+              allCombinedFindings,
+              ovData,
+              cfg.githubUser
+            );
+            if (reconciledCids.length > 0) {
+              if (!uiState.comments) uiState.comments = {};
+              for (const f of allCombinedFindings) {
+                if (reconciledCids.includes(f.cid)) {
+                  uiState.comments[f.cid] = {
+                    ...(uiState.comments[f.cid] || {}),
+                    posted: true,
+                    postedBy: f.postedBy,
+                    postedAt: f.postedAt,
+                    postedUrl: f.postedUrl || null,
+                    fingerprint: computeFindingFingerprint(f),
+                    filePath: f.filePath || '',
+                  };
+                }
+              }
+              writeJsonSafe(uiStateFile, uiState);
+            }
+          }
+        }
 
         const parsedMdScorecard = parseScorecardBlockFromMarkdown(markdown);
         const storedScorecard = reviewMetadata?.scorecard || parsedMdScorecard || null;
@@ -1199,7 +1482,7 @@ export function createHubServer(options = {}) {
           scorecard: liveScorecard,
           productContext: productContextMeta,
           markdown,
-          findings: [...aiFindings, ...manualFindings],
+          findings: allCombinedFindings,
         });
       }
 
@@ -1236,14 +1519,25 @@ export function createHubServer(options = {}) {
           }
           if (md) {
             const diffRulesLookup = buildRulesLookupMap(cfg.teamProfile);
-            resolvedFindings = parseFindingsFromMarkdown(md).map((f) => {
+            const rawDiffFindings = parseFindingsFromMarkdown(md);
+            resolvedFindings = rawDiffFindings.map((f) => {
               const cid = `${prKey}::${f.id}`;
+              const { localEntry, sharedEntry } = resolveSavedEntriesForFinding(
+                prKey,
+                f,
+                uiState.comments,
+                sharedFindings,
+                rawDiffFindings
+              );
               const mergedState = mergeCollaborativeAndLocalFindingState({
-                sharedEntry: sharedFindings[cid],
-                localEntry: uiState.comments?.[cid],
+                sharedEntry,
+                localEntry,
                 defaultComment: f.comment,
               });
-              const resolution = resolveFindingAgainstDiff(f, files);
+              const resolution = resolveFindingAgainstDiff(
+                { ...f, customComment: mergedState.customComment },
+                files
+              );
               return {
                 ...f,
                 matchedRules: enrichFindingMatchedRules(f, diffRulesLookup),
@@ -1266,8 +1560,11 @@ export function createHubServer(options = {}) {
             ...resolution,
             resolvedPath: resolution.resolvedPath || m.filePath,
             resolvedLine: resolution.resolvedLine || m.endLine || m.startLine || 1,
+            resolvedSide: resolution.resolvedSide || m.side || 'RIGHT',
             isManual: true,
             posted: Boolean(saved.posted ?? m.posted),
+            postedBy: saved.postedBy || m.postedBy || null,
+            postedUrl: saved.postedUrl || m.postedUrl || null,
             dismissed: Boolean(saved.dismissed ?? m.dismissed),
             customComment: saved.customComment ?? m.customComment ?? m.comment,
           };
@@ -1288,6 +1585,7 @@ export function createHubServer(options = {}) {
           line = 1,
           startLine = null,
           endLine = null,
+          side = 'RIGHT',
           title = '',
           comment = '',
           severity = 'minor',
@@ -1296,6 +1594,7 @@ export function createHubServer(options = {}) {
           return sendJson(res, 400, { error: 'Missing prKey or comment' });
         }
 
+        const normalizedSide = String(side || 'RIGHT').toUpperCase() === 'LEFT' ? 'LEFT' : 'RIGHT';
         const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
         if (!uiState.comments) uiState.comments = {};
         if (!uiState.manualComments) uiState.manualComments = {};
@@ -1322,6 +1621,7 @@ export function createHubServer(options = {}) {
               ...(hasLineOverride
                 ? { startLine: startLineNum, endLine: endLineNum }
                 : {}),
+              ...(body.side !== undefined ? { side: normalizedSide } : {}),
               title: title.trim() || list[existingIdx].title,
               comment: comment.trim(),
               customComment: comment.trim(),
@@ -1341,6 +1641,7 @@ export function createHubServer(options = {}) {
             cid: newCid,
             prKey,
             filePath,
+            side: normalizedSide,
             startLine: startLineNum,
             endLine: endLineNum,
             title: title.trim() || `Comment on ${shortBase}:${rangeLabel}`,
@@ -2006,14 +2307,25 @@ export function createHubServer(options = {}) {
 
       if (req.method === 'POST' && pathname === '/api/ui-state') {
         const body = await readRequestBody(req);
-        const uiState = readJsonSafe(uiStateFile, { comments: {} });
+        const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
         if (!uiState.comments) uiState.comments = {};
 
-        const { cid, posted, dismissed, dismissReason, customComment, postedUrl } = body;
+        const {
+          cid,
+          posted,
+          dismissed,
+          dismissReason,
+          customComment,
+          postedUrl,
+          filePath,
+          title,
+        } = body;
         if (!cid) return sendJson(res, 400, { error: 'Missing cid' });
 
         const actor = resolveGithubActor(req, cfg);
         const nowIso = new Date().toISOString();
+        const fp =
+          filePath || title ? computeFindingFingerprint({ filePath, title }) : undefined;
 
         uiState.comments[cid] = {
           ...(uiState.comments[cid] || {}),
@@ -2034,7 +2346,33 @@ export function createHubServer(options = {}) {
           ...(typeof dismissReason === 'string' ? { dismissReason } : {}),
           ...(typeof customComment === 'string' ? { customComment } : {}),
           ...(postedUrl ? { postedUrl } : {}),
+          ...(fp ? { fingerprint: fp } : {}),
+          ...(typeof filePath === 'string' && filePath ? { filePath } : {}),
         };
+
+        // Keep manualComments array item in sync when toggling posted/dismissed/customComment
+        if (cid.includes('::#M') && uiState.manualComments) {
+          const prKeyPart = cid.split('::')[0];
+          const manualArr = uiState.manualComments[prKeyPart];
+          if (Array.isArray(manualArr)) {
+            const idx = manualArr.findIndex((m) => m.cid === cid);
+            if (idx >= 0) {
+              manualArr[idx] = {
+                ...manualArr[idx],
+                ...(typeof posted === 'boolean'
+                  ? {
+                      posted,
+                      postedBy: posted ? actor.login : null,
+                      postedAt: posted ? nowIso : null,
+                    }
+                  : {}),
+                ...(typeof dismissed === 'boolean' ? { dismissed } : {}),
+                ...(typeof customComment === 'string' ? { customComment, comment: customComment } : {}),
+                ...(postedUrl ? { postedUrl } : {}),
+              };
+            }
+          }
+        }
 
         writeJsonSafe(uiStateFile, uiState);
 
@@ -2125,16 +2463,18 @@ export function createHubServer(options = {}) {
           repo,
           number,
           headSha,
-          commentBody,
           filePath,
           line,
           startLine,
           endLine,
+          side = 'RIGHT',
           mode,
           cid,
+          title = '',
         } = body;
+        const effectiveCommentBody = String(body.commentBody ?? body.body ?? '').trim();
 
-        if (!repo || !number || !commentBody) {
+        if (!repo || !number || !effectiveCommentBody) {
           return sendJson(res, 400, { error: 'Missing repo, number, or commentBody' });
         }
 
@@ -2142,97 +2482,123 @@ export function createHubServer(options = {}) {
         const ghExecEnv = buildGithubExecEnv(actor);
         let resultData = null;
 
+        const runGhJsonInput = async (endpoint, method, payloadObj) => {
+          if (customGithubPublishHandlerForTests) {
+            return customGithubPublishHandlerForTests({
+              kind: 'comment',
+              endpoint,
+              method,
+              payload: payloadObj,
+              actor: actor.login,
+              repo,
+              number: Number(number),
+              mode: mode || 'general',
+            });
+          }
+          const proc = execFile(
+            'gh',
+            ['api', endpoint, '--method', method, '--input', '-'],
+            { env: ghExecEnv }
+          );
+          proc.stdin.write(JSON.stringify(payloadObj));
+          proc.stdin.end();
+          const stdout = await new Promise((resolve, reject) => {
+            let out = '';
+            let err = '';
+            proc.stdout.on('data', (d) => (out += d));
+            proc.stderr.on('data', (d) => (err += d));
+            proc.on('close', (code) =>
+              code === 0 ? resolve(out) : reject(new Error(err || `gh exited ${code}`))
+            );
+          });
+          return JSON.parse(stdout || '{}');
+        };
+
         if (mode === 'inline' && filePath && headSha) {
           const files = await fetchPrDiffFiles(repo, number, headSha);
           const reqStart = Number(startLine ?? line) || null;
           const reqEnd = Number(endLine ?? line ?? reqStart) || 1;
           const resolved = resolveFindingAgainstDiff(
-            { filePath, startLine: reqStart, endLine: reqEnd },
+            {
+              filePath,
+              startLine: reqStart,
+              endLine: reqEnd,
+              side,
+              commentBody: effectiveCommentBody,
+            },
             files
           );
 
           if (resolved.inDiff && resolved.resolvedPath && resolved.resolvedLine) {
+            const targetSide = resolved.resolvedSide === 'LEFT' ? 'LEFT' : 'RIGHT';
             const payloadObj = {
-              body: commentBody,
+              body: effectiveCommentBody,
               commit_id: headSha,
               path: resolved.resolvedPath,
               line: Number(resolved.resolvedLine),
-              side: 'RIGHT',
+              side: targetSide,
               ...(resolved.resolvedStartLine && resolved.resolvedStartLine < resolved.resolvedLine
                 ? {
                     start_line: Number(resolved.resolvedStartLine),
-                    start_side: 'RIGHT',
+                    start_side: targetSide,
                   }
                 : {}),
             };
-            const payload = JSON.stringify(payloadObj);
-
-            const proc = execFile(
-              'gh',
-              [
-                'api',
-                `repos/${cfg.githubOrg}/${repo}/pulls/${number}/comments`,
-                '--method',
-                'POST',
-                '--input',
-                '-',
-              ],
-              { env: ghExecEnv }
+            resultData = await runGhJsonInput(
+              `repos/${cfg.githubOrg}/${repo}/pulls/${number}/comments`,
+              'POST',
+              payloadObj
             );
-            proc.stdin.write(payload);
-            proc.stdin.end();
-
-            const stdout = await new Promise((resolve, reject) => {
-              let out = '';
-              let err = '';
-              proc.stdout.on('data', (d) => (out += d));
-              proc.stderr.on('data', (d) => (err += d));
-              proc.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(err || `gh exited ${code}`))));
-            });
-            resultData = JSON.parse(stdout);
           } else {
             return sendJson(res, 422, {
               error: `File "${filePath}" is not part of the PR diff hunks. Choose "General PR Comment" instead.`,
             });
           }
         } else {
-          const payload = JSON.stringify({ body: commentBody });
-          const proc = execFile(
-            'gh',
-            [
-              'api',
-              `repos/${cfg.githubOrg}/${repo}/issues/${number}/comments`,
-              '--method',
-              'POST',
-              '--input',
-              '-',
-            ],
-            { env: ghExecEnv }
+          resultData = await runGhJsonInput(
+            `repos/${cfg.githubOrg}/${repo}/issues/${number}/comments`,
+            'POST',
+            { body: effectiveCommentBody }
           );
-          proc.stdin.write(payload);
-          proc.stdin.end();
-
-          const stdout = await new Promise((resolve, reject) => {
-            let out = '';
-            let err = '';
-            proc.stdout.on('data', (d) => (out += d));
-            proc.stderr.on('data', (d) => (err += d));
-            proc.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(err || `gh exited ${code}`))));
-          });
-          resultData = JSON.parse(stdout);
         }
 
         if (cid) {
-          const uiState = readJsonSafe(uiStateFile, { comments: {} });
+          const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
           if (!uiState.comments) uiState.comments = {};
+          const nowIso = new Date().toISOString();
+          const fp =
+            filePath || title ? computeFindingFingerprint({ filePath, title }) : undefined;
+
           uiState.comments[cid] = {
             ...(uiState.comments[cid] || {}),
             posted: true,
             postedBy: actor.login,
-            postedAt: new Date().toISOString(),
+            postedAt: nowIso,
             postedUrl: resultData?.html_url || null,
-            customComment: commentBody,
+            customComment: effectiveCommentBody,
+            ...(fp ? { fingerprint: fp } : {}),
+            ...(filePath ? { filePath } : {}),
           };
+
+          if (cid.includes('::#M') && uiState.manualComments) {
+            const prKeyPart = cid.split('::')[0];
+            const manualArr = uiState.manualComments[prKeyPart];
+            if (Array.isArray(manualArr)) {
+              const idx = manualArr.findIndex((m) => m.cid === cid);
+              if (idx >= 0) {
+                manualArr[idx] = {
+                  ...manualArr[idx],
+                  posted: true,
+                  postedBy: actor.login,
+                  postedAt: nowIso,
+                  postedUrl: resultData?.html_url || null,
+                  customComment: effectiveCommentBody,
+                  comment: effectiveCommentBody,
+                };
+              }
+            }
+          }
+
           writeJsonSafe(uiStateFile, uiState);
 
           if (!cid.includes('::#M')) {
@@ -2259,7 +2625,15 @@ export function createHubServer(options = {}) {
       // Explicit User Action: Submit a GitHub Review (APPROVE, COMMENT, REQUEST_CHANGES, or PENDING draft)
       if (req.method === 'POST' && pathname === '/api/github/review') {
         const body = await readRequestBody(req);
-        const { repo, number, headSha, event, summaryBody, inlineComments } = body;
+        const {
+          repo,
+          number,
+          headSha,
+          event,
+          summaryBody,
+          inlineComments,
+          allowRepost = false,
+        } = body;
 
         if (!repo || !number) {
           return sendJson(res, 400, { error: 'Missing repo or number' });
@@ -2267,27 +2641,67 @@ export function createHubServer(options = {}) {
 
         const actor = resolveGithubActor(req, cfg);
         const ghExecEnv = buildGithubExecEnv(actor);
+        const prKey = `${repo}#${Number(number)}`;
+        const stateSnap = readJsonSafe(stateFile, { prs: {} });
+        const prEntry = stateSnap.prs?.[prKey] || null;
+
+        if (
+          prEntry?.author &&
+          actor.login &&
+          String(prEntry.author).toLowerCase() === String(actor.login).toLowerCase() &&
+          (event === 'APPROVE' || event === 'REQUEST_CHANGES')
+        ) {
+          return sendJson(res, 422, {
+            error: `GitHub does not allow "${event}" on your own Pull Request (@${actor.login}). Choose "COMMENT" or "PENDING" instead.`,
+          });
+        }
+
+        // Automatically filter out any comment already marked as posted on GitHub (unless allowRepost=true)
+        const uiStateBefore = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
+        const sharedFindingsBefore = readSharedFindingsState(cfg).findings || {};
+        const skippedAlreadyPostedCids = [];
+        const rawInlineItems = Array.isArray(inlineComments) ? inlineComments : [];
+        const eligibleInlineItems = rawInlineItems.filter((item) => {
+          if (!item || !String(item.body || '').trim()) return false;
+          if (!allowRepost && item.cid) {
+            const localPosted = Boolean(uiStateBefore.comments?.[item.cid]?.posted);
+            const sharedPosted = Boolean(sharedFindingsBefore[item.cid]?.posted);
+            if (localPosted || sharedPosted) {
+              skippedAlreadyPostedCids.push(item.cid);
+              return false;
+            }
+          }
+          return true;
+        });
+
         const reviewComments = [];
         const fallbackGeneralBodies = [];
 
-        if (Array.isArray(inlineComments) && inlineComments.length > 0) {
+        if (eligibleInlineItems.length > 0) {
           const files = await fetchPrDiffFiles(repo, number, headSha);
-          for (const item of inlineComments) {
+          for (const item of eligibleInlineItems) {
             const reqStart = Number(item.startLine ?? item.line) || null;
             const reqEnd = Number(item.endLine ?? item.line ?? reqStart) || 1;
             const resolved = resolveFindingAgainstDiff(
-              { filePath: item.filePath, startLine: reqStart, endLine: reqEnd },
+              {
+                filePath: item.filePath,
+                startLine: reqStart,
+                endLine: reqEnd,
+                side: item.side || 'RIGHT',
+                commentBody: item.body,
+              },
               files
             );
             if (resolved.inDiff && resolved.resolvedPath && resolved.resolvedLine) {
+              const targetSide = resolved.resolvedSide === 'LEFT' ? 'LEFT' : 'RIGHT';
               reviewComments.push({
                 path: resolved.resolvedPath,
                 line: Number(resolved.resolvedLine),
-                side: 'RIGHT',
+                side: targetSide,
                 ...(resolved.resolvedStartLine && resolved.resolvedStartLine < resolved.resolvedLine
                   ? {
                       start_line: Number(resolved.resolvedStartLine),
-                      start_side: 'RIGHT',
+                      start_side: targetSide,
                     }
                   : {}),
                 body: item.body,
@@ -2300,6 +2714,19 @@ export function createHubServer(options = {}) {
 
         const finalBody = [summaryBody || '', ...fallbackGeneralBodies].filter(Boolean).join('\n\n---\n\n');
 
+        if (
+          (event === 'PENDING' || event === 'COMMENT' || event === 'REQUEST_CHANGES') &&
+          reviewComments.length === 0 &&
+          !finalBody.trim()
+        ) {
+          return sendJson(res, 400, {
+            error:
+              skippedAlreadyPostedCids.length > 0
+                ? `All selected comments (${skippedAlreadyPostedCids.length}) were already posted on GitHub. Enter a summary message or choose "APPROVE".`
+                : `GitHub "${event}" requires either at least one unposted inline comment or a summary message.`,
+          });
+        }
+
         const reviewPayload = {
           ...(headSha ? { commit_id: headSha } : {}),
           ...(finalBody ? { body: finalBody } : {}),
@@ -2307,45 +2734,179 @@ export function createHubServer(options = {}) {
           ...(reviewComments.length > 0 ? { comments: reviewComments } : {}),
         };
 
-        const proc = execFile(
-          'gh',
-          [
-            'api',
+        const runGhReviewCall = async (endpoint, method, payloadObj) => {
+          if (customGithubPublishHandlerForTests) {
+            return customGithubPublishHandlerForTests({
+              kind: 'review',
+              endpoint,
+              method,
+              payload: payloadObj,
+              actor: actor.login,
+              repo,
+              number: Number(number),
+              event: event || 'PENDING',
+              skippedAlreadyPostedCids,
+            });
+          }
+          const proc = execFile(
+            'gh',
+            ['api', endpoint, '--method', method, '--input', '-'],
+            { env: ghExecEnv }
+          );
+          proc.stdin.write(JSON.stringify(payloadObj));
+          proc.stdin.end();
+          const stdout = await new Promise((resolve, reject) => {
+            let out = '';
+            let err = '';
+            proc.stdout.on('data', (d) => (out += d));
+            proc.stderr.on('data', (d) => (err += d));
+            proc.on('close', (code) =>
+              code === 0 ? resolve(out) : reject(new Error(err || `gh exited ${code}`))
+            );
+          });
+          return JSON.parse(stdout || '{}');
+        };
+
+        let resultData = null;
+        try {
+          resultData = await runGhReviewCall(
             `repos/${cfg.githubOrg}/${repo}/pulls/${number}/reviews`,
-            '--method',
             'POST',
-            '--input',
-            '-',
-          ],
-          { env: ghExecEnv }
-        );
-        proc.stdin.write(JSON.stringify(reviewPayload));
-        proc.stdin.end();
+            reviewPayload
+          );
+        } catch (reviewErr) {
+          const errMsg = String(reviewErr?.message || reviewErr || '');
+          const isDuplicatePendingErr = /only have one pending review|pending review/i.test(errMsg);
+          if (!isDuplicatePendingErr || customGithubPublishHandlerForTests) {
+            throw reviewErr;
+          }
 
-        const stdout = await new Promise((resolve, reject) => {
-          let out = '';
-          let err = '';
-          proc.stdout.on('data', (d) => (out += d));
-          proc.stderr.on('data', (d) => (err += d));
-          proc.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(err || `gh exited ${code}`))));
-        });
+          // Recover seamlessly when the user already has a PENDING review on GitHub for this PR:
+          // attach any new inline comments via GraphQL, then either update or submit that pending review!
+          const { stdout: existingJson } = await execFileAsync(
+            'gh',
+            ['api', `repos/${cfg.githubOrg}/${repo}/pulls/${number}/reviews?per_page=100`],
+            { env: ghExecEnv }
+          );
+          const allReviews = JSON.parse(existingJson || '[]');
+          const existingPending = Array.isArray(allReviews)
+            ? allReviews.find(
+                (r) =>
+                  r &&
+                  r.state === 'PENDING' &&
+                  String(r.user?.login || '').toLowerCase() === String(actor.login || '').toLowerCase()
+              )
+            : null;
 
-        const resultData = JSON.parse(stdout);
+          if (!existingPending) {
+            throw reviewErr;
+          }
 
-        if (Array.isArray(inlineComments) && inlineComments.length > 0) {
-          const uiState = readJsonSafe(uiStateFile, { comments: {} });
+          if (reviewComments.length > 0 && existingPending.node_id) {
+            const addThreadMutation = `
+              mutation($reviewId: ID!, $path: String!, $line: Int!, $side: DiffSide!, $body: String!, $startLine: Int, $startSide: DiffSide) {
+                addPullRequestReviewThread(input: {
+                  pullRequestReviewId: $reviewId,
+                  path: $path,
+                  line: $line,
+                  side: $side,
+                  startLine: $startLine,
+                  startSide: $startSide,
+                  body: $body
+                }) {
+                  thread { id }
+                }
+              }
+            `;
+            for (const rc of reviewComments) {
+              const args = [
+                'api',
+                'graphql',
+                '-f',
+                `query=${addThreadMutation}`,
+                '-F',
+                `reviewId=${existingPending.node_id}`,
+                '-F',
+                `path=${rc.path}`,
+                '-F',
+                `line=${Number(rc.line)}`,
+                '-F',
+                `side=${rc.side || 'RIGHT'}`,
+                '-F',
+                `body=${rc.body}`,
+              ];
+              if (rc.start_line) {
+                args.push('-F', `startLine=${Number(rc.start_line)}`);
+                args.push('-F', `startSide=${rc.start_side || rc.side || 'RIGHT'}`);
+              }
+              await execFileAsync('gh', args, { env: ghExecEnv });
+            }
+          }
+
+          if (event && event !== 'PENDING') {
+            resultData = await runGhReviewCall(
+              `repos/${cfg.githubOrg}/${repo}/pulls/${number}/reviews/${existingPending.id}/events`,
+              'POST',
+              {
+                event,
+                ...(finalBody ? { body: finalBody } : {}),
+              }
+            );
+          } else {
+            if (finalBody) {
+              const combinedBody = [existingPending.body || '', finalBody]
+                .filter(Boolean)
+                .join('\n\n---\n\n');
+              resultData = await runGhReviewCall(
+                `repos/${cfg.githubOrg}/${repo}/pulls/${number}/reviews/${existingPending.id}`,
+                'PUT',
+                { body: combinedBody }
+              );
+            } else {
+              resultData = existingPending;
+            }
+          }
+        }
+
+        if (eligibleInlineItems.length > 0) {
+          const uiState = readJsonSafe(uiStateFile, { comments: {}, manualComments: {} });
           if (!uiState.comments) uiState.comments = {};
+          const nowIso = new Date().toISOString();
           let sharedMarked = false;
-          for (const item of inlineComments) {
+          for (const item of eligibleInlineItems) {
             if (item.cid) {
+              const fp =
+                item.filePath || item.title
+                  ? computeFindingFingerprint({ filePath: item.filePath, title: item.title })
+                  : undefined;
               uiState.comments[item.cid] = {
                 ...(uiState.comments[item.cid] || {}),
                 posted: true,
                 postedBy: actor.login,
-                postedAt: new Date().toISOString(),
+                postedAt: nowIso,
                 postedUrl: resultData?.html_url || null,
                 customComment: item.body,
+                ...(fp ? { fingerprint: fp } : {}),
+                ...(item.filePath ? { filePath: item.filePath } : {}),
               };
+              if (item.cid.includes('::#M') && uiState.manualComments) {
+                const prKeyPart = item.cid.split('::')[0];
+                const manualArr = uiState.manualComments[prKeyPart];
+                if (Array.isArray(manualArr)) {
+                  const idx = manualArr.findIndex((m) => m.cid === item.cid);
+                  if (idx >= 0) {
+                    manualArr[idx] = {
+                      ...manualArr[idx],
+                      posted: true,
+                      postedBy: actor.login,
+                      postedAt: nowIso,
+                      postedUrl: resultData?.html_url || null,
+                      customComment: item.body,
+                      comment: item.body,
+                    };
+                  }
+                }
+              }
               if (!item.cid.includes('::#M')) {
                 recordSharedFindingAction({
                   cfg,
@@ -2368,7 +2929,13 @@ export function createHubServer(options = {}) {
         }
 
         invalidatePrOverviewCache(repo, number);
-        return sendJson(res, 200, { ok: true, postedBy: actor.login, githubResponse: resultData });
+        return sendJson(res, 200, {
+          ok: true,
+          postedBy: actor.login,
+          postedCount: eligibleInlineItems.length,
+          skippedAlreadyPostedCids,
+          githubResponse: resultData,
+        });
       }
 
       if (req.method === 'GET' && pathname === '/api/github/overview') {

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PR Review Hub</title>
-  <link rel="stylesheet" href="/styles.css?v=20261119-1" />
+  <link rel="stylesheet" href="/styles.css?v=20261120-1" />
   <link id="hljsThemeLink" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -66,7 +66,9 @@
           <div class="sidebar-filters-subrow">
             <div class="filter-tabs" id="modeFilterTabs">
               <button class="filter-tab active" data-filter="open">All Open <span id="count-open" class="count-pill">0</span></button>
-              <button class="filter-tab" data-filter="actionable">Actionable <span id="count-actionable" class="count-pill">0</span></button>
+              <button class="filter-tab" data-filter="review-asked" title="Open PRs where a review is requested from you directly or from your team">Review Asked <span id="count-review-asked" class="count-pill">0</span></button>
+              <button class="filter-tab" data-filter="actionable" title="PRs needing review, re-review on new commits, or attention on blockers/CI">Actionable <span id="count-actionable" class="count-pill">0</span></button>
+              <button class="filter-tab" data-filter="reviewed" title="Open PRs you have already reviewed">Reviewed <span id="count-reviewed" class="count-pill">0</span></button>
               <button class="filter-tab" data-filter="peer">Peer-Review <span id="count-peer" class="count-pill">0</span></button>
               <button class="filter-tab" data-filter="self">Self-Review <span id="count-self" class="count-pill">0</span></button>
               <button class="filter-tab" data-filter="draft">Draft <span id="count-draft" class="count-pill">0</span></button>
@@ -76,6 +78,12 @@
               Opened Date &darr; (Newest)
             </button>
             <div class="repo-pills" id="repoFilterPills"></div>
+          </div>
+          <div id="reviewAskedSubFilterBar" class="review-asked-subfilter-bar hidden">
+            <span class="meta-text" style="font-size:11px;font-weight:600;">Requested for:</span>
+            <button type="button" class="repo-pill active" data-asked-scope="all">All Asked <span id="count-asked-all">0</span></button>
+            <button type="button" class="repo-pill" data-asked-scope="direct">Direct (@me) <span id="count-asked-direct">0</span></button>
+            <button type="button" class="repo-pill" data-asked-scope="team">Team <span id="count-asked-team">0</span></button>
           </div>
           <div id="activeAuthorFilterBar" class="author-filter-bar hidden">
             <span id="activeAuthorFilterLabel" class="meta-text"></span>
@@ -381,7 +389,7 @@
   <!-- Toast notification -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script type="module" src="/app.js?v=20261119-1"></script>
+  <script type="module" src="/app.js?v=20261120-1"></script>
 
   <!-- Debug Console Drawer -->
   <div id="debugConsoleDrawer" style="position:fixed;bottom:0;left:0;right:0;height:40vh;background:var(--bg-surface);border-top:1px solid var(--border-color);z-index:10000;display:flex;flex-direction:column;transform:translateY(100%);transition:transform 0.2s ease-out;box-shadow:0 -5px 15px rgba(0,0,0,0.1);">

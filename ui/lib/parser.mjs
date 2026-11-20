@@ -139,6 +139,7 @@ export function parseFindingsFromMarkdown(markdown, repoHint = '') {
   let currentFinding = null;
   let inFence = false;
   let fenceTicks = '';
+  let nestedFenceDepth = 0;
   let fenceBuffer = [];
   let capturingReadyToPaste = false;
   let ignoreNextReadyFence = false;
@@ -295,11 +296,12 @@ export function parseFindingsFromMarkdown(markdown, repoHint = '') {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // Check code fence transitions (supports 3 or 4 backticks)
+    // Check code fence transitions (supports 3 or 4 backticks, including nested ```suggestion / ```php fences)
     const fenceMatch = line.match(/^(`{3,4})([^\s`]*)\s*$/);
     if (!inFence && fenceMatch) {
       inFence = true;
       fenceTicks = fenceMatch[1];
+      nestedFenceDepth = 0;
       fenceBuffer = [];
       if (currentFinding && !capturingReadyToPaste && !ignoreNextReadyFence && !standaloneReadySection) {
         currentFinding.bodyLines.push(line);
@@ -308,8 +310,19 @@ export function parseFindingsFromMarkdown(markdown, repoHint = '') {
     }
 
     if (inFence) {
+      const nestedOpenRegex = new RegExp(`^${fenceTicks}[^\\s\`]+\\s*$`);
       const closeRegex = new RegExp(`^${fenceTicks}\\s*$`);
+      if (nestedOpenRegex.test(line)) {
+        nestedFenceDepth++;
+        fenceBuffer.push(line);
+        continue;
+      }
       if (closeRegex.test(line)) {
+        if (nestedFenceDepth > 0) {
+          nestedFenceDepth--;
+          fenceBuffer.push(line);
+          continue;
+        }
         inFence = false;
         const blockContent = fenceBuffer.join('\n').trim();
         if (ignoreNextReadyFence) {
@@ -339,6 +352,7 @@ export function parseFindingsFromMarkdown(markdown, repoHint = '') {
           currentFinding.bodyLines.push(...fenceBuffer, line);
         }
         fenceTicks = '';
+        nestedFenceDepth = 0;
         fenceBuffer = [];
         continue;
       }
@@ -464,6 +478,16 @@ export function parseFindingsFromMarkdown(markdown, repoHint = '') {
     }
   }
 
+  // Recover gracefully if an unclosed code fence reached EOF
+  if (inFence && fenceBuffer.length > 0 && currentFinding) {
+    const blockContent = fenceBuffer.join('\n').trim();
+    if (capturingReadyToPaste || standaloneReadySection) {
+      if (!currentFinding.comment) currentFinding.comment = blockContent;
+    } else {
+      currentFinding.bodyLines.push(...fenceBuffer);
+    }
+  }
+
   flushFinding();
   return findings;
 }
@@ -524,19 +548,94 @@ export function parsePatchRightHunks(patch) {
   return hunks;
 }
 
+export function parsePatchLeftLines(patch) {
+  const validLeftLines = new Set();
+  if (!patch || typeof patch !== 'string') return validLeftLines;
+  const lines = patch.split('\n');
+  let leftLine = 0;
+  let inHunk = false;
+
+  for (const line of lines) {
+    const hunkMatch = line.match(/^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@/);
+    if (hunkMatch) {
+      leftLine = Number(hunkMatch[1]);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (line.startsWith('-') || line.startsWith(' ')) {
+      validLeftLines.add(leftLine);
+      leftLine++;
+    }
+  }
+  return validLeftLines;
+}
+
+export function parsePatchLeftHunks(patch) {
+  const hunks = [];
+  if (!patch || typeof patch !== 'string') return hunks;
+  const lines = patch.split('\n');
+  let leftLine = 0;
+  let currentSet = null;
+
+  for (const line of lines) {
+    const hunkMatch = line.match(/^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@/);
+    if (hunkMatch) {
+      leftLine = Number(hunkMatch[1]);
+      currentSet = new Set();
+      hunks.push(currentSet);
+      continue;
+    }
+    if (!currentSet) continue;
+    if (line.startsWith('-') || line.startsWith(' ')) {
+      currentSet.add(leftLine);
+      leftLine++;
+    }
+  }
+  return hunks;
+}
+
 /**
- * Resolves a finding's file path and line number (or multi-line range) against the PR's changed files.
+ * Inspects whether a Markdown comment contains a GitHub ```suggestion block and whether a
+ * multi-line [startLine..endLine] range would dangerously replace an oversized span of code.
+ */
+export function analyzeSuggestionBlockRange(body, startLine = null, endLine = null) {
+  const text = String(body || '');
+  const sugMatch = text.match(/`{3,}suggestion[^\r\n]*\r?\n([\s\S]*?)\r?\n`{3,}/i);
+  if (!sugMatch) {
+    return { hasSuggestion: false, suggestionLines: 0, spanLines: 1, oversizedRange: false };
+  }
+  const suggestionContent = sugMatch[1];
+  const suggestionLines = suggestionContent === '' ? 0 : suggestionContent.split(/\r?\n/).length;
+  const s = Number(startLine) || 0;
+  const e = Number(endLine) || s;
+  const spanLines = s > 0 && e >= s ? e - s + 1 : 1;
+  const maxSafeSpan = Math.max(6, suggestionLines * 3 + 2);
+  const oversizedRange = s > 0 && e > s && spanLines > maxSafeSpan;
+  return {
+    hasSuggestion: true,
+    suggestionLines,
+    spanLines,
+    oversizedRange,
+  };
+}
+
+/**
+ * Resolves a finding's file path, side (RIGHT or LEFT), and line number (or multi-line range)
+ * against the PR's changed files.
  */
 export function resolveFindingAgainstDiff(finding, diffFiles) {
   const rawFilePath = finding?.filePath || finding?.path || null;
   const rawStartLine = Number(finding?.startLine ?? finding?.lineStart) || null;
   const rawEndLine = Number(finding?.endLine ?? finding?.lineEnd ?? finding?.line) || null;
+  const requestedSide = String(finding?.side || finding?.diffSide || '').toUpperCase() === 'LEFT' ? 'LEFT' : 'RIGHT';
 
   if (!rawFilePath || !Array.isArray(diffFiles) || diffFiles.length === 0) {
     return {
       resolvedPath: rawFilePath,
       resolvedStartLine: rawStartLine && rawEndLine && rawStartLine < rawEndLine ? rawStartLine : null,
       resolvedLine: rawEndLine || rawStartLine || null,
+      resolvedSide: requestedSide,
       inDiff: false,
     };
   }
@@ -559,12 +658,24 @@ export function resolveFindingAgainstDiff(finding, diffFiles) {
       resolvedPath: rawFilePath,
       resolvedStartLine: rawStartLine && rawEndLine && rawStartLine < rawEndLine ? rawStartLine : null,
       resolvedLine: rawEndLine || rawStartLine || null,
+      resolvedSide: requestedSide,
       inDiff: false,
     };
   }
 
-  const validLines = parsePatchRightLines(matchedFile.patch || '');
-  const hunks = parsePatchRightHunks(matchedFile.patch || '');
+  const patch = matchedFile.patch || '';
+  const rightLines = parsePatchRightLines(patch);
+  const rightHunks = parsePatchRightHunks(patch);
+  const leftLines = parsePatchLeftLines(patch);
+  const leftHunks = parsePatchLeftHunks(patch);
+
+  // Use LEFT side if explicitly requested or if the file only has deleted lines (e.g. removed file)
+  const useLeft =
+    (requestedSide === 'LEFT' && leftLines.size > 0) ||
+    (rightLines.size === 0 && leftLines.size > 0);
+  const resolvedSide = useLeft ? 'LEFT' : 'RIGHT';
+  const validLines = useLeft ? leftLines : rightLines;
+  const hunks = useLeft ? leftHunks : rightHunks;
   const desiredLine = rawEndLine || rawStartLine;
 
   if (!desiredLine || validLines.size === 0) {
@@ -573,13 +684,17 @@ export function resolveFindingAgainstDiff(finding, diffFiles) {
       resolvedPath: matchedFile.filename,
       resolvedStartLine: null,
       resolvedLine: desiredLine || firstLine,
+      resolvedSide,
       inDiff: validLines.size > 0,
     };
   }
 
+  const commentBody = finding?.commentBody ?? finding?.customComment ?? finding?.comment ?? '';
+  const sugCheck = analyzeSuggestionBlockRange(commentBody, rawStartLine, desiredLine);
+
   if (validLines.has(desiredLine)) {
     let resolvedStartLine = null;
-    if (rawStartLine && rawStartLine < desiredLine) {
+    if (rawStartLine && rawStartLine < desiredLine && !sugCheck.oversizedRange) {
       const sameHunk = hunks.some((h) => h.has(rawStartLine) && h.has(desiredLine));
       if (sameHunk) {
         resolvedStartLine = rawStartLine;
@@ -589,7 +704,9 @@ export function resolveFindingAgainstDiff(finding, diffFiles) {
       resolvedPath: matchedFile.filename,
       resolvedStartLine,
       resolvedLine: desiredLine,
+      resolvedSide,
       inDiff: true,
+      ...(sugCheck.oversizedRange ? { droppedOversizedSuggestionRange: `${rawStartLine}-${desiredLine}` } : {}),
     };
   }
 
@@ -607,7 +724,181 @@ export function resolveFindingAgainstDiff(finding, diffFiles) {
     resolvedPath: matchedFile.filename,
     resolvedStartLine: null,
     resolvedLine: closest,
+    resolvedSide,
     inDiff: true,
     snappedFrom: desiredLine,
+  };
+}
+
+/**
+ * Computes GitHub-style intra-line diff character ranges [start, end) for a pair of modified lines.
+ * Expects raw code content WITHOUT the leading '-' / '+' diff marker.
+ */
+export function computeIntraLineDiffRanges(oldCode, newCode) {
+  const a = String(oldCode ?? '');
+  const b = String(newCode ?? '');
+  if (a === b || (!a.trim() && !b.trim())) {
+    return { highlight: false, delRanges: [], addRanges: [] };
+  }
+
+  // Tokenize into identifier/word runs, whitespace runs, or single punctuation characters
+  const tokenize = (str) => {
+    const out = [];
+    const re = /[A-Za-z0-9_]+|\s+|./gs;
+    let m;
+    while ((m = re.exec(str)) !== null) {
+      out.push({ text: m[0], start: m.index, end: m.index + m[0].length });
+    }
+    return out;
+  };
+
+  const tokA = tokenize(a);
+  const tokB = tokenize(b);
+
+  // Trim identical leading and trailing tokens first (fast path)
+  let prefixCount = 0;
+  const minLen = Math.min(tokA.length, tokB.length);
+  while (prefixCount < minLen && tokA[prefixCount].text === tokB[prefixCount].text) {
+    prefixCount++;
+  }
+
+  let suffixCount = 0;
+  while (
+    suffixCount < minLen - prefixCount &&
+    tokA[tokA.length - 1 - suffixCount].text === tokB[tokB.length - 1 - suffixCount].text
+  ) {
+    suffixCount++;
+  }
+
+  const midA = tokA.slice(prefixCount, tokA.length - suffixCount);
+  const midB = tokB.slice(prefixCount, tokB.length - suffixCount);
+
+  // Guard against overly huge lines where O(N*M) DP would be expensive
+  if (midA.length * midB.length > 16000) {
+    const delStart = midA.length > 0 ? midA[0].start : 0;
+    const delEnd = midA.length > 0 ? midA[midA.length - 1].end : 0;
+    const addStart = midB.length > 0 ? midB[0].start : 0;
+    const addEnd = midB.length > 0 ? midB[midB.length - 1].end : 0;
+    const unchangedChars =
+      (prefixCount > 0 ? tokA[prefixCount - 1].end : 0) +
+      (suffixCount > 0 ? a.length - tokA[tokA.length - suffixCount].start : 0);
+    if (unchangedChars === 0) {
+      return { highlight: false, delRanges: [], addRanges: [] };
+    }
+    return {
+      highlight: true,
+      delRanges: delEnd > delStart ? [[delStart, delEnd]] : [],
+      addRanges: addEnd > addStart ? [[addStart, addEnd]] : [],
+    };
+  }
+
+  // Token-level LCS on the middle slice
+  const n = midA.length;
+  const m = midB.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      if (midA[i].text === midB[j].text) {
+        dp[i][j] = dp[i + 1][j + 1] + 1;
+      } else {
+        dp[i][j] = dp[i + 1][j] >= dp[i][j + 1] ? dp[i + 1][j] : dp[i][j + 1];
+      }
+    }
+  }
+
+  const keepA = new Uint8Array(tokA.length);
+  const keepB = new Uint8Array(tokB.length);
+  for (let k = 0; k < prefixCount; k++) {
+    keepA[k] = 1;
+    keepB[k] = 1;
+  }
+  for (let k = 0; k < suffixCount; k++) {
+    keepA[tokA.length - 1 - k] = 1;
+    keepB[tokB.length - 1 - k] = 1;
+  }
+
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (midA[i].text === midB[j].text) {
+      keepA[prefixCount + i] = 1;
+      keepB[prefixCount + j] = 1;
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      i++;
+    } else {
+      j++;
+    }
+  }
+
+  // Check similarity ratio: if two lines share zero non-whitespace tokens (completely different lines),
+  // avoid highlighting the entire line unless they share a meaningful character prefix/suffix.
+  let sharedNonWsChars = 0;
+  for (let k = 0; k < tokA.length; k++) {
+    if (keepA[k] && tokA[k].text.trim()) {
+      sharedNonWsChars += tokA[k].text.length;
+    }
+  }
+  const totalNonWsChars = Math.max(a.replace(/\s+/g, '').length, b.replace(/\s+/g, '').length, 1);
+
+  const toMergedRanges = (tokens, keepFlags) => {
+    const raw = [];
+    for (let k = 0; k < tokens.length; k++) {
+      if (!keepFlags[k]) {
+        if (raw.length > 0 && raw[raw.length - 1][1] === tokens[k].start) {
+          raw[raw.length - 1][1] = tokens[k].end;
+        } else {
+          raw.push([tokens[k].start, tokens[k].end]);
+        }
+      }
+    }
+    // Coalesce tiny whitespace-only gaps between two adjacent changed spans (GitHub readability polish)
+    const coalesced = [];
+    for (const r of raw) {
+      if (coalesced.length > 0) {
+        const prev = coalesced[coalesced.length - 1];
+        const gapLen = r[0] - prev[1];
+        if (gapLen > 0 && gapLen <= 2) {
+          prev[1] = r[1];
+          continue;
+        }
+      }
+      coalesced.push([...r]);
+    }
+    return coalesced;
+  };
+
+  let delRanges = toMergedRanges(tokA, keepA);
+  let addRanges = toMergedRanges(tokB, keepB);
+
+  // Sub-token refinement when a single range changed on both sides (e.g. getZipCode -> getPostalCode)
+  if (delRanges.length === 1 && addRanges.length === 1) {
+    let [ds, de] = delRanges[0];
+    let [as, ae] = addRanges[0];
+    while (ds < de && as < ae && a[ds] === b[as]) {
+      ds++;
+      as++;
+      sharedNonWsChars++;
+    }
+    while (de > ds && ae > as && a[de - 1] === b[ae - 1]) {
+      de--;
+      ae--;
+      sharedNonWsChars++;
+    }
+    delRanges = de > ds ? [[ds, de]] : [];
+    addRanges = ae > as ? [[as, ae]] : [];
+  }
+
+  // Only highlight intra-line changes when the two lines actually share context (>= 20% non-ws similarity,
+  // or pure indentation/punctuation change where sharedNonWsChars > 0)
+  if (sharedNonWsChars === 0 || sharedNonWsChars / totalNonWsChars < 0.18) {
+    return { highlight: false, delRanges: [], addRanges: [] };
+  }
+
+  return {
+    highlight: delRanges.length > 0 || addRanges.length > 0,
+    delRanges,
+    addRanges,
   };
 }

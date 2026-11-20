@@ -183,10 +183,15 @@ async function runGraphql(query, timeoutMs = 45000, maxRetries = 3) {
       });
       return JSON.parse(stdout || '{}');
     } catch (err) {
-      if (attempt >= maxRetries) throw err;
+      const errDetail = `${err?.stderr || ''} ${err?.stdout || ''} ${err?.message || ''}`;
+      const isPermanentGraphqlErr =
+        /Could not resolve to a (?:Repository|PullRequest)|NOT_FOUND|FORBIDDEN|INSUFFICIENT_SCOPES/i.test(
+          errDetail
+        );
+      if (isPermanentGraphqlErr || attempt >= maxRetries) throw err;
       attempt++;
-      console.warn(`GraphQL attempt ${attempt} failed (502 Bad Gateway?), retrying in 5s...`);
-      await new Promise(resolve => setTimeout(resolve, 5000 * attempt));
+      console.warn(`GraphQL attempt ${attempt} failed (transient error), retrying in 5s...`);
+      await new Promise((resolve) => setTimeout(resolve, 5000 * attempt));
     }
   }
 }
@@ -226,6 +231,10 @@ export async function scanPrQueue(customCfg = null) {
     const m = base.match(/^review-(.+)-([0-9]+)\.md$/);
     if (!m) continue;
     let repoPart = m[1];
+    // Skip local branch / Jira review artifacts (e.g. review-2cloud-PRD-17964.md, review-repo-feat-PRD-123.md)
+    if (/-(?:PRD|HYB|WAN|POP|OPS|SEC|JIRA|FEAT|FIX|CHORE|REFACTOR)$/i.test(repoPart)) {
+      continue;
+    }
     const prNum = Number(m[2]);
     const multiMatch = repoPart.match(/^(.+)-([0-9]+)$/);
     if (multiMatch) {
@@ -314,10 +323,21 @@ export async function scanPrQueue(customCfg = null) {
       const pr = data?.data?.repository?.pullRequest;
       if (pr) {
         const cur = state.prs[key] || {};
+        const nextIsDraft = Boolean(pr.isDraft);
+        const transitionedFromDraft = !nextIsDraft && cur.syncStatus === 'DRAFT';
         state.prs[key] = {
           ...cur,
           state: pr.state,
-          isDraft: Boolean(pr.isDraft),
+          isDraft: nextIsDraft,
+          ...(transitionedFromDraft
+            ? {
+                syncStatus: cur.lastReviewedSha === pr.headRefOid ? 'UP_TO_DATE' : 'NEEDS_REVIEW',
+                reviewStatus:
+                  cur.lastReviewedSha === pr.headRefOid
+                    ? cur.reviewStatus || '✅ Reviewed'
+                    : '⏳ Pending Review',
+              }
+            : {}),
           headRefOid: pr.headRefOid,
           updatedAt: pr.updatedAt,
           createdAt: pr.createdAt ?? cur.createdAt ?? null,

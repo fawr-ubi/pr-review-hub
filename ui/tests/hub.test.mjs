@@ -9,6 +9,9 @@ import {
   detectSeverity,
   parseFindingsFromMarkdown,
   parsePatchRightLines,
+  parsePatchLeftLines,
+  analyzeSuggestionBlockRange,
+  computeIntraLineDiffRanges,
   resolveFindingAgainstDiff
 } from '../lib/parser.mjs';
 
@@ -67,7 +70,12 @@ import {
 } from '../lib/store.mjs';
 import { synthesizeCandidateRulesFromComments } from '../lib/onboarding.mjs';
 import { saveCandidateRules } from '../lib/rules.mjs';
-import { createHubServer, setCustomOverviewHandlerForTests } from '../server.mjs';
+import {
+  createHubServer,
+  setCustomOverviewHandlerForTests,
+  setCustomGithubPublishHandlerForTests,
+  reconcileFindingsWithOverviewData,
+} from '../server.mjs';
 import { execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -3248,6 +3256,557 @@ describe('Multi-Domain PR Scoring Agents, Jira Context & wanreview Surgical Expo
     }
   });
 });
+
+// =============================================================================
+// 10. Review & Comment Posting Hardening, Manual GitHub Post Exclusion,
+//     Review Asked Filtering & GitHub-Style Intra-Line Diff
+// =============================================================================
+describe('Review & Comment Posting Hardening, Review Asked Filter & Intra-Line Diff', () => {
+  test('computeIntraLineDiffRanges highlights exact single-line changes (identifier sub-token, port/number, multi-token) and skips unrelated rewrites', () => {
+    // 1. Sub-token PHP getter rename: $billing->getZipCode() -> $billing->getPostalCode()
+    const oldPhp = '    $zip = $billingInformation->getZipCode();';
+    const newPhp = '    $zip = $billingInformation->getPostalCode();';
+    const resPhp = computeIntraLineDiffRanges(oldPhp, newPhp);
+    assert.equal(resPhp.highlight, true);
+    assert.equal(resPhp.delRanges.length, 1);
+    assert.equal(resPhp.addRanges.length, 1);
+    assert.equal(oldPhp.slice(resPhp.delRanges[0][0], resPhp.delRanges[0][1]), 'Zip');
+    assert.equal(newPhp.slice(resPhp.addRanges[0][0], resPhp.addRanges[0][1]), 'Postal');
+
+    // 2. Single-digit YAML port change: "8080:80" -> "8081:80"
+    const oldYaml = '      - "8080:80"';
+    const newYaml = '      - "8081:80"';
+    const resYaml = computeIntraLineDiffRanges(oldYaml, newYaml);
+    assert.equal(resYaml.highlight, true);
+    assert.equal(oldYaml.slice(resYaml.delRanges[0][0], resYaml.delRanges[0][1]), '0');
+    assert.equal(newYaml.slice(resYaml.addRanges[0][0], resYaml.addRanges[0][1]), '1');
+
+    // 3. Multi-token expression change on a single line
+    const oldCond = 'if (!empty($value)) {';
+    const newCond = "if ($value !== null && $value !== '') {";
+    const resCond = computeIntraLineDiffRanges(oldCond, newCond);
+    assert.equal(resCond.highlight, true);
+    assert.ok(resCond.delRanges.length >= 1);
+    assert.ok(resCond.addRanges.length >= 1);
+
+    // 4. Completely unrelated lines should NOT highlight intra-line noise
+    const unrelated = computeIntraLineDiffRanges(
+      'return null;',
+      '$this->logger->critical("Database connection pool exhausted");'
+    );
+    assert.equal(unrelated.highlight, false);
+  });
+
+  test('Nested 3-backtick suggestion fences, LEFT-side deleted line resolution, and oversized suggestion range safety', () => {
+    // 1. 3-backtick outer fence containing an inner ```suggestion fence + trailing note
+    const mdWith3TickNested = `
+## 2. Review Findings
+
+### 🟡 Clean Code
+
+#### \`#1\` — [Align Step 3 fallback](file:///skills/ci-review/SKILL.md#L18-L63)
+- **Domain:** quality
+- **Ready-to-paste GitHub comment:**
+\`\`\`markdown
+Nit: Removing the \`gh pr comment\` fallback keeps the instructions consistent.
+
+\`\`\`suggestion
+When reviewing a GitHub Pull Request, publish a single COMMENT PR review:
+\`\`\`
+
+Let me know if you prefer keeping a dry-run note!
+\`\`\`
+`;
+    const parsed = parseFindingsFromMarkdown(mdWith3TickNested);
+    assert.equal(parsed.length, 1);
+    assert.ok(parsed[0].comment.includes('```suggestion'));
+    assert.ok(
+      parsed[0].comment.includes('Let me know if you prefer keeping a dry-run note!'),
+      'Outer 3-backtick fence must not close early on inner ```suggestion fence'
+    );
+
+    // 2. Oversized suggestion range (L18-L63 = 46 lines for a 1-line suggestion) drops start_line so GitHub will not delete 45 lines
+    const sugAnalysis = analyzeSuggestionBlockRange(parsed[0].comment, 18, 63);
+    assert.equal(sugAnalysis.hasSuggestion, true);
+    assert.equal(sugAnalysis.suggestionLines, 1);
+    assert.equal(sugAnalysis.oversizedRange, true);
+
+    const sampleDiff = [
+      {
+        filename: 'skills/ci-review/SKILL.md',
+        patch: [
+          '@@ -15,55 +15,55 @@',
+          ...Array.from({ length: 55 }, (_, i) => (i === 48 ? '+Updated line 63' : ` line ${15 + i}`)),
+        ].join('\n'),
+      },
+      {
+        filename: 'projects/services/mobility-account/docker-compose.yml',
+        patch: [
+          '@@ -35,6 +35,4 @@',
+          '   environment:',
+          '     APP_ENV: dev',
+          '-    LEGACY_FLAG: "1"',
+          '-    DEPRECATED_PORT: "9009"',
+          '     DATABASE_URL: postgres://db',
+          '     REDIS_URL: redis://cache',
+        ].join('\n'),
+      },
+    ];
+
+    const resolvedSug = resolveFindingAgainstDiff(
+      {
+        filePath: 'skills/ci-review/SKILL.md',
+        startLine: 18,
+        endLine: 63,
+        customComment: parsed[0].comment,
+      },
+      sampleDiff
+    );
+    assert.equal(resolvedSug.inDiff, true);
+    assert.equal(resolvedSug.resolvedLine, 63);
+    assert.equal(
+      resolvedSug.resolvedStartLine,
+      null,
+      'Oversized multi-line range on a 1-line suggestion must clamp to single-line endLine'
+    );
+
+    // 3. Deleted lines (LEFT side) resolve accurately on docker-compose.yml lines 37-38
+    const leftSet = parsePatchLeftLines(sampleDiff[1].patch);
+    assert.ok(leftSet.has(37) && leftSet.has(38));
+
+    const resolvedDeleted = resolveFindingAgainstDiff(
+      {
+        filePath: 'projects/services/mobility-account/docker-compose.yml',
+        startLine: 37,
+        endLine: 38,
+        side: 'LEFT',
+        comment: "Can't it be deleted ?",
+      },
+      sampleDiff
+    );
+    assert.equal(resolvedDeleted.inDiff, true);
+    assert.equal(resolvedDeleted.resolvedSide, 'LEFT');
+    assert.equal(resolvedDeleted.resolvedStartLine, 37);
+    assert.equal(resolvedDeleted.resolvedLine, 38);
+  });
+
+  test('E2E HTTP: excludes manually posted comments (Hub + GitHub Overview) from batch review, supports Overview general comments, LEFT side, self-PR guard, re-review fingerprint & Review Asked filter', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-posting-e2e-'));
+    const prevCfgEnv = process.env.REVIEW_HUB_CONFIG;
+    const publishedCalls = [];
+
+    try {
+      const cfgPath = path.join(tmpDir, 'config.json');
+      const reviewsDir = path.join(tmpDir, 'reviews');
+      const cacheDir = path.join(reviewsDir, '.cache');
+      const projectsDir = path.join(tmpDir, 'projects');
+      fs.mkdirSync(cacheDir, { recursive: true });
+      fs.mkdirSync(projectsDir, { recursive: true });
+
+      process.env.REVIEW_HUB_CONFIG = cfgPath;
+      saveConfig({
+        githubUser: 'fawr-ubi',
+        githubOrg: 'ubitransports',
+        teamProfile: 'popcorn-back',
+        githubTeams: ['ubi-eng-team-popcorn', 'popcorn-back'],
+        reviewsDir,
+        projectsDir,
+        hubRole: 'reader',
+        autoReviewEnabled: false,
+      });
+
+      // Seed PR queue state to test Review Asked (direct vs team vs already-reviewed vs self vs draft)
+      const headSha = 'abcdef1234567890abcdef1234567890abcdef12';
+      fs.writeFileSync(
+        path.join(reviewsDir, '.state.json'),
+        JSON.stringify(
+          {
+            prs: {
+              '2cloud-services#5701': {
+                repo: '2cloud-services',
+                number: 5701,
+                title: 'PRD-18382 feat: Moneris billing details',
+                state: 'OPEN',
+                isDraft: false,
+                author: 'sontungpham',
+                headRefOid: headSha,
+                reviewFile: 'review-2cloud-services-5701.md',
+                pendingReviewers: [{ login: 'fawr-ubi', name: 'Antoine', isTeam: false }],
+                latestReviews: [],
+              },
+              '2cloud-services#5742': {
+                repo: '2cloud-services',
+                number: 5742,
+                title: 'PRD-18400 feat: Mobility account endpoint',
+                state: 'OPEN',
+                isDraft: false,
+                author: 'augarnier',
+                headRefOid: '111111111111',
+                pendingReviewers: [{ login: 'popcorn-back', name: 'popcorn-back', isTeam: true }],
+                latestReviews: [],
+              },
+              '2cloud-services#5500': {
+                repo: '2cloud-services',
+                number: 5500,
+                title: 'Already approved team PR',
+                state: 'OPEN',
+                isDraft: false,
+                author: 'augarnier',
+                headRefOid: '222222222222',
+                pendingReviewers: [{ login: 'popcorn-back', name: 'popcorn-back', isTeam: true }],
+                latestReviews: [{ login: 'fawr-ubi', name: 'Antoine', state: 'APPROVED' }],
+              },
+              '2cloud-services#5800': {
+                repo: '2cloud-services',
+                number: 5800,
+                title: 'My own PR',
+                state: 'OPEN',
+                isDraft: false,
+                author: 'fawr-ubi',
+                headRefOid: headSha,
+                pendingReviewers: [{ login: 'popcorn-back', name: 'popcorn-back', isTeam: true }],
+                latestReviews: [],
+              },
+              '2cloud-services#5900': {
+                repo: '2cloud-services',
+                number: 5900,
+                title: 'Draft PR',
+                state: 'OPEN',
+                isDraft: true,
+                author: 'sontungpham',
+                headRefOid: '333333333333',
+                pendingReviewers: [{ login: 'fawr-ubi', name: 'Antoine', isTeam: false }],
+                latestReviews: [],
+              },
+            },
+          },
+          null,
+          2
+        ),
+        'utf8'
+      );
+
+      // Seed cached diff for 2cloud-services#5701 and #5800
+      const diffPayload = [
+        {
+          filename: 'src/Billing/MonerisPaymentGateway.php',
+          patch: [
+            '@@ -250,8 +250,9 @@',
+            '     public function preloadOrder(): array',
+            '     {',
+            '-        $legacy = true;',
+            '+        if (!empty($zipCode)) {',
+            '+            $payload["postal_code"] = $zipCode;',
+            '+        }',
+            '         return $payload;',
+            '     }',
+          ].join('\n'),
+        },
+        {
+          filename: 'src/Listener/LittlepayMerchantCreationListener.php',
+          patch: [
+            '@@ -10,4 +10,4 @@',
+            '-#[AsEntityListener(event: Events::postPersist, entity: Merchant::class)]',
+            '+#[AsDoctrineListener(event: Events::postPersist)]',
+            ' final class LittlepayMerchantCreationListener',
+          ].join('\n'),
+        },
+      ];
+      const safeSha = headSha.slice(0, 12);
+      fs.writeFileSync(
+        path.join(cacheDir, `diff-2cloud-services-5701-${safeSha}.json`),
+        JSON.stringify(diffPayload),
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(cacheDir, `diff-2cloud-services-5800-${safeSha}.json`),
+        JSON.stringify(diffPayload),
+        'utf8'
+      );
+
+      // Seed review markdown with 3 findings (#1, #2, #3)
+      const reviewMdV1 = [
+        '# Code Review: 2cloud-services#5701',
+        '',
+        '## 2. Review Findings',
+        '',
+        '### 🔴 Blockers',
+        '',
+        '#### `#1` — [Map all 5 billing_details fields](file:///src/Billing/MonerisPaymentGateway.php#L253-L254)',
+        '- **Domain:** product',
+        '- **Ready-to-paste GitHub comment:**',
+        '```markdown',
+        'Map `address_1`, `city`, `province`, `country`, and `postal_code` into `billing_details` instead of only `postal_code`.',
+        '```',
+        '',
+        '#### `#2` — [Keep Merchant entity scope on listener](file:///src/Listener/LittlepayMerchantCreationListener.php#L10)',
+        '- **Domain:** quality',
+        '- **Ready-to-paste GitHub comment:**',
+        '```markdown',
+        'Switching from `AsEntityListener` to `AsDoctrineListener` makes this listener run on every entity across all entity managers.',
+        '```',
+        '',
+        '#### `#3` — [Avoid loose empty() check](file:///src/Billing/MonerisPaymentGateway.php#L253)',
+        '- **Domain:** quality',
+        '- **Ready-to-paste GitHub comment:**',
+        '```markdown',
+        'Prefer strict `$zipCode !== null && $zipCode !== ""` instead of `!empty($zipCode)`.',
+        '```',
+      ].join('\n');
+      fs.writeFileSync(path.join(reviewsDir, 'review-2cloud-services-5701.md'), reviewMdV1, 'utf8');
+
+      // Seed cached GitHub Overview simulating that #2 was manually copy-pasted by @fawr-ubi directly onto GitHub.com!
+      fs.writeFileSync(
+        path.join(cacheDir, 'overview-2cloud-services-5701.json'),
+        JSON.stringify({
+          fetchedAt: Date.now(),
+          data: {
+            repo: '2cloud-services',
+            number: 5701,
+            headRefOid: headSha,
+            generalComments: [],
+            reviews: [],
+            reviewThreads: [
+              {
+                id: 'PRRT_manual_2',
+                isResolved: false,
+                path: 'src/Listener/LittlepayMerchantCreationListener.php',
+                line: 10,
+                diffSide: 'RIGHT',
+                comments: [
+                  {
+                    id: 'PRRC_manual_2',
+                    body: 'Switching from `AsEntityListener` to `AsDoctrineListener` makes this listener run on every entity across all entity managers.',
+                    authorLogin: 'fawr-ubi',
+                    createdAt: '2026-11-20T09:00:00Z',
+                    url: 'https://github.com/ubitransports/2cloud-services/pull/5701#discussion_r9992',
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+        'utf8'
+      );
+
+      setCustomGithubPublishHandlerForTests(async (call) => {
+        publishedCalls.push(call);
+        return {
+          id: 77700 + publishedCalls.length,
+          html_url: `https://github.com/ubitransports/${call.repo}/pull/${call.number}#discussion_r${77700 + publishedCalls.length}`,
+        };
+      });
+
+      const srv = createHubServer({ enableScheduler: false });
+      await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+      const port = srv.address().port;
+      const base = `http://127.0.0.1:${port}`;
+
+      try {
+        // A. Verify Review Asked metadata in GET /api/state
+        const stateRes = await fetch(`${base}/api/state`).then((r) => r.json());
+        const byKey = Object.fromEntries(stateRes.prs.map((p) => [p.key, p]));
+        assert.equal(byKey['2cloud-services#5701'].isReviewAsked, true);
+        assert.equal(byKey['2cloud-services#5701'].reviewAskedDirect, true);
+        assert.equal(byKey['2cloud-services#5701'].reviewAskedSource, 'direct');
+
+        assert.equal(byKey['2cloud-services#5742'].isReviewAsked, true);
+        assert.equal(byKey['2cloud-services#5742'].reviewAskedTeam, true);
+        assert.equal(byKey['2cloud-services#5742'].reviewAskedSource, 'team');
+
+        assert.equal(
+          byKey['2cloud-services#5500'].isReviewAsked,
+          false,
+          'Team PR already approved by @fawr-ubi should move to Reviewed, not stay in Review Asked'
+        );
+        assert.equal(byKey['2cloud-services#5500'].reviewedByMe, true);
+        assert.equal(byKey['2cloud-services#5800'].isReviewAsked, false, 'Own PR is never Review Asked');
+        assert.equal(byKey['2cloud-services#5900'].isReviewAsked, false, 'Draft PR is never Review Asked');
+
+        // B. Verify GET /api/review auto-reconciles #2 (manually posted on GitHub.com!) as posted=true
+        const revRes1 = await fetch(
+          `${base}/api/review?file=review-2cloud-services-5701.md&key=${encodeURIComponent('2cloud-services#5701')}`
+        ).then((r) => r.json());
+        const f1 = revRes1.findings.find((f) => f.id === '#1');
+        const f2 = revRes1.findings.find((f) => f.id === '#2');
+        const f3 = revRes1.findings.find((f) => f.id === '#3');
+        assert.equal(f1.posted, false);
+        assert.equal(f2.posted, true, '#2 manually posted on GitHub must be auto-marked posted=true');
+        assert.equal(
+          f2.postedUrl,
+          'https://github.com/ubitransports/2cloud-services/pull/5701#discussion_r9992'
+        );
+        assert.equal(f3.posted, false);
+
+        // C. Post General Comment from Overview tab using `{ body }` (previously 400 bug!)
+        const genRes = await fetch(`${base}/api/github/comment`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            repo: '2cloud-services',
+            number: 5701,
+            mode: 'general',
+            body: 'General note from PR Overview tab.',
+          }),
+        });
+        assert.equal(genRes.status, 200);
+        assert.equal(publishedCalls.at(-1).payload.body, 'General note from PR Overview tab.');
+
+        // D. Post inline comment on a DELETED line (`side: 'LEFT'`, line 252 `- $legacy = true;`)
+        const delInlineRes = await fetch(`${base}/api/github/comment`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            repo: '2cloud-services',
+            number: 5701,
+            headSha,
+            mode: 'inline',
+            side: 'LEFT',
+            filePath: 'src/Billing/MonerisPaymentGateway.php',
+            startLine: 252,
+            endLine: 252,
+            commentBody: 'Good cleanup removing $legacy!',
+          }),
+        });
+        assert.equal(delInlineRes.status, 200);
+        assert.equal(publishedCalls.at(-1).payload.side, 'LEFT');
+        assert.equal(publishedCalls.at(-1).payload.line, 252);
+
+        // E. Publish #1 individually via Hub (`POST /api/github/comment`)
+        const postF1Res = await fetch(`${base}/api/github/comment`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            repo: '2cloud-services',
+            number: 5701,
+            headSha,
+            mode: 'inline',
+            filePath: f1.filePath,
+            startLine: f1.startLine,
+            endLine: f1.endLine,
+            commentBody: f1.customComment,
+            cid: f1.cid,
+            title: f1.title,
+          }),
+        });
+        assert.equal(postF1Res.status, 200);
+
+        // F. CRITICAL USER REQUIREMENT: Submit global PR Review passing [#1, #2, #3].
+        //    Both #1 (posted via Hub) AND #2 (posted manually on GitHub.com) MUST be excluded; ONLY #3 is sent!
+        const batchRes = await fetch(`${base}/api/github/review`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            repo: '2cloud-services',
+            number: 5701,
+            headSha,
+            event: 'REQUEST_CHANGES',
+            summaryBody: 'Please address the remaining point.',
+            inlineComments: [f1, f2, f3].map((f) => ({
+              cid: f.cid,
+              title: f.title,
+              filePath: f.filePath,
+              startLine: f.startLine,
+              endLine: f.endLine,
+              body: f.customComment,
+            })),
+          }),
+        });
+        assert.equal(batchRes.status, 200);
+        const batchData = await batchRes.json();
+        assert.equal(batchData.postedCount, 1, 'Only #3 must be posted in batch review');
+        assert.deepEqual(batchData.skippedAlreadyPostedCids.sort(), [f1.cid, f2.cid].sort());
+        const ghBatchCall = publishedCalls.at(-1);
+        assert.equal(ghBatchCall.payload.comments.length, 1);
+        assert.ok(ghBatchCall.payload.comments[0].body.includes('Prefer strict'));
+
+        // G. Calling COMMENT review again when all 3 comments are already posted and summaryBody is empty -> clear 400
+        const duplicateBatchRes = await fetch(`${base}/api/github/review`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            repo: '2cloud-services',
+            number: 5701,
+            headSha,
+            event: 'COMMENT',
+            summaryBody: '',
+            inlineComments: [f3].map((f) => ({
+              cid: f.cid,
+              filePath: f.filePath,
+              startLine: f.startLine,
+              endLine: f.endLine,
+              body: f.customComment,
+            })),
+          }),
+        });
+        assert.equal(duplicateBatchRes.status, 400);
+
+        // H. Self-PR guard: APPROVE on own PR (2cloud-services#5800) returns 422
+        const selfApproveRes = await fetch(`${base}/api/github/review`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            repo: '2cloud-services',
+            number: 5800,
+            headSha,
+            event: 'APPROVE',
+            summaryBody: 'LGTM',
+            inlineComments: [],
+          }),
+        });
+        assert.equal(selfApproveRes.status, 422);
+
+        // I. AI Re-Review Fingerprint Resilience: swap #1 and #3 in regenerated markdown + add a brand-new #1!
+        const reviewMdV2 = [
+          '# Code Review: 2cloud-services#5701 (Re-run)',
+          '',
+          '## 2. Review Findings',
+          '',
+          '### 🔴 Blockers',
+          '',
+          '#### `#1` — [Brand new unposted security finding](file:///src/Billing/MonerisPaymentGateway.php#L254)',
+          '- **Domain:** security',
+          '- **Ready-to-paste GitHub comment:**',
+          '```markdown',
+          'Sanitize postal_code format before forwarding.',
+          '```',
+          '',
+          '#### `#2` — [Map all 5 billing_details fields](file:///src/Billing/MonerisPaymentGateway.php#L253-L254)',
+          '- **Domain:** product',
+          '- **Ready-to-paste GitHub comment:**',
+          '```markdown',
+          'Map `address_1`, `city`, `province`, `country`, and `postal_code` into `billing_details` instead of only `postal_code`.',
+          '```',
+        ].join('\n');
+        fs.writeFileSync(path.join(reviewsDir, 'review-2cloud-services-5701.md'), reviewMdV2, 'utf8');
+
+        const revRes2 = await fetch(
+          `${base}/api/review?file=review-2cloud-services-5701.md&key=${encodeURIComponent('2cloud-services#5701')}`
+        ).then((r) => r.json());
+        const v2New1 = revRes2.findings.find((f) => f.id === '#1');
+        const v2Moved2 = revRes2.findings.find((f) => f.id === '#2');
+        assert.equal(
+          v2New1.posted,
+          false,
+          'Brand-new finding #1 must NOT inherit old #1 posted=true state!'
+        );
+        assert.equal(
+          v2Moved2.posted,
+          true,
+          'Moved finding (Map all 5 billing_details fields) must retain its posted=true state via fingerprint!'
+        );
+      } finally {
+        await new Promise((resolve) => srv.close(resolve));
+      }
+    } finally {
+      setCustomGithubPublishHandlerForTests(null);
+      if (prevCfgEnv === undefined) delete process.env.REVIEW_HUB_CONFIG;
+      else process.env.REVIEW_HUB_CONFIG = prevCfgEnv;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
 
 
 

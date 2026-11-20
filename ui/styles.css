@@ -18,8 +18,10 @@
   --status-ok: #689474;
   --diff-add-bg: rgba(104, 148, 116, 0.11);
   --diff-add-text: #8ab094;
+  --diff-intraline-add-bg: rgba(46, 160, 67, 0.38);
   --diff-del-bg: rgba(181, 104, 104, 0.11);
   --diff-del-text: #c28282;
+  --diff-intraline-del-bg: rgba(248, 81, 73, 0.38);
   --diff-hunk-bg: rgba(154, 167, 184, 0.06);
   --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -44,8 +46,10 @@
   --status-ok: #72b38c;
   --diff-add-bg: rgba(114, 179, 140, 0.13);
   --diff-add-text: #98d4b0;
+  --diff-intraline-add-bg: rgba(70, 190, 115, 0.38);
   --diff-del-bg: rgba(217, 117, 131, 0.13);
   --diff-del-text: #e89ba6;
+  --diff-intraline-del-bg: rgba(235, 92, 110, 0.38);
   --diff-hunk-bg: rgba(184, 169, 245, 0.08);
 }
 
@@ -68,8 +72,10 @@
   --status-ok: #3e754e;
   --diff-add-bg: rgba(62, 117, 78, 0.1);
   --diff-add-text: #2e633d;
+  --diff-intraline-add-bg: rgba(46, 160, 67, 0.3);
   --diff-del-bg: rgba(166, 75, 75, 0.1);
   --diff-del-text: #8f3939;
+  --diff-intraline-del-bg: rgba(220, 60, 60, 0.28);
   --diff-hunk-bg: rgba(73, 86, 104, 0.06);
 }
 
@@ -4537,6 +4543,68 @@ a.wanreview-rule-badge:hover {
   font-size: 11px;
   color: var(--text-secondary);
 }
+
+/* ============================================================================
+   GitHub-Style Intra-Line Diff Highlighting & Review Asked Filter Badges
+   ============================================================================ */
+mark.diff-intraline-add,
+mark.diff-intraline-del {
+  color: inherit;
+  border-radius: 2px;
+  padding: 1px 0;
+  font-weight: inherit;
+}
+
+mark.diff-intraline-add {
+  background: var(--diff-intraline-add-bg, rgba(46, 160, 67, 0.38));
+}
+
+mark.diff-intraline-del {
+  background: var(--diff-intraline-del-bg, rgba(248, 81, 73, 0.38));
+}
+
+.review-asked-subfilter-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 5px 8px;
+  margin-top: 2px;
+  border-radius: 5px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+}
+
+.review-asked-subfilter-bar.hidden {
+  display: none !important;
+}
+
+.badge-review-asked-direct {
+  background: rgba(56, 139, 253, 0.16);
+  color: #58a6ff;
+  border: 1px solid rgba(56, 139, 253, 0.38);
+  font-weight: 600;
+}
+
+[data-theme="light"] .badge-review-asked-direct {
+  background: rgba(9, 105, 218, 0.12);
+  color: #0969da;
+  border-color: rgba(9, 105, 218, 0.32);
+}
+
+.badge-review-asked-team {
+  background: rgba(163, 113, 247, 0.15);
+  color: #bc8cff;
+  border: 1px solid rgba(163, 113, 247, 0.34);
+  font-weight: 500;
+}
+
+[data-theme="light"] .badge-review-asked-team {
+  background: rgba(130, 80, 223, 0.11);
+  color: #8250df;
+  border-color: rgba(130, 80, 223, 0.28);
+}
+
 
 
 

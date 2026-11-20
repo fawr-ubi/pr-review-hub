@@ -13,7 +13,8 @@ const state = {
   prs: [],
   uiState: {},
   jobs: [],
-  activeFilter: 'open',
+  activeFilter: localStorage.getItem('prHub.activeFilter') || 'open',
+  reviewAskedScope: localStorage.getItem('prHub.reviewAskedScope') || 'all', // 'all' | 'direct' | 'team'
   activeRepo: 'all',
   activeAuthor: null,
   prSortOrder: localStorage.getItem('prHub.prSortOrder') || 'desc', // 'desc' (newest createdAt first) | 'asc' (oldest createdAt first / FIFO)
@@ -605,20 +606,74 @@ function formatShortFilePath(filePath, startLine = null) {
   return `${short}${startLine ? `:${startLine}` : ''}`;
 }
 
+function isReviewAskedPr(pr, scope = 'all') {
+  if (!pr || pr.isArchived || pr.isDraft || isMyPr(pr)) return false;
+
+  let direct = Boolean(pr.reviewAskedDirect);
+  let team = Boolean(pr.reviewAskedTeam);
+
+  if (pr.isReviewAsked === undefined) {
+    const currentUser = String(state.config?.githubUser || '').trim().toLowerCase();
+    const watchedTeams = new Set(
+      [...(state.config?.githubTeams || []), state.config?.teamProfile]
+        .map((s) => String(s || '').trim().replace(/^[^/]+\//, '').toLowerCase())
+        .filter(Boolean)
+    );
+    const items = Array.isArray(pr.pendingReviewerItems)
+      ? pr.pendingReviewerItems
+      : Array.isArray(pr.pendingReviewers)
+      ? pr.pendingReviewers.map((r) =>
+          typeof r === 'string' ? { login: r, isTeam: false } : r
+        )
+      : [];
+    direct = Boolean(
+      currentUser &&
+        items.some((r) => r && !r.isTeam && String(r.login || '').toLowerCase() === currentUser)
+    );
+    team = Boolean(
+      items.some(
+        (r) =>
+          r &&
+          r.isTeam &&
+          watchedTeams.has(String(r.login || r.name || '').replace(/^[^/]+\//, '').toLowerCase())
+      )
+    );
+  }
+
+  if (scope === 'direct') return direct;
+  if (scope === 'team') return team && !direct;
+  return Boolean(pr.isReviewAsked ?? (direct || team));
+}
+
 function isActionablePr(pr) {
-  if (pr.isArchived || pr.isDraft) return false;
+  if (!pr || pr.isArchived || pr.isDraft) return false;
   const status = String(pr.reviewStatus || '');
   const sync = String(pr.syncStatus || '');
   const summary = String(pr.findingsSummary || '');
-  return (
-    sync === 'NEEDS_REVIEW' ||
-    sync === 'NEEDS_UPDATE' ||
+  const hasSevereFinding =
     status.includes('🔴') ||
     status.includes('🟠') ||
     /request changes|blocker/i.test(status) ||
     summary.includes('🔴') ||
-    summary.includes('🟠')
-  );
+    summary.includes('🟠');
+
+  if (isMyPr(pr)) {
+    return (
+      (Array.isArray(pr.changesRequestedBy) && pr.changesRequestedBy.length > 0) ||
+      pr.ciStatus === 'FAIL' ||
+      pr.mergeable === 'CONFLICTING' ||
+      hasSevereFinding
+    );
+  }
+
+  if (pr.isReviewAsked !== undefined) {
+    return (
+      Boolean(pr.isReviewAsked) ||
+      (Boolean(pr.reviewedByMe) && sync === 'NEEDS_UPDATE')
+    );
+  }
+
+  return sync === 'NEEDS_REVIEW' || sync === 'NEEDS_UPDATE' || hasSevereFinding;
 }
 
 let jobPollTimer = null;
@@ -876,11 +931,33 @@ function isMyPr(pr) {
   return pr.reviewMode === 'Self-Review';
 }
 
+function syncFilterTabsUi() {
+  document.querySelectorAll('#modeFilterTabs .filter-tab').forEach((t) => {
+    t.classList.toggle('active', t.dataset.filter === state.activeFilter);
+  });
+  const subBar = document.getElementById('reviewAskedSubFilterBar');
+  if (subBar) {
+    subBar.classList.toggle('hidden', state.activeFilter !== 'review-asked');
+    subBar.querySelectorAll('[data-asked-scope]').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.askedScope === state.reviewAskedScope);
+    });
+  }
+}
+
 function updateFilterCounts() {
   const openPrs = state.prs.filter((p) => !p.isArchived);
   const nonDraftOpenPrs = openPrs.filter((p) => !p.isDraft);
+  const askedAll = nonDraftOpenPrs.filter((p) => isReviewAskedPr(p, 'all'));
+  const askedDirect = nonDraftOpenPrs.filter((p) => isReviewAskedPr(p, 'direct'));
+  const askedTeam = nonDraftOpenPrs.filter((p) => isReviewAskedPr(p, 'team'));
+  const reviewedOpen = nonDraftOpenPrs.filter((p) => !isMyPr(p) && Boolean(p.reviewedByMe));
+
   document.getElementById('count-open').textContent = nonDraftOpenPrs.length;
+  const reviewAskedEl = document.getElementById('count-review-asked');
+  if (reviewAskedEl) reviewAskedEl.textContent = askedAll.length;
   document.getElementById('count-actionable').textContent = nonDraftOpenPrs.filter(isActionablePr).length;
+  const reviewedEl = document.getElementById('count-reviewed');
+  if (reviewedEl) reviewedEl.textContent = reviewedOpen.length;
   document.getElementById('count-peer').textContent = nonDraftOpenPrs.filter((p) => !isMyPr(p)).length;
   document.getElementById('count-self').textContent = nonDraftOpenPrs.filter((p) => isMyPr(p)).length;
   const draftCountEl = document.getElementById('count-draft');
@@ -888,6 +965,15 @@ function updateFilterCounts() {
     draftCountEl.textContent = openPrs.filter((p) => Boolean(p.isDraft)).length;
   }
   document.getElementById('count-archived').textContent = state.prs.filter((p) => p.isArchived && !p.isDraft).length;
+
+  const cAskedAll = document.getElementById('count-asked-all');
+  const cAskedDirect = document.getElementById('count-asked-direct');
+  const cAskedTeam = document.getElementById('count-asked-team');
+  if (cAskedAll) cAskedAll.textContent = `(${askedAll.length})`;
+  if (cAskedDirect) cAskedDirect.textContent = `(${askedDirect.length})`;
+  if (cAskedTeam) cAskedTeam.textContent = `(${askedTeam.length})`;
+
+  syncFilterTabsUi();
 }
 
 function renderRepoPills() {
@@ -963,7 +1049,16 @@ function getFilteredPrs() {
     } else {
       if (pr.isDraft) return false;
       if (state.activeFilter === 'open' && pr.isArchived) return false;
+      if (
+        state.activeFilter === 'review-asked' &&
+        !isReviewAskedPr(pr, state.reviewAskedScope || 'all')
+      ) {
+        return false;
+      }
       if (state.activeFilter === 'actionable' && !isActionablePr(pr)) return false;
+      if (state.activeFilter === 'reviewed' && (pr.isArchived || isMyPr(pr) || !pr.reviewedByMe)) {
+        return false;
+      }
       if (state.activeFilter === 'peer' && (pr.isArchived || isMyPr(pr))) return false;
       if (state.activeFilter === 'self' && (pr.isArchived || !isMyPr(pr))) return false;
       if (state.activeFilter === 'archived' && !pr.isArchived) return false;
@@ -981,7 +1076,12 @@ function getFilteredPrs() {
       const draftToken = pr.isDraft ? 'draft brouillon' : '';
       const mergeableToken = pr.mergeReadiness?.isMergeable ? 'mergeable prete' : '';
       const myPrToken = isMyPr(pr) ? 'my pr self-review' : 'peer-review';
-      const hay = `${pr.key} ${pr.title} ${pr.author} ${pr.authorDisplayName || ''} ${pr.jiraKey || ''} ${pr.headRefName || ''} ${approvers} ${pending} ${labels} ${owners} ${draftToken} ${mergeableToken} ${myPrToken}`.toLowerCase();
+      const askedToken = isReviewAskedPr(pr, 'all')
+        ? pr.reviewAskedDirect
+          ? 'review asked requested direct @me'
+          : 'review asked requested team'
+        : '';
+      const hay = `${pr.key} ${pr.title} ${pr.author} ${pr.authorDisplayName || ''} ${pr.jiraKey || ''} ${pr.headRefName || ''} ${approvers} ${pending} ${labels} ${owners} ${draftToken} ${mergeableToken} ${myPrToken} ${askedToken}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -1084,6 +1184,11 @@ function renderPrList() {
       const modeBadge = myPr
         ? `<span class="badge badge-my-pr" title="You authored this Pull Request (Self-Review)">👤 My PR</span>`
         : `<span class="badge">Peer-Review</span>`;
+      const reviewAskedBadge = pr.reviewAskedDirect
+        ? `<span class="badge badge-review-asked-direct" title="Your personal review (@${escapeHtml(state.config?.githubUser || 'you')}) was explicitly requested on GitHub">Review asked (@you)</span>`
+        : pr.reviewAskedTeam
+        ? `<span class="badge badge-review-asked-team" title="Team review requested (${escapeHtml((pr.reviewAskedTeams || []).join(', ') || state.config?.teamProfile || 'team')})">Review asked (team)</span>`
+        : '';
       const jiraBadge =
         pr.jiraKey && pr.jiraKey !== '—'
           ? `<span class="badge">Ticket ${escapeHtml(pr.jiraKey)}</span>`
@@ -1190,6 +1295,7 @@ function renderPrList() {
                 <span class="author-full-name">${escapeHtml(authorFullLabel)}</span>
               </span>
               ${modeBadge}
+              ${reviewAskedBadge}
             </div>
             <div class="pr-card-badges">
               ${wtBadge}
@@ -2268,18 +2374,55 @@ function bindClickableBreadcrumbs(rootEl) {
   });
 }
 
+function syncFindingPostedStateInClient(cid, patch = {}) {
+  if (!cid) return;
+  if (patch.posted === true) {
+    state.selectedCommentCids.delete(cid);
+  } else if (patch.posted === false && !patch.dismissed) {
+    state.selectedCommentCids.add(cid);
+  }
+
+  if (Array.isArray(state.currentReview?.findings)) {
+    for (const f of state.currentReview.findings) {
+      if (f.cid === cid) {
+        Object.assign(f, patch);
+      }
+    }
+  }
+
+  if (Array.isArray(state.currentDiff?.resolvedFindings)) {
+    for (const rf of state.currentDiff.resolvedFindings) {
+      if (rf.cid === cid) {
+        Object.assign(rf, patch);
+      }
+    }
+  }
+
+  if (state.selectedPrKey) {
+    for (const k of Object.keys(state.prReviewCache || {})) {
+      if (k.startsWith(`${state.selectedPrKey}::`)) delete state.prReviewCache[k];
+    }
+    for (const k of Object.keys(state.prOverviewCache || {})) {
+      if (k.startsWith(`${state.selectedPrKey}::`)) delete state.prOverviewCache[k];
+    }
+  }
+}
+
 async function saveManualInlineComment({
   cid = null,
   filePath,
   line,
   startLine = null,
   endLine = null,
+  side = 'RIGHT',
   title,
   severity,
   comment,
+  autoSelect = true,
 }) {
   const prKey = state.selectedPrKey;
   if (!prKey || !comment) return null;
+  const normalizedSide = String(side || 'RIGHT').toUpperCase() === 'LEFT' ? 'LEFT' : 'RIGHT';
   const rawStart = Number(startLine ?? line) || 1;
   const rawEnd = Number(endLine ?? line ?? rawStart) || rawStart;
   const startLineNum = Math.max(1, Math.min(rawStart, rawEnd));
@@ -2292,6 +2435,7 @@ async function saveManualInlineComment({
       prKey,
       cid,
       filePath,
+      side: normalizedSide,
       line: endLineNum,
       startLine: startLineNum,
       endLine: endLineNum,
@@ -2315,13 +2459,16 @@ async function saveManualInlineComment({
     findings.push(saved);
   }
   state.currentReview.findings = findings;
-  state.selectedCommentCids.add(saved.cid);
+  if (autoSelect && !saved.posted && !saved.dismissed) {
+    state.selectedCommentCids.add(saved.cid);
+  }
 
   if (state.currentDiff) {
     const resolvedList = state.currentDiff.resolvedFindings || [];
     const resolvedEntry = {
       ...saved,
       resolvedPath: saved.filePath,
+      resolvedSide: normalizedSide,
       resolvedStartLine:
         saved.startLine && saved.endLine && saved.startLine < saved.endLine
           ? saved.startLine
@@ -2375,13 +2522,18 @@ async function deleteManualInlineComment(cid) {
   showToast('Manual comment deleted.');
 }
 
-function highlightSelectedLineRange(tableEl, startLine, endLine) {
+function highlightSelectedLineRange(tableEl, startLine, endLine, side = 'RIGHT') {
   if (!tableEl) return;
   const s = Math.min(Number(startLine) || 0, Number(endLine) || 0);
   const e = Math.max(Number(startLine) || 0, Number(endLine) || 0);
+  const useLeft = String(side || 'RIGHT').toUpperCase() === 'LEFT';
   tableEl.querySelectorAll('tr').forEach((tr) => {
-    const rLine = Number(tr.dataset.rightLine || tr.dataset.blobLine || 0);
-    if (rLine && s > 0 && rLine >= s && rLine <= e) {
+    const lineVal = useLeft
+      ? Number(tr.dataset.leftLine || 0) && !Number(tr.dataset.rightLine || 0)
+        ? Number(tr.dataset.leftLine || 0)
+        : Number(tr.dataset.leftLine || 0)
+      : Number(tr.dataset.rightLine || tr.dataset.blobLine || 0);
+    if (lineVal && s > 0 && lineVal >= s && lineVal <= e) {
       tr.classList.add('comment-range-selected');
     } else {
       tr.classList.remove('comment-range-selected');
@@ -2389,14 +2541,17 @@ function highlightSelectedLineRange(tableEl, startLine, endLine) {
   });
 }
 
-function collectRangeCodeSnippet(tableEl, startLine, endLine) {
+function collectRangeCodeSnippet(tableEl, startLine, endLine, side = 'RIGHT') {
   if (!tableEl) return '';
   const s = Math.min(Number(startLine) || 1, Number(endLine) || 1);
   const e = Math.max(Number(startLine) || 1, Number(endLine) || 1);
+  const useLeft = String(side || 'RIGHT').toUpperCase() === 'LEFT';
   const lines = [];
   tableEl.querySelectorAll('tr').forEach((tr) => {
-    const rLine = Number(tr.dataset.rightLine || tr.dataset.blobLine || 0);
-    if (rLine >= s && rLine <= e) {
+    const lineVal = useLeft
+      ? Number(tr.dataset.leftLine || 0)
+      : Number(tr.dataset.rightLine || tr.dataset.blobLine || 0);
+    if (lineVal >= s && lineVal <= e) {
       const codeCell = tr.querySelector('.diff-line-code, .blob-line-code');
       if (codeCell) lines.push(codeCell.textContent || '');
     }
@@ -2411,6 +2566,7 @@ function openInlineCommentComposer({
   lineNum,
   startLine = null,
   endLine = null,
+  side = 'RIGHT',
   codeSnippet = '',
   existingFinding = null,
   colSpan = 3,
@@ -2419,6 +2575,11 @@ function openInlineCommentComposer({
 
   // Remove any open composer in this table
   tableEl.querySelectorAll('tr.inline-comment-composer-row').forEach((r) => r.remove());
+
+  const effectiveSide =
+    String(existingFinding?.side || existingFinding?.resolvedSide || side || 'RIGHT').toUpperCase() === 'LEFT'
+      ? 'LEFT'
+      : 'RIGHT';
 
   const initStart = Math.max(
     1,
@@ -2435,12 +2596,13 @@ function openInlineCommentComposer({
     )
   );
 
-  highlightSelectedLineRange(tableEl, initStart, initEnd);
+  highlightSelectedLineRange(tableEl, initStart, initEnd, effectiveSide);
 
   const baseName = filePath.split('/').pop() || filePath;
   const initRangeStr = initStart !== initEnd ? `${initStart}-${initEnd}` : `${initEnd}`;
+  const sideLabel = effectiveSide === 'LEFT' ? ' (deleted)' : '';
   const defaultTitle =
-    existingFinding?.title || `Comment on \`${baseName}:${initRangeStr}\``;
+    existingFinding?.title || `Comment on \`${baseName}:${initRangeStr}\`${sideLabel}`;
   const defaultSeverity = existingFinding?.severity || '🟡 Minor';
   const defaultBody = existingFinding?.customComment || '';
 
@@ -2454,7 +2616,7 @@ function openInlineCommentComposer({
             <span id="inlineComposerHeaderLabel">${
               existingFinding
                 ? `Edit ${escapeHtml(existingFinding.id)}`
-                : `New comment on ${escapeHtml(baseName)}:${initRangeStr}`
+                : `New comment on ${escapeHtml(baseName)}:${initRangeStr}${escapeHtml(sideLabel)}`
             }</span>
             <span class="line-range-inputs" title="Select multiple lines with the mouse (drag or Shift+Click on line numbers) or adjust the line range here">
               <label>Start line <input id="inlineComposerStartLine" type="number" min="1" class="line-range-input" value="${initStart}" /></label>
@@ -2473,13 +2635,13 @@ function openInlineCommentComposer({
             <input id="inlineComposerTitle" type="text" class="search-input" style="width:280px;padding:4px 8px;font-size:11.5px;" value="${escapeHtml(defaultTitle)}" placeholder="Short comment title..." />
           </div>
         </div>
-        <textarea id="inlineComposerTextarea" class="finding-textarea" rows="2" placeholder="Write your Markdown comment (or your question for the AI Agent)... Cmd+Enter to save to review.">${escapeHtml(defaultBody)}</textarea>
+        <textarea id="inlineComposerTextarea" class="finding-textarea" rows="2" placeholder="Write your Markdown comment (or your question for the AI Agent)... Cmd+Enter to add to review.">${escapeHtml(defaultBody)}</textarea>
         <div class="inline-comment-composer-actions">
           <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
             <button type="button" id="inlineComposerSaveBtn" class="btn btn-primary btn-xs">
               ${existingFinding ? 'Save changes' : 'Add to review'}
             </button>
-            <button type="button" id="inlineComposerPostNowBtn" class="btn btn-secondary btn-xs" title="Publish this inline comment directly to GitHub">
+            <button type="button" id="inlineComposerPostNowBtn" class="btn btn-cta-submit btn-xs" title="Publish this inline comment immediately to GitHub">
               Post to GitHub
             </button>
             <button type="button" id="inlineComposerAskAiBtn" class="btn btn-ghost btn-xs" title="Open Agent Q&A targeted at this line range">
@@ -2516,16 +2678,18 @@ function openInlineCommentComposer({
 
   const syncRangeUi = () => {
     const { startLine: s, endLine: e, rangeStr } = readCurrentRange();
-    highlightSelectedLineRange(tableEl, s, e);
+    highlightSelectedLineRange(tableEl, s, e, effectiveSide);
     if (!existingFinding && headerLabel) {
-      headerLabel.textContent = `New comment on ${baseName}:${rangeStr}`;
+      headerLabel.textContent = `New comment on ${baseName}:${rangeStr}${sideLabel}`;
     }
     if (
       !existingFinding &&
       titleInput &&
-      /^(?:Comment on|Commentaire sur) `[^`]+:\d+(?:-\d+)?`$/.test(titleInput.value.trim())
+      /^(?:Comment on|Commentaire sur) `[^`]+:\d+(?:-\d+)?`(?:\s*\(deleted\))?$/.test(
+        titleInput.value.trim()
+      )
     ) {
-      titleInput.value = `Comment on \`${baseName}:${rangeStr}\``;
+      titleInput.value = `Comment on \`${baseName}:${rangeStr}\`${sideLabel}`;
     }
   };
 
@@ -2533,7 +2697,7 @@ function openInlineCommentComposer({
   endInput?.addEventListener('input', syncRangeUi);
 
   const closeComposer = () => {
-    highlightSelectedLineRange(tableEl, 0, 0);
+    highlightSelectedLineRange(tableEl, 0, 0, effectiveSide);
     composerRow.remove();
   };
 
@@ -2549,16 +2713,17 @@ function openInlineCommentComposer({
       const saved = await saveManualInlineComment({
         cid: existingFinding?.cid || null,
         filePath,
+        side: effectiveSide,
         line: e,
         startLine: s,
         endLine: e,
-        title: titleInput?.value.trim() || `Comment on \`${baseName}:${rangeStr}\``,
+        title: titleInput?.value.trim() || `Comment on \`${baseName}:${rangeStr}\`${sideLabel}`,
         severity: sevSelect?.value || '🟡 Minor',
         comment: body,
       });
       closeComposer();
       if (state.selectedDiffFile === filePath) {
-        selectDiffFile(filePath, e);
+        selectDiffFile(filePath, effectiveSide === 'RIGHT' ? e : null);
       }
       showToast(`Comment ${saved.id} added to review (${baseName}:${rangeStr}).`);
     } catch (err) {
@@ -2568,36 +2733,85 @@ function openInlineCommentComposer({
 
   composerRow.querySelector('#inlineComposerSaveBtn')?.addEventListener('click', handleSaveToReview);
 
-  composerRow.querySelector('#inlineComposerPostNowBtn')?.addEventListener('click', async () => {
+  const postNowBtn = composerRow.querySelector('#inlineComposerPostNowBtn');
+  postNowBtn?.addEventListener('click', async () => {
     const body = textarea?.value.trim() || '';
     if (!body) {
       showToast('Please enter a comment before publishing to GitHub.');
       textarea?.focus();
       return;
     }
+    const pr = state.prs.find((p) => p.key === state.selectedPrKey);
+    if (!pr) return;
+
     const { startLine: s, endLine: e, rangeStr } = readCurrentRange();
+    postNowBtn.disabled = true;
+    postNowBtn.textContent = 'Posting…';
+
     try {
       const saved = await saveManualInlineComment({
         cid: existingFinding?.cid || null,
         filePath,
+        side: effectiveSide,
         line: e,
         startLine: s,
         endLine: e,
-        title: titleInput?.value.trim() || `Comment on \`${baseName}:${rangeStr}\``,
+        title: titleInput?.value.trim() || `Comment on \`${baseName}:${rangeStr}\`${sideLabel}`,
         severity: sevSelect?.value || '🟡 Minor',
         comment: body,
+        autoSelect: false,
+      });
+
+      const res = await fetch('/api/github/comment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repo: pr.repo,
+          number: pr.number,
+          headSha: pr.headRefOid || pr.lastReviewedSha,
+          commentBody: body,
+          filePath,
+          side: effectiveSide,
+          line: e,
+          startLine: s,
+          endLine: e,
+          mode: 'inline',
+          cid: saved.cid,
+          title: saved.title,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to publish comment to GitHub');
+
+      syncFindingPostedStateInClient(saved.cid, {
+        posted: true,
+        postedBy: data.postedBy || state.config?.githubUser || null,
+        postedUrl: data.githubResponse?.html_url || null,
+        customComment: body,
       });
       closeComposer();
-      openSingleCommentModal(saved, 'inline');
+      renderFindingsTab();
+      renderReportFindingsQuickBar();
+      if (state.selectedDiffFile === filePath) {
+        selectDiffFile(filePath, effectiveSide === 'RIGHT' ? e : null);
+      }
+      loadPrOverview(pr, true);
+      loadState(true);
+      showToast(`Comment ${saved.id} published on GitHub (${baseName}:${rangeStr}).`);
     } catch (err) {
-      showToast(`Error: ${err.message}`, 4000);
+      postNowBtn.disabled = false;
+      postNowBtn.textContent = 'Post to GitHub';
+      if (state.selectedDiffFile === filePath) {
+        // Keep composer open so the user's text is never lost
+      }
+      showToast(`Error: ${err.message}`, 5000);
     }
   });
 
   composerRow.querySelector('#inlineComposerAskAiBtn')?.addEventListener('click', () => {
     const typedQuestion = textarea?.value.trim() || '';
     const { startLine: s, endLine: e, rangeStr } = readCurrentRange();
-    const snippet = collectRangeCodeSnippet(tableEl, s, e) || codeSnippet;
+    const snippet = collectRangeCodeSnippet(tableEl, s, e, effectiveSide) || codeSnippet;
     closeComposer();
     openChatWithFindingContext({
       id: `L${rangeStr}`,
@@ -2642,20 +2856,26 @@ function getSelectedTextLineRange(tableEl) {
   const text = sel.toString().trim();
   if (!text) return null;
 
-  const findRowNum = (node) => {
+  const findRowMeta = (node) => {
     const el = node?.nodeType === 1 ? node : node?.parentElement;
-    if (!el || !tableEl.contains(el)) return 0;
-    const tr = el.closest('tr[data-right-line], tr[data-blob-line]');
-    return Number(tr?.dataset?.rightLine || tr?.dataset?.blobLine || 0);
+    if (!el || !tableEl.contains(el)) return null;
+    const tr = el.closest('tr[data-right-line], tr[data-left-line], tr[data-blob-line]');
+    if (!tr) return null;
+    const rLine = Number(tr.dataset.rightLine || tr.dataset.blobLine || 0);
+    if (rLine > 0) return { line: rLine, side: 'RIGHT' };
+    const lLine = Number(tr.dataset.leftLine || 0);
+    if (lLine > 0) return { line: lLine, side: 'LEFT' };
+    return null;
   };
 
   const range = sel.getRangeAt(0);
-  const startLine = findRowNum(range.startContainer);
-  const endLine = findRowNum(range.endContainer);
-  if (startLine > 0 && endLine > 0) {
+  const startMeta = findRowMeta(range.startContainer);
+  const endMeta = findRowMeta(range.endContainer);
+  if (startMeta && endMeta && startMeta.side === endMeta.side) {
     return {
-      startLine: Math.min(startLine, endLine),
-      endLine: Math.max(startLine, endLine),
+      side: startMeta.side,
+      startLine: Math.min(startMeta.line, endMeta.line),
+      endLine: Math.max(startMeta.line, endMeta.line),
     };
   }
   return null;
@@ -2665,16 +2885,24 @@ function bindMultiLineCommentSelection(tableEl, filePath, colSpan = 3) {
   if (!tableEl || !filePath) return;
   let dragStartLine = null;
   let dragCurrentLine = null;
+  let dragSide = 'RIGHT';
 
-  const findRowByLine = (lineNum) =>
-    tableEl.querySelector(`tr[data-right-line="${lineNum}"], tr[data-blob-line="${lineNum}"]`);
+  const findRowByLine = (lineNum, side = 'RIGHT') => {
+    if (side === 'LEFT') {
+      return (
+        tableEl.querySelector(`tr.diff-row-del[data-left-line="${lineNum}"]`) ||
+        tableEl.querySelector(`tr[data-left-line="${lineNum}"]`)
+      );
+    }
+    return tableEl.querySelector(`tr[data-right-line="${lineNum}"], tr[data-blob-line="${lineNum}"]`);
+  };
 
-  const openForRange = (lineA, lineB) => {
+  const openForRange = (lineA, lineB, side = 'RIGHT') => {
     const startLine = Math.min(lineA, lineB);
     const endLine = Math.max(lineA, lineB);
-    const endRow = findRowByLine(endLine) || findRowByLine(startLine);
+    const endRow = findRowByLine(endLine, side) || findRowByLine(startLine, side);
     if (!endRow) return;
-    const snippet = collectRangeCodeSnippet(tableEl, startLine, endLine);
+    const snippet = collectRangeCodeSnippet(tableEl, startLine, endLine, side);
     openInlineCommentComposer({
       tableEl,
       anchorRow: endRow,
@@ -2682,6 +2910,7 @@ function bindMultiLineCommentSelection(tableEl, filePath, colSpan = 3) {
       lineNum: endLine,
       startLine,
       endLine,
+      side,
       codeSnippet: snippet,
       colSpan,
     });
@@ -2691,6 +2920,7 @@ function bindMultiLineCommentSelection(tableEl, filePath, colSpan = 3) {
     cell.addEventListener('mousedown', (ev) => {
       if (ev.button !== 0) return;
       const lineNum = Number(cell.dataset.commentLine);
+      const cellSide = String(cell.dataset.commentSide || 'RIGHT').toUpperCase() === 'LEFT' ? 'LEFT' : 'RIGHT';
       if (!lineNum) return;
 
       // Prevent native browser text selection so dragging across line numbers or '+' buttons always tracks smoothly
@@ -2701,56 +2931,53 @@ function bindMultiLineCommentSelection(tableEl, filePath, colSpan = 3) {
         ev.shiftKey &&
         state.lineRangeAnchor &&
         state.lineRangeAnchor.filePath === filePath &&
+        state.lineRangeAnchor.side === cellSide &&
         state.lineRangeAnchor.line
       ) {
+        dragSide = cellSide;
         dragStartLine = state.lineRangeAnchor.line;
         dragCurrentLine = lineNum;
         state.isDraggingLineRange = true;
-        highlightSelectedLineRange(tableEl, dragStartLine, dragCurrentLine);
+        highlightSelectedLineRange(tableEl, dragStartLine, dragCurrentLine, dragSide);
         return;
       }
 
       const textSelRange = getSelectedTextLineRange(tableEl);
       if (
         textSelRange &&
+        textSelRange.side === cellSide &&
         textSelRange.endLine > textSelRange.startLine &&
         lineNum >= textSelRange.startLine &&
         lineNum <= textSelRange.endLine
       ) {
+        dragSide = cellSide;
         dragStartLine = textSelRange.startLine;
         dragCurrentLine = textSelRange.endLine;
         state.isDraggingLineRange = true;
-        highlightSelectedLineRange(tableEl, dragStartLine, dragCurrentLine);
+        highlightSelectedLineRange(tableEl, dragStartLine, dragCurrentLine, dragSide);
         return;
       }
 
+      dragSide = cellSide;
       dragStartLine = lineNum;
       dragCurrentLine = lineNum;
       state.isDraggingLineRange = true;
-      highlightSelectedLineRange(tableEl, lineNum, lineNum);
+      highlightSelectedLineRange(tableEl, lineNum, lineNum, dragSide);
     });
   });
 
-  // Track mouse movement across ANY part of the table rows while dragging
+  // Track mouse movement across ANY part of the table rows while dragging on line numbers
   tableEl.addEventListener('mouseover', (ev) => {
     if (!state.isDraggingLineRange || !dragStartLine) return;
-    const row = ev.target?.closest?.('tr[data-right-line], tr[data-blob-line]');
-    const lineNum = Number(row?.dataset?.rightLine || row?.dataset?.blobLine || 0);
+    const row = ev.target?.closest?.('tr[data-right-line], tr[data-left-line], tr[data-blob-line]');
+    if (!row) return;
+    const lineNum =
+      dragSide === 'LEFT'
+        ? Number(row.dataset.leftLine || 0)
+        : Number(row.dataset.rightLine || row.dataset.blobLine || 0);
     if (!lineNum || lineNum === dragCurrentLine) return;
     dragCurrentLine = lineNum;
-    highlightSelectedLineRange(tableEl, dragStartLine, dragCurrentLine);
-  });
-
-  // Also support selecting multiple lines directly in the code column: on mouseup, open composer for the selected lines
-  tableEl.addEventListener('mouseup', () => {
-    if (state.isDraggingLineRange) return;
-    setTimeout(() => {
-      const selRange = getSelectedTextLineRange(tableEl);
-      if (selRange && selRange.endLine > selRange.startLine) {
-        state.lineRangeAnchor = { filePath, line: selRange.startLine };
-        openForRange(selRange.startLine, selRange.endLine);
-      }
-    }, 10);
+    highlightSelectedLineRange(tableEl, dragStartLine, dragCurrentLine, dragSide);
   });
 
   if (_activeLineDragMouseUpHandler) {
@@ -2761,11 +2988,12 @@ function bindMultiLineCommentSelection(tableEl, filePath, colSpan = 3) {
     if (!state.isDraggingLineRange || !dragStartLine) return;
     const s = dragStartLine;
     const e = dragCurrentLine || dragStartLine;
+    const side = dragSide;
     state.isDraggingLineRange = false;
     dragStartLine = null;
     dragCurrentLine = null;
-    state.lineRangeAnchor = { filePath, line: Math.min(s, e) };
-    openForRange(s, e);
+    state.lineRangeAnchor = { filePath, line: Math.min(s, e), side };
+    openForRange(s, e, side);
   };
 
   window.addEventListener('mouseup', _activeLineDragMouseUpHandler);
@@ -2821,17 +3049,41 @@ window.addEventListener('resize', () => {
   requestAnimationFrame(() => autoResizeAllFindingTextareas());
 });
 
+function syncBatchSelectionSummaryUi(findings = state.currentReview?.findings || []) {
+  for (const f of findings) {
+    if ((f.posted || f.dismissed) && state.selectedCommentCids.has(f.cid)) {
+      state.selectedCommentCids.delete(f.cid);
+    }
+  }
+  const eligible = findings.filter((f) => !f.posted && !f.dismissed);
+  const selectedEligibleCount = eligible.filter((f) => state.selectedCommentCids.has(f.cid)).length;
+  const postedCount = findings.filter((f) => f.posted).length;
+  const dismissedCount = findings.filter((f) => f.dismissed).length;
+
+  const selectAllCb = document.getElementById('selectAllCommentsCheckbox');
+  if (selectAllCb) {
+    selectAllCb.disabled = eligible.length === 0;
+    selectAllCb.checked = eligible.length > 0 && selectedEligibleCount === eligible.length;
+    selectAllCb.indeterminate =
+      selectedEligibleCount > 0 && selectedEligibleCount < eligible.length;
+  }
+
+  const statsEl = document.getElementById('commentsSummaryStats');
+  if (statsEl) {
+    statsEl.textContent =
+      `${postedCount}/${findings.length} posted` +
+      (eligible.length > 0 ? ` · ${selectedEligibleCount}/${eligible.length} to post` : '') +
+      (dismissedCount > 0 ? ` · ${dismissedCount} false positive(s)` : '') +
+      (state.activeDomainFilter ? ` · Filtered: ${state.activeDomainFilter}` : '');
+  }
+}
+
 function renderFindingsTab() {
   const findings = state.currentReview?.findings || [];
   document.getElementById('tabFindingsCount').textContent = findings.length;
   const listEl = document.getElementById('findingsList');
 
-  const postedCount = findings.filter((f) => f.posted).length;
-  const dismissedCount = findings.filter((f) => f.dismissed).length;
-  document.getElementById('commentsSummaryStats').textContent =
-    `${postedCount}/${findings.length} posted` +
-    (dismissedCount > 0 ? ` · ${dismissedCount} false positive(s)` : '') +
-    (state.activeDomainFilter ? ` · Filtered: ${state.activeDomainFilter}` : '');
+  syncBatchSelectionSummaryUi(findings);
 
   const activeFilterBanner = state.activeDomainFilter
     ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;margin-bottom:10px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--accent, #6366f1);">
@@ -2898,8 +3150,15 @@ function renderFindingsTab() {
                 type="checkbox"
                 class="finding-select-cb"
                 data-cid="${escapeHtml(f.cid)}"
-                ${isSelected ? 'checked' : ''}
-                title="Include in batch review submission"
+                ${isSelected && !f.posted && !f.dismissed ? 'checked' : ''}
+                ${f.posted || f.dismissed ? 'disabled' : ''}
+                title="${
+                  f.posted
+                    ? 'Already posted on GitHub — automatically excluded from batch PR review (uncheck Posted to re-include)'
+                    : f.dismissed
+                    ? 'Dismissed as False Positive — excluded from batch PR review'
+                    : 'Include in batch review submission'
+                }"
               />
               <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
               ${domainId ? `<span class="domain-pill domain-pill-${escapeHtml(domainId)}" title="Domain Agent: ${escapeHtml(domainId)}">${escapeHtml(domainId)}</span>` : ''}
@@ -2915,10 +3174,15 @@ function renderFindingsTab() {
                   ? `${renderClickableBreadcrumbsHtml(f.filePath, f.startLine, 'finding', f.endLine)}`
                   : `<span class="meta-text">${escapeHtml(fullLocation)}</span>`
               }
-              <label class="checkbox-label">
+              <label class="checkbox-label" title="Mark as already posted on GitHub (excludes it from batch PR review)">
                 <input type="checkbox" class="finding-posted-cb" data-cid="${escapeHtml(f.cid)}" ${f.posted ? 'checked' : ''} />
                 <span>Posted${f.posted && f.postedBy ? ` (@${escapeHtml(f.postedBy)})` : ''}</span>
               </label>
+              ${
+                f.posted && f.postedUrl
+                  ? `<a href="${escapeHtml(f.postedUrl)}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs" title="View posted comment on GitHub">GitHub &nearr;</a>`
+                  : ''
+              }
             </div>
           </div>
 
@@ -2955,12 +3219,12 @@ function renderFindingsTab() {
                     ? `<button class="btn btn-diff-jump btn-sm view-diff-finding-btn" data-path="${escapeHtml(f.filePath)}" data-line="${f.startLine || ''}">
                         View in Diff
                       </button>
-                      <button class="btn btn-cta-submit btn-sm post-inline-btn" data-idx="${idx}">
-                        Post to GitHub
+                      <button class="btn ${f.posted ? 'btn-secondary' : 'btn-cta-submit'} btn-sm post-inline-btn" data-idx="${idx}">
+                        ${f.posted ? 'Posted ✓ (Repost)' : 'Post to GitHub'}
                       </button>`
                     : ''
                 }
-                <button class="btn ${f.filePath ? 'btn-secondary' : 'btn-cta-submit'} btn-sm post-general-btn" data-idx="${idx}">
+                <button class="btn ${f.filePath || f.posted ? 'btn-secondary' : 'btn-cta-submit'} btn-sm post-general-btn" data-idx="${idx}">
                   Post general
                 </button>
               </div>
@@ -2983,6 +3247,7 @@ function renderFindingsTab() {
     cb.addEventListener('change', () => {
       if (cb.checked) state.selectedCommentCids.add(cb.dataset.cid);
       else state.selectedCommentCids.delete(cb.dataset.cid);
+      syncBatchSelectionSummaryUi(findings);
     });
   });
 
@@ -2990,13 +3255,25 @@ function renderFindingsTab() {
     cb.addEventListener('change', async () => {
       const cid = cb.dataset.cid;
       const finding = findings.find((x) => x.cid === cid);
-      if (finding) finding.posted = cb.checked;
+      syncFindingPostedStateInClient(cid, {
+        posted: cb.checked,
+        postedBy: cb.checked ? state.config?.githubUser || null : null,
+      });
       await fetch('/api/ui-state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cid, posted: cb.checked }),
+        body: JSON.stringify({
+          cid,
+          posted: cb.checked,
+          filePath: finding?.filePath || '',
+          title: finding?.title || '',
+        }),
       });
       renderFindingsTab();
+      renderReportFindingsQuickBar();
+      if (state.selectedDiffFile && finding?.filePath === state.selectedDiffFile) {
+        selectDiffFile(state.selectedDiffFile, state.highlightedLine);
+      }
       loadState(true);
     });
   });
@@ -3008,13 +3285,18 @@ function renderFindingsTab() {
       autoResizeFindingTextarea(ta);
       const cid = ta.dataset.cid;
       const finding = findings.find((x) => x.cid === cid);
-      if (finding) finding.customComment = ta.value;
+      syncFindingPostedStateInClient(cid, { customComment: ta.value });
       clearTimeout(saveTimer);
       saveTimer = setTimeout(() => {
         fetch('/api/ui-state', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cid, customComment: ta.value }),
+          body: JSON.stringify({
+            cid,
+            customComment: ta.value,
+            filePath: finding?.filePath || '',
+            title: finding?.title || '',
+          }),
         });
       }, 450);
     });
@@ -3200,7 +3482,234 @@ function renderFindingFileButtonInnerHtml(filePath, startLine = null) {
   return `${dir ? `<span class="finding-file-dir">${escapeHtml(dir)}</span>` : ''}<span class="finding-file-basename">${escapeHtml(base + lineStr)}</span>`;
 }
 
-function highlightDiffCodeLine(codeText, filename = state.selectedDiffFile) {
+function computeIntraLineDiffRangesClient(oldCode, newCode) {
+  const a = String(oldCode ?? '');
+  const b = String(newCode ?? '');
+  if (a === b || (!a.trim() && !b.trim())) {
+    return { highlight: false, delRanges: [], addRanges: [] };
+  }
+
+  const tokenize = (str) => {
+    const out = [];
+    const re = /[A-Za-z0-9_]+|\s+|./gs;
+    let m;
+    while ((m = re.exec(str)) !== null) {
+      out.push({ text: m[0], start: m.index, end: m.index + m[0].length });
+    }
+    return out;
+  };
+
+  const tokA = tokenize(a);
+  const tokB = tokenize(b);
+
+  let prefixCount = 0;
+  const minLen = Math.min(tokA.length, tokB.length);
+  while (prefixCount < minLen && tokA[prefixCount].text === tokB[prefixCount].text) {
+    prefixCount++;
+  }
+
+  let suffixCount = 0;
+  while (
+    suffixCount < minLen - prefixCount &&
+    tokA[tokA.length - 1 - suffixCount].text === tokB[tokB.length - 1 - suffixCount].text
+  ) {
+    suffixCount++;
+  }
+
+  const midA = tokA.slice(prefixCount, tokA.length - suffixCount);
+  const midB = tokB.slice(prefixCount, tokB.length - suffixCount);
+
+  if (midA.length * midB.length > 16000) {
+    const delStart = midA.length > 0 ? midA[0].start : 0;
+    const delEnd = midA.length > 0 ? midA[midA.length - 1].end : 0;
+    const addStart = midB.length > 0 ? midB[0].start : 0;
+    const addEnd = midB.length > 0 ? midB[midB.length - 1].end : 0;
+    const unchangedChars =
+      (prefixCount > 0 ? tokA[prefixCount - 1].end : 0) +
+      (suffixCount > 0 ? a.length - tokA[tokA.length - suffixCount].start : 0);
+    if (unchangedChars === 0) {
+      return { highlight: false, delRanges: [], addRanges: [] };
+    }
+    return {
+      highlight: true,
+      delRanges: delEnd > delStart ? [[delStart, delEnd]] : [],
+      addRanges: addEnd > addStart ? [[addStart, addEnd]] : [],
+    };
+  }
+
+  const n = midA.length;
+  const m = midB.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      if (midA[i].text === midB[j].text) {
+        dp[i][j] = dp[i + 1][j + 1] + 1;
+      } else {
+        dp[i][j] = dp[i + 1][j] >= dp[i][j + 1] ? dp[i + 1][j] : dp[i][j + 1];
+      }
+    }
+  }
+
+  const keepA = new Uint8Array(tokA.length);
+  const keepB = new Uint8Array(tokB.length);
+  for (let k = 0; k < prefixCount; k++) {
+    keepA[k] = 1;
+    keepB[k] = 1;
+  }
+  for (let k = 0; k < suffixCount; k++) {
+    keepA[tokA.length - 1 - k] = 1;
+    keepB[tokB.length - 1 - k] = 1;
+  }
+
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (midA[i].text === midB[j].text) {
+      keepA[prefixCount + i] = 1;
+      keepB[prefixCount + j] = 1;
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      i++;
+    } else {
+      j++;
+    }
+  }
+
+  let sharedNonWsChars = 0;
+  for (let k = 0; k < tokA.length; k++) {
+    if (keepA[k] && tokA[k].text.trim()) {
+      sharedNonWsChars += tokA[k].text.length;
+    }
+  }
+  const totalNonWsChars = Math.max(a.replace(/\s+/g, '').length, b.replace(/\s+/g, '').length, 1);
+
+  const toMergedRanges = (tokens, keepFlags) => {
+    const raw = [];
+    for (let k = 0; k < tokens.length; k++) {
+      if (!keepFlags[k]) {
+        if (raw.length > 0 && raw[raw.length - 1][1] === tokens[k].start) {
+          raw[raw.length - 1][1] = tokens[k].end;
+        } else {
+          raw.push([tokens[k].start, tokens[k].end]);
+        }
+      }
+    }
+    const coalesced = [];
+    for (const r of raw) {
+      if (coalesced.length > 0) {
+        const prev = coalesced[coalesced.length - 1];
+        const gapLen = r[0] - prev[1];
+        if (gapLen > 0 && gapLen <= 2) {
+          prev[1] = r[1];
+          continue;
+        }
+      }
+      coalesced.push([...r]);
+    }
+    return coalesced;
+  };
+
+  let delRanges = toMergedRanges(tokA, keepA);
+  let addRanges = toMergedRanges(tokB, keepB);
+
+  if (delRanges.length === 1 && addRanges.length === 1) {
+    let [ds, de] = delRanges[0];
+    let [as, ae] = addRanges[0];
+    while (ds < de && as < ae && a[ds] === b[as]) {
+      ds++;
+      as++;
+      sharedNonWsChars++;
+    }
+    while (de > ds && ae > as && a[de - 1] === b[ae - 1]) {
+      de--;
+      ae--;
+      sharedNonWsChars++;
+    }
+    delRanges = de > ds ? [[ds, de]] : [];
+    addRanges = ae > as ? [[as, ae]] : [];
+  }
+
+  if (sharedNonWsChars === 0 || sharedNonWsChars / totalNonWsChars < 0.18) {
+    return { highlight: false, delRanges: [], addRanges: [] };
+  }
+
+  return {
+    highlight: delRanges.length > 0 || addRanges.length > 0,
+    delRanges,
+    addRanges,
+  };
+}
+
+function injectIntraLineMarksIntoHtml(highlightedHtml, ranges, markClass) {
+  if (!highlightedHtml || !Array.isArray(ranges) || ranges.length === 0 || !markClass) {
+    return highlightedHtml;
+  }
+
+  const isCharMarked = (idx) => {
+    for (let r = 0; r < ranges.length; r++) {
+      if (idx >= ranges[r][0] && idx < ranges[r][1]) return true;
+    }
+    return false;
+  };
+
+  let out = '';
+  let charIdx = 0;
+  let markOpen = false;
+  let pos = 0;
+  const len = highlightedHtml.length;
+
+  while (pos < len) {
+    const ch = highlightedHtml[pos];
+    if (ch === '<') {
+      const tagEnd = highlightedHtml.indexOf('>', pos);
+      if (tagEnd >= 0) {
+        if (markOpen) {
+          out += '</mark>';
+          markOpen = false;
+        }
+        out += highlightedHtml.slice(pos, tagEnd + 1);
+        pos = tagEnd + 1;
+        continue;
+      }
+    }
+
+    const wantMark = isCharMarked(charIdx);
+    if (wantMark && !markOpen) {
+      out += `<mark class="${markClass}">`;
+      markOpen = true;
+    } else if (!wantMark && markOpen) {
+      out += '</mark>';
+      markOpen = false;
+    }
+
+    if (ch === '&') {
+      const semi = highlightedHtml.indexOf(';', pos);
+      if (semi > pos && semi - pos <= 10) {
+        out += highlightedHtml.slice(pos, semi + 1);
+        pos = semi + 1;
+        charIdx++;
+        continue;
+      }
+    }
+
+    out += ch;
+    pos++;
+    charIdx++;
+  }
+
+  if (markOpen) {
+    out += '</mark>';
+  }
+  return out;
+}
+
+function highlightDiffCodeLine(
+  codeText,
+  filename = state.selectedDiffFile,
+  intraRanges = null,
+  intraClass = ''
+) {
   const raw = String(codeText ?? '');
   if (!raw) return '<span class="diff-line-prefix"> </span><span class="diff-line-syntax"></span>';
   const firstChar = raw.charAt(0);
@@ -3225,6 +3734,9 @@ function highlightDiffCodeLine(codeText, filename = state.selectedDiffFile) {
     } catch {
       highlighted = escapeHtml(body);
     }
+  }
+  if (Array.isArray(intraRanges) && intraRanges.length > 0 && intraClass) {
+    highlighted = injectIntraLineMarksIntoHtml(highlighted, intraRanges, intraClass);
   }
   return `<span class="diff-line-prefix">${escapeHtml(prefix)}</span><span class="diff-line-syntax">${highlighted}</span>`;
 }
@@ -3586,6 +4098,7 @@ function selectDiffFile(filename, highlightLine = null) {
           lineNum: Number(f.resolvedLine || f.endLine || f.startLine || 1),
           startLine: Number(f.startLine || f.resolvedLine || 1),
           endLine: Number(f.endLine || f.resolvedLine || f.startLine || 1),
+          side: f.side || f.resolvedSide || 'RIGHT',
           existingFinding: f,
           colSpan: 3,
         });
@@ -3846,6 +4359,85 @@ async function toggleExpandAllDiffContext(filename) {
   }
 }
 
+function annotateIntraLineDiffOnHunkRows(rows) {
+  if (!Array.isArray(rows) || rows.length < 2) return;
+  let idx = 0;
+  while (idx < rows.length) {
+    if (rows[idx].type !== 'del') {
+      idx++;
+      continue;
+    }
+    const delStart = idx;
+    while (idx < rows.length && rows[idx].type === 'del') {
+      idx++;
+    }
+    const delEnd = idx;
+    const addStart = idx;
+    while (idx < rows.length && rows[idx].type === 'add') {
+      idx++;
+    }
+    const addEnd = idx;
+    const delCount = delEnd - delStart;
+    const addCount = addEnd - addStart;
+
+    if (delCount > 0 && addCount > 0 && delCount <= 8 && addCount <= 8) {
+      if (delCount === addCount) {
+        for (let k = 0; k < delCount; k++) {
+          const delRow = rows[delStart + k];
+          const addRow = rows[addStart + k];
+          const oldBody = String(delRow.rawLine || '').slice(1);
+          const newBody = String(addRow.rawLine || '').slice(1);
+          const res = computeIntraLineDiffRangesClient(oldBody, newBody);
+          if (res.highlight) {
+            delRow.intraRanges = res.delRanges;
+            delRow.intraClass = 'diff-intraline-del';
+            addRow.intraRanges = res.addRanges;
+            addRow.intraClass = 'diff-intraline-add';
+          }
+        }
+      } else {
+        // Asymmetric hunk (e.g. 2 deleted lines + 1 modified added line): greedily pair highest-similarity lines in order
+        const candidates = [];
+        for (let di = 0; di < delCount; di++) {
+          const oldBody = String(rows[delStart + di].rawLine || '').slice(1);
+          for (let ai = 0; ai < addCount; ai++) {
+            const newBody = String(rows[addStart + ai].rawLine || '').slice(1);
+            const res = computeIntraLineDiffRangesClient(oldBody, newBody);
+            if (!res.highlight) continue;
+            const changedDelLen = res.delRanges.reduce((s, [a, b]) => s + (b - a), 0);
+            const changedAddLen = res.addRanges.reduce((s, [a, b]) => s + (b - a), 0);
+            const maxLen = Math.max(oldBody.length, newBody.length, 1);
+            const similarity = 1 - Math.max(changedDelLen, changedAddLen) / maxLen;
+            if (similarity >= 0.45) {
+              candidates.push({ di, ai, similarity, res });
+            }
+          }
+        }
+        candidates.sort((a, b) => b.similarity - a.similarity);
+        const matchedPairs = [];
+        for (const cand of candidates) {
+          const crossesOrDuplicates = matchedPairs.some(
+            (p) =>
+              p.di === cand.di ||
+              p.ai === cand.ai ||
+              (p.di < cand.di && p.ai > cand.ai) ||
+              (p.di > cand.di && p.ai < cand.ai)
+          );
+          if (!crossesOrDuplicates) {
+            matchedPairs.push(cand);
+            const delRow = rows[delStart + cand.di];
+            const addRow = rows[addStart + cand.ai];
+            delRow.intraRanges = cand.res.delRanges;
+            delRow.intraClass = 'diff-intraline-del';
+            addRow.intraRanges = cand.res.addRanges;
+            addRow.intraClass = 'diff-intraline-add';
+          }
+        }
+      }
+    }
+  }
+}
+
 function parsePatchIntoHunks(patch) {
   const lines = String(patch || '').split('\n');
   const hunks = [];
@@ -3854,7 +4446,10 @@ function parsePatchIntoHunks(patch) {
   for (const rawLine of lines) {
     const hunkMatch = rawLine.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
     if (hunkMatch) {
-      if (current) hunks.push(current);
+      if (current) {
+        annotateIntraLineDiffOnHunkRows(current.rows);
+        hunks.push(current);
+      }
       const startLeft = Number(hunkMatch[1]);
       const startRight = Number(hunkMatch[3]);
       current = {
@@ -3898,8 +4493,21 @@ function parsePatchIntoHunks(patch) {
       });
     }
   }
-  if (current) hunks.push(current);
+  if (current) {
+    annotateIntraLineDiffOnHunkRows(current.rows);
+    hunks.push(current);
+  }
   return hunks;
+}
+
+function normalizeBodyForInlineDedup(raw = '') {
+  return String(raw || '')
+    .replace(/`{3,}[a-z0-9_-]*\r?\n?/gi, ' ')
+    .replace(/`{3,}/g, ' ')
+    .replace(/[`*_>#~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 }
 
 function renderDiffLineAndFindingsHtml({
@@ -3907,6 +4515,8 @@ function renderDiffLineAndFindingsHtml({
   lNum,
   rNum,
   codeText,
+  intraRanges = null,
+  intraClass = '',
   fileFindings,
   fileThreads = [],
   highlightLine,
@@ -3914,39 +4524,93 @@ function renderDiffLineAndFindingsHtml({
 }) {
   const isHighlighted = highlightLine && rNum && Number(rNum) === Number(highlightLine);
   const finalClass = `${rowClass}${isHighlighted ? ' diff-row-highlight' : ''}`.trim();
+  const isDeletedOnly = !rNum && Boolean(lNum);
+
+  const leftCellHtml = isDeletedOnly
+    ? `<td class="diff-line-num commentable-line" data-comment-line="${lNum}" data-comment-side="LEFT" title="Click or drag to write a comment on deleted line ${lNum}"><button type="button" class="diff-line-add-btn" tabindex="-1">+</button>${lNum}</td>`
+    : `<td class="diff-line-num">${lNum}</td>`;
+
   const rightCellHtml = rNum
-    ? `<td class="diff-line-num commentable-line" data-comment-line="${rNum}" title="Click or drag to write a comment on line ${rNum}"><button type="button" class="diff-line-add-btn" tabindex="-1">+</button>${rNum}</td>`
+    ? `<td class="diff-line-num commentable-line" data-comment-line="${rNum}" data-comment-side="RIGHT" title="Click or drag to write a comment on line ${rNum}"><button type="button" class="diff-line-add-btn" tabindex="-1">+</button>${rNum}</td>`
     : `<td class="diff-line-num"></td>`;
+
+  const trAttrs = [
+    rNum ? `data-right-line="${rNum}"` : '',
+    lNum ? `data-left-line="${lNum}"` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
   const out = [
-    `<tr class="${finalClass}" ${rNum ? `data-right-line="${rNum}"` : ''}><td class="diff-line-num">${lNum}</td>${rightCellHtml}<td class="diff-line-code">${highlightDiffCodeLine(codeText, filename)}</td></tr>`,
+    `<tr class="${finalClass}" ${trAttrs}>${leftCellHtml}${rightCellHtml}<td class="diff-line-code">${highlightDiffCodeLine(codeText, filename, intraRanges, intraClass)}</td></tr>`,
   ];
 
-  if (rNum) {
-    const matchingFindings = fileFindings.filter((f) => Number(f.resolvedLine) === Number(rNum));
+  const activeSide = isDeletedOnly ? 'LEFT' : 'RIGHT';
+  const activeLineNum = isDeletedOnly ? Number(lNum) : Number(rNum);
+
+  if (activeLineNum) {
+    const matchingThreads = (fileThreads || []).filter((t) => {
+      const tSide = String(t.diffSide || 'RIGHT').toUpperCase() === 'LEFT' ? 'LEFT' : 'RIGHT';
+      if (tSide !== activeSide) return false;
+      return Number(t.line || t.startLine || 0) === activeLineNum;
+    });
+
+    const threadNormBodies = new Set();
+    for (const t of matchingThreads) {
+      for (const c of t.comments || []) {
+        const nb = normalizeBodyForInlineDedup(c.body);
+        if (nb) threadNormBodies.add(nb);
+      }
+    }
+
+    const matchingFindings = fileFindings.filter((f) => {
+      const fSide =
+        String(f.resolvedSide || f.side || 'RIGHT').toUpperCase() === 'LEFT' ? 'LEFT' : 'RIGHT';
+      return fSide === activeSide && Number(f.resolvedLine) === activeLineNum;
+    });
+
     for (const mf of matchingFindings) {
+      // If this finding is already posted AND its live GitHub thread is already rendered right below, skip the duplicate local box
+      if (mf.posted) {
+        const normMf = normalizeBodyForInlineDedup(mf.customComment || mf.comment);
+        if (normMf && threadNormBodies.has(normMf)) {
+          continue;
+        }
+      }
+
       const sev = getSeverityMeta(mf.severity);
       const rangeBadgeHtml =
         mf.startLine && mf.endLine && Number(mf.endLine) > Number(mf.startLine)
           ? `<span class="badge" title="Multi-line comment (L${mf.startLine} to L${mf.endLine})">L${mf.startLine}&ndash;L${mf.endLine}</span>`
-          : `<span class="badge">L${rNum}</span>`;
+          : `<span class="badge">L${activeLineNum}${activeSide === 'LEFT' ? ' (del)' : ''}</span>`;
+      const actionRightHtml = mf.posted
+        ? `<span class="badge badge-pass">Posted${mf.postedBy ? ` · @${escapeHtml(mf.postedBy)}` : ''}</span>${
+            mf.postedUrl
+              ? `<a href="${escapeHtml(mf.postedUrl)}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs">GitHub &nearr;</a>`
+              : ''
+          }`
+        : `<button class="btn btn-primary btn-xs diff-post-finding-btn" data-cid="${escapeHtml(mf.cid)}">Post here</button>`;
+
       out.push(`
         <tr>
-          <td colspan="3" class="diff-inline-finding">
+          <td colspan="3" class="diff-inline-finding ${mf.posted ? 'posted' : ''}">
             <div class="diff-inline-finding-header">
               <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
                 <span class="badge ${sev.badgeClass}">${escapeHtml(sev.label)}</span>
                 ${rangeBadgeHtml}
                 <strong>${escapeHtml(mf.id)} — ${formatInlineCodeHtml(mf.title)}</strong>
               </div>
-              <div style="display:flex;gap:4px;flex-wrap:wrap;">
+              <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
                 ${
-                  mf.isManual
+                  mf.isManual && !mf.posted
                     ? `<button class="btn btn-ghost btn-xs diff-edit-manual-finding-btn" data-cid="${escapeHtml(mf.cid)}">Edit</button>
                        <button class="btn btn-ghost btn-xs diff-delete-manual-finding-btn" data-cid="${escapeHtml(mf.cid)}">Delete</button>`
+                    : mf.isManual
+                    ? `<button class="btn btn-ghost btn-xs diff-delete-manual-finding-btn" data-cid="${escapeHtml(mf.cid)}">Remove local copy</button>`
                     : ''
                 }
                 <button class="btn btn-secondary btn-xs diff-copy-finding-btn" data-cid="${escapeHtml(mf.cid)}">Copy</button>
-                <button class="btn btn-primary btn-xs diff-post-finding-btn" data-cid="${escapeHtml(mf.cid)}">Post here</button>
+                ${actionRightHtml}
               </div>
             </div>
             <pre class="diff-inline-finding-body">${escapeHtml(mf.customComment)}</pre>
@@ -3955,9 +4619,6 @@ function renderDiffLineAndFindingsHtml({
       `);
     }
 
-    const matchingThreads = (fileThreads || []).filter(
-      (t) => Number(t.line || t.startLine || 0) === Number(rNum)
-    );
     for (const thread of matchingThreads) {
       out.push(`
         <tr>
@@ -4138,6 +4799,8 @@ function renderPatchTableRows(
           lNum: r.leftNum,
           rNum: r.rightNum,
           codeText: r.rawLine,
+          intraRanges: r.intraRanges || null,
+          intraClass: r.intraClass || '',
           fileFindings,
           fileThreads,
           highlightLine,
@@ -4471,7 +5134,8 @@ async function toggleGitHubThreadResolution(threadId, resolve) {
 
 async function submitGeneralPrCommentFromOverview(body) {
   const pr = state.prs.find((p) => p.key === state.selectedPrKey);
-  if (!pr || !body) return false;
+  const cleanBody = String(body || '').trim();
+  if (!pr || !cleanBody) return false;
   try {
     const res = await fetch('/api/github/comment', {
       method: 'POST',
@@ -4480,17 +5144,111 @@ async function submitGeneralPrCommentFromOverview(body) {
         repo: pr.repo,
         number: pr.number,
         mode: 'general',
-        body,
+        commentBody: cleanBody,
+        body: cleanBody,
       }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'GitHub comment publish error');
     showToast('General comment published on PR.');
     await loadPrOverview(pr, true);
+    loadState(true);
     return true;
   } catch (err) {
     showToast(`Error: ${err.message}`, 4500);
     return false;
+  }
+}
+
+function reconcileClientFindingsWithOverview(overviewData) {
+  const findings = state.currentReview?.findings;
+  if (!overviewData || !Array.isArray(findings) || findings.length === 0) return;
+
+  const ghItems = [];
+  for (const t of overviewData.reviewThreads || []) {
+    for (const c of t?.comments || []) {
+      const norm = normalizeBodyForInlineDedup(c?.body);
+      if (norm.length >= 12) {
+        ghItems.push({
+          norm,
+          path: String(t.path || '').replace(/^\/+/, ''),
+          authorLogin: c.authorLogin || '',
+          url: c.url || null,
+          isInline: true,
+        });
+      }
+    }
+  }
+  for (const c of overviewData.generalComments || []) {
+    const norm = normalizeBodyForInlineDedup(c?.body);
+    if (norm.length >= 12) {
+      ghItems.push({
+        norm,
+        path: '',
+        authorLogin: c.authorLogin || '',
+        url: c.url || null,
+        isInline: false,
+      });
+    }
+  }
+  if (ghItems.length === 0) return;
+
+  const meLower = String(state.config?.githubUser || '').trim().toLowerCase();
+  let changed = false;
+
+  for (const f of findings) {
+    if (!f || f.posted || f.dismissed) continue;
+    const cands = [
+      normalizeBodyForInlineDedup(f.customComment || ''),
+      normalizeBodyForInlineDedup(f.comment || ''),
+    ].filter((s) => s.length >= 12);
+    if (cands.length === 0) continue;
+
+    const fPath = String(f.filePath || '').replace(/^\/+/, '');
+    const hit = ghItems.find((gh) => {
+      if (cands.some((cand) => gh.norm === cand)) return true;
+      const overlap = cands.some(
+        (cand) =>
+          cand.length >= 28 &&
+          gh.norm.length >= 28 &&
+          (gh.norm.includes(cand) || cand.includes(gh.norm))
+      );
+      if (!overlap) return false;
+      if (!fPath || !gh.isInline) {
+        return !meLower || String(gh.authorLogin || '').toLowerCase() === meLower;
+      }
+      return (
+        gh.path === fPath ||
+        gh.path.endsWith('/' + fPath) ||
+        fPath.endsWith('/' + gh.path)
+      );
+    });
+
+    if (hit) {
+      syncFindingPostedStateInClient(f.cid, {
+        posted: true,
+        postedBy: hit.authorLogin || state.config?.githubUser || 'github',
+        postedUrl: hit.url || f.postedUrl || null,
+      });
+      changed = true;
+      fetch('/api/ui-state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cid: f.cid,
+          posted: true,
+          postedUrl: hit.url || '',
+          filePath: f.filePath || '',
+          title: f.title || '',
+        }),
+      }).catch(() => {});
+    }
+  }
+
+  if (changed) {
+    renderFindingsTab();
+    renderReportFindingsQuickBar();
+    loadState(true);
   }
 }
 
@@ -4502,6 +5260,7 @@ async function loadPrOverview(pr, forceRefresh = false) {
   const applyOverviewData = (data) => {
     if (state.selectedPrKey !== pr.key) return;
     state.currentOverview = data;
+    reconcileClientFindingsWithOverview(data);
 
     // Update tab badges
     const commitsBadge = document.getElementById('tabOverviewCommitsCount');
@@ -5502,6 +6261,22 @@ async function promptAddRuleFromFinding(finding) {
 // =============================================================================
 // Modals for explicit GitHub publishing
 // =============================================================================
+function checkOversizedSuggestionSpan(body, startLine, endLine) {
+  const sugMatch = String(body || '').match(/`{3,}suggestion[^\r\n]*\r?\n([\s\S]*?)\r?\n`{3,}/i);
+  if (!sugMatch) return { hasSuggestion: false, oversizedRange: false, suggestionLines: 0 };
+  const suggestionLines = sugMatch[1] === '' ? 0 : sugMatch[1].split(/\r?\n/).length;
+  const s = Number(startLine) || 0;
+  const e = Number(endLine) || s;
+  const spanLines = s > 0 && e >= s ? e - s + 1 : 1;
+  const maxSafeSpan = Math.max(6, suggestionLines * 3 + 2);
+  return {
+    hasSuggestion: true,
+    suggestionLines,
+    spanLines,
+    oversizedRange: s > 0 && e > s && spanLines > maxSafeSpan,
+  };
+}
+
 function openSingleCommentModal(finding, mode) {
   const pr = state.prs.find((p) => p.key === state.selectedPrKey);
   if (!pr) return;
@@ -5517,34 +6292,85 @@ function openSingleCommentModal(finding, mode) {
       : `Publish general comment (${pr.repo}#${pr.number})`;
   confirmBtn.textContent = 'Confirm';
 
-  const targetLineRangeLabel =
-    finding.startLine && finding.endLine && Number(finding.endLine) > Number(finding.startLine)
-      ? `${finding.filePath}:${finding.startLine}-${finding.endLine}`
-      : `${finding.filePath}:${finding.endLine || finding.startLine || 1}`;
+  const rawStart = Number(finding.startLine || finding.endLine || 1);
+  const rawEnd = Number(finding.endLine || finding.startLine || 1);
+  const sugWarning =
+    mode === 'inline'
+      ? checkOversizedSuggestionSpan(finding.customComment, rawStart, rawEnd)
+      : { oversizedRange: false };
+  const initStart = sugWarning.oversizedRange ? rawEnd : rawStart;
+  const initEnd = rawEnd;
+  const initSide =
+    String(finding.side || finding.resolvedSide || 'RIGHT').toUpperCase() === 'LEFT'
+      ? 'LEFT'
+      : 'RIGHT';
 
   bodyEl.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:10px;">
-      <p style="margin:0;">
-        <strong>Target:</strong>
-        <code>${escapeHtml(mode === 'inline' ? targetLineRangeLabel : 'General PR conversation')}</code>
-      </p>
+      ${
+        mode === 'inline'
+          ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:8px 10px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--border-subtle);">
+              <div style="font-size:12px;">
+                <strong>Target file:</strong> <code>${escapeHtml(finding.filePath || '')}</code>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;">
+                <label>Side
+                  <select id="modalInlineSideSelect" class="diff-file-jump-select" style="min-width:85px;">
+                    <option value="RIGHT" ${initSide === 'RIGHT' ? 'selected' : ''}>RIGHT (+)</option>
+                    <option value="LEFT" ${initSide === 'LEFT' ? 'selected' : ''}>LEFT (-)</option>
+                  </select>
+                </label>
+                <label>Start <input id="modalInlineStartLine" type="number" min="1" class="line-range-input" value="${initStart}" /></label>
+                <span>&rarr;</span>
+                <label>End <input id="modalInlineEndLine" type="number" min="1" class="line-range-input" value="${initEnd}" /></label>
+              </div>
+            </div>
+            ${
+              sugWarning.oversizedRange
+                ? `<div style="padding:8px 10px;border-radius:6px;font-size:11.5px;background:rgba(210,153,34,0.14);border:1px solid rgba(210,153,34,0.4);color:var(--text-primary);">
+                    <strong>Suggestion range adjusted (${rawStart}-${rawEnd} &rarr; ${initEnd}):</strong>
+                    This comment contains a ${sugWarning.suggestionLines}-line <code>\`\`\`suggestion</code> block. Start line was clamped to ${initEnd} so GitHub does not propose deleting ${sugWarning.spanLines} lines. Adjust Start/End above if needed.
+                  </div>`
+                : ''
+            }`
+          : `<p style="margin:0;"><strong>Target:</strong> <code>General PR conversation</code></p>`
+      }
       <div>
         <label style="display:block;font-weight:500;margin-bottom:6px;">Markdown Content:</label>
         <textarea id="modalCommentTextarea" class="finding-textarea" style="min-height:150px;">${escapeHtml(finding.customComment)}</textarea>
       </div>
       <label class="checkbox-label" style="margin-top:4px;">
         <input type="checkbox" id="modalSaveAsAgentRuleCb" />
-        <span>Also save this item as a permanent rule in <code>reviewer-dna.md</code></span>
+        <span>Also save this item as a permanent personal rule (<code>.local.md</code>)</span>
       </label>
     </div>
   `;
 
   modal.classList.remove('hidden');
+  const modalTa = document.getElementById('modalCommentTextarea');
+  if (modalTa) {
+    requestAnimationFrame(() => autoResizeFindingTextarea(modalTa));
+    modalTa.addEventListener('input', () => autoResizeFindingTextarea(modalTa));
+  }
 
   confirmBtn.onclick = async () => {
     const editedBody = document.getElementById('modalCommentTextarea').value.trim();
     const saveAsRule = document.getElementById('modalSaveAsAgentRuleCb')?.checked;
     if (!editedBody) return;
+
+    const chosenStart =
+      mode === 'inline'
+        ? Math.max(1, Number(document.getElementById('modalInlineStartLine')?.value) || initStart)
+        : 1;
+    const chosenEnd =
+      mode === 'inline'
+        ? Math.max(chosenStart, Number(document.getElementById('modalInlineEndLine')?.value) || chosenStart)
+        : 1;
+    const chosenSide =
+      mode === 'inline'
+        ? document.getElementById('modalInlineSideSelect')?.value || initSide
+        : 'RIGHT';
+
     confirmBtn.disabled = true;
     confirmBtn.textContent = 'Sending...';
 
@@ -5558,11 +6384,13 @@ function openSingleCommentModal(finding, mode) {
           headSha: pr.headRefOid || pr.lastReviewedSha,
           commentBody: editedBody,
           filePath: finding.filePath,
-          line: finding.endLine || finding.startLine || 1,
-          startLine: finding.startLine || finding.endLine || 1,
-          endLine: finding.endLine || finding.startLine || 1,
+          side: chosenSide,
+          line: chosenEnd,
+          startLine: chosenStart,
+          endLine: chosenEnd,
           mode,
           cid: finding.cid,
+          title: finding.title || '',
         }),
       });
       const data = await res.json();
@@ -5583,14 +6411,23 @@ function openSingleCommentModal(finding, mode) {
         await loadRules();
       }
 
-      finding.posted = true;
-      finding.customComment = editedBody;
+      syncFindingPostedStateInClient(finding.cid, {
+        posted: true,
+        postedBy: data.postedBy || state.config?.githubUser || null,
+        postedUrl: data.githubResponse?.html_url || null,
+        customComment: editedBody,
+      });
       modal.classList.add('hidden');
       renderFindingsTab();
+      renderReportFindingsQuickBar();
+      if (state.selectedDiffFile) {
+        selectDiffFile(state.selectedDiffFile, state.highlightedLine);
+      }
+      loadPrOverview(pr, true);
       loadState(true);
       showToast(
         saveAsRule
-          ? `Comment ${finding.id} published and rule added to reviewer-dna.md.`
+          ? `Comment ${finding.id} published and personal rule saved.`
           : `Comment ${finding.id} published on GitHub.`
       );
     } catch (err) {
@@ -5606,8 +6443,18 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
   const pr = state.prs.find((p) => p.key === state.selectedPrKey);
   if (!pr) return;
 
+  const selfPr = isMyPr(pr);
+  const effectiveDefaultEvent =
+    selfPr && (defaultEvent === 'APPROVE' || defaultEvent === 'REQUEST_CHANGES')
+      ? 'COMMENT'
+      : defaultEvent;
+
   const findings = state.currentReview?.findings || [];
-  const selectedFindings = findings.filter((f) => state.selectedCommentCids.has(f.cid) && !f.dismissed);
+  // Never include comments that were already posted on GitHub or dismissed as false positives
+  const selectedFindings = findings.filter(
+    (f) => state.selectedCommentCids.has(f.cid) && !f.posted && !f.dismissed
+  );
+  const alreadyPostedCount = findings.filter((f) => f.posted).length;
 
   const modal = document.getElementById('githubModal');
   const titleEl = document.getElementById('modalTitle');
@@ -5622,10 +6469,10 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
       <div>
         <label style="display:block;font-weight:500;margin-bottom:6px;">GitHub Review Action:</label>
         <select id="modalReviewEventSelect" class="search-input">
-          <option value="PENDING" ${defaultEvent === 'PENDING' ? 'selected' : ''}>PENDING — Create a draft Pending Review on GitHub (not submitted yet)</option>
-          <option value="APPROVE" ${defaultEvent === 'APPROVE' ? 'selected' : ''}>APPROVE — Approve the PR</option>
-          <option value="COMMENT" ${defaultEvent === 'COMMENT' ? 'selected' : ''}>COMMENT — Publish comments without blocking</option>
-          <option value="REQUEST_CHANGES" ${defaultEvent === 'REQUEST_CHANGES' ? 'selected' : ''}>REQUEST_CHANGES — Request changes</option>
+          <option value="PENDING" ${effectiveDefaultEvent === 'PENDING' ? 'selected' : ''}>PENDING — Create / append to a draft Pending Review on GitHub</option>
+          <option value="APPROVE" ${effectiveDefaultEvent === 'APPROVE' ? 'selected' : ''} ${selfPr ? 'disabled' : ''}>APPROVE — Approve the PR${selfPr ? ' (unavailable on your own PR)' : ''}</option>
+          <option value="COMMENT" ${effectiveDefaultEvent === 'COMMENT' ? 'selected' : ''}>COMMENT — Publish comments without blocking</option>
+          <option value="REQUEST_CHANGES" ${effectiveDefaultEvent === 'REQUEST_CHANGES' ? 'selected' : ''} ${selfPr ? 'disabled' : ''}>REQUEST_CHANGES — Request changes${selfPr ? ' (unavailable on your own PR)' : ''}</option>
         </select>
       </div>
 
@@ -5636,15 +6483,22 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
 
       <div>
         <label class="checkbox-label">
-          <input type="checkbox" id="modalIncludeSelectedComments" ${selectedFindings.length > 0 ? 'checked' : ''} />
-          <span>Include <strong>${selectedFindings.length} selected comment(s)</strong></span>
+          <input type="checkbox" id="modalIncludeSelectedComments" ${selectedFindings.length > 0 ? 'checked' : ''} ${selectedFindings.length === 0 ? 'disabled' : ''} />
+          <span>Include <strong>${selectedFindings.length} unposted selected comment(s)</strong></span>
         </label>
+        ${
+          alreadyPostedCount > 0
+            ? `<p class="meta-text" style="margin:5px 0 0;color:var(--status-ok);">
+                &check; ${alreadyPostedCount} comment(s) already posted on GitHub were automatically excluded so they won't be duplicated.
+              </p>`
+            : ''
+        }
         ${
           selectedFindings.length > 0
             ? `<ul style="margin:6px 0 0;padding-left:20px;color:var(--text-secondary);font-size:11.5px;">
                 ${selectedFindings.map((f) => `<li><strong>${escapeHtml(f.id)}</strong> — ${escapeHtml(stripEmojis(f.title))} (${escapeHtml(f.filePath || 'General')})</li>`).join('')}
               </ul>`
-            : `<p class="meta-text" style="margin:4px 0 0;">No comments checked (only the review verdict/summary message will be sent).</p>`
+            : `<p class="meta-text" style="margin:4px 0 0;">No unposted comments checked (only the review verdict/summary message will be sent).</p>`
         }
       </div>
     </div>
@@ -5660,7 +6514,9 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
     const inlineComments = includeComments
       ? selectedFindings.map((f) => ({
           cid: f.cid,
+          title: f.title || '',
           filePath: f.filePath,
+          side: f.side || f.resolvedSide || 'RIGHT',
           line: f.endLine || f.startLine || 1,
           startLine: f.startLine || f.endLine || 1,
           endLine: f.endLine || f.startLine || 1,
@@ -5668,8 +6524,12 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
         }))
       : [];
 
-    if (event === 'PENDING' && inlineComments.length === 0 && !summaryBody) {
-      showToast('Select at least one comment or enter a summary message.');
+    if (
+      (event === 'PENDING' || event === 'COMMENT' || event === 'REQUEST_CHANGES') &&
+      inlineComments.length === 0 &&
+      !summaryBody
+    ) {
+      showToast('Select at least one unposted comment or enter a summary message.');
       return;
     }
 
@@ -5692,15 +6552,26 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to create GitHub review');
 
-      for (const f of selectedFindings) {
-        if (includeComments) f.posted = true;
+      if (includeComments) {
+        for (const f of selectedFindings) {
+          syncFindingPostedStateInClient(f.cid, {
+            posted: true,
+            postedBy: data.postedBy || state.config?.githubUser || null,
+            postedUrl: data.githubResponse?.html_url || null,
+          });
+        }
       }
       modal.classList.add('hidden');
       renderFindingsTab();
+      renderReportFindingsQuickBar();
+      if (state.selectedDiffFile) {
+        selectDiffFile(state.selectedDiffFile, state.highlightedLine);
+      }
+      loadPrOverview(pr, true);
       loadState(true);
       showToast(
         event === 'PENDING'
-          ? 'Pending Review (draft) created on GitHub.'
+          ? 'Pending Review (draft) updated on GitHub.'
           : `Review (${event}) published on GitHub.`
       );
     } catch (err) {
@@ -5715,9 +6586,26 @@ function openBatchReviewModal(defaultEvent = 'PENDING') {
 // Event Listeners Setup
 document.getElementById('modeFilterTabs')?.querySelectorAll('.filter-tab').forEach((tab) => {
   tab.addEventListener('click', () => {
-    document.querySelectorAll('.filter-tab').forEach((t) => t.classList.remove('active'));
-    tab.classList.add('active');
     state.activeFilter = tab.dataset.filter;
+    try {
+      localStorage.setItem('prHub.activeFilter', state.activeFilter);
+    } catch {
+      // Ignore storage errors
+    }
+    syncFilterTabsUi();
+    renderPrList();
+  });
+});
+
+document.getElementById('reviewAskedSubFilterBar')?.querySelectorAll('[data-asked-scope]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    state.reviewAskedScope = btn.dataset.askedScope || 'all';
+    try {
+      localStorage.setItem('prHub.reviewAskedScope', state.reviewAskedScope);
+    } catch {
+      // Ignore storage errors
+    }
+    syncFilterTabsUi();
     renderPrList();
   });
 });
@@ -5836,17 +6724,18 @@ document.getElementById('appUpdateBtn')?.addEventListener('click', async () => {
 
 document.getElementById('selectAllCommentsCheckbox')?.addEventListener('change', (e) => {
   const findings = state.currentReview?.findings || [];
+  state.selectedCommentCids.clear();
   if (e.target.checked) {
-    findings.filter((f) => !f.dismissed).forEach((f) => state.selectedCommentCids.add(f.cid));
-  } else {
-    state.selectedCommentCids.clear();
+    findings
+      .filter((f) => !f.posted && !f.dismissed)
+      .forEach((f) => state.selectedCommentCids.add(f.cid));
   }
   renderFindingsTab();
 });
 
 document.getElementById('copyAllSelectedBtn')?.addEventListener('click', async () => {
   const findings = (state.currentReview?.findings || []).filter(
-    (f) => state.selectedCommentCids.has(f.cid) && !f.dismissed
+    (f) => state.selectedCommentCids.has(f.cid) && !f.posted && !f.dismissed
   );
   if (findings.length === 0) {
     showToast('No comments selected.');
