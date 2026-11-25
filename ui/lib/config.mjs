@@ -398,10 +398,72 @@ function detectLocalWanreviewRepo(projectsDir = '') {
   return '';
 }
 
+export const DEFAULT_AUTO_REVIEW_EXCLUDE = Object.freeze({
+  enabled: true,
+  botAuthors: ['ci-cd-matawan', 'dependabot', 'renovate', 'github-actions'],
+  excludeTitlePatterns: [
+    '^chore\\(release\\)',
+    '^release\\b',
+    '^bump\\b',
+    '^update version\\b',
+    '^merge (branch|tag|pull request)\\b',
+  ],
+  excludeBranchPrefixes: ['release/', 'hotfix/', 'backmerge/', 'dependabot/', 'renovate/'],
+  excludeLabels: ['skip-ai-review', 'no-review', 'wip', 'do-not-merge', 'dependencies'],
+  skipLockfilesOnly: true,
+  maxChangedFiles: 120,
+});
+
+function normalizeStringArray(raw, fallback = []) {
+  if (Array.isArray(raw)) {
+    return raw.map((s) => String(s || '').trim()).filter(Boolean);
+  }
+  if (typeof raw === 'string') {
+    return raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [...fallback];
+}
+
+export function normalizeAutoReviewExcludeField(raw = null, defaults = DEFAULT_AUTO_REVIEW_EXCLUDE) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const maxFilesNum = Number(src.maxChangedFiles ?? defaults.maxChangedFiles ?? 120);
+  return {
+    enabled:
+      typeof src.enabled === 'boolean'
+        ? src.enabled
+        : typeof defaults.enabled === 'boolean'
+        ? defaults.enabled
+        : true,
+    botAuthors: normalizeStringArray(src.botAuthors, defaults.botAuthors),
+    excludeTitlePatterns: normalizeStringArray(
+      src.excludeTitlePatterns,
+      defaults.excludeTitlePatterns
+    ),
+    excludeBranchPrefixes: normalizeStringArray(
+      src.excludeBranchPrefixes,
+      defaults.excludeBranchPrefixes
+    ),
+    excludeLabels: normalizeStringArray(src.excludeLabels, defaults.excludeLabels),
+    skipLockfilesOnly:
+      typeof src.skipLockfilesOnly === 'boolean'
+        ? src.skipLockfilesOnly
+        : Boolean(defaults.skipLockfilesOnly),
+    maxChangedFiles:
+      Number.isFinite(maxFilesNum) && maxFilesNum > 0 ? Math.round(maxFilesNum) : 120,
+  };
+}
+
 export function getDefaultConfig() {
   const defaultProjectsDir = detectLocalProjectsDir();
   const defaultReviewsDir =
     process.env.REVIEWS_DIR || path.join(defaultProjectsDir, 'artifacts', 'reviews');
+  const rawRunnerMode = String(process.env.REVIEW_HUB_RUNNER_MODE || 'auto').trim().toLowerCase();
+  const agentRunnerMode = ['auto', 'cli', 'gemini-api', 'vertex'].includes(rawRunnerMode)
+    ? rawRunnerMode
+    : 'auto';
 
   return {
     githubOrg: process.env.REVIEW_HUB_ORG || 'ubitransports',
@@ -409,10 +471,15 @@ export function getDefaultConfig() {
     githubTeams: [],
     teamProfile: process.env.REVIEW_HUB_TEAM_PROFILE || 'popcorn-back',
     agentCli: detectInstalledAgentCli(),
+    agentRunnerMode,
+    agentModel: (process.env.REVIEW_HUB_MODEL || '').trim(),
+    gcpProjectId: (process.env.GCP_PROJECT_ID || '').trim(),
+    gcpLocation: (process.env.GCP_LOCATION || 'global').trim() || 'global',
     projectsDir: defaultProjectsDir,
     reviewsDir: defaultReviewsDir,
     wanreviewRepoPath: detectLocalWanreviewRepo(defaultProjectsDir),
     domainAgents: { ...DEFAULT_DOMAIN_AGENTS_CONFIG },
+    autoReviewExclude: normalizeAutoReviewExcludeField(),
     jiraBaseUrl: 'https://ubitransport.atlassian.net/browse',
     jiraPrefixes: ['PRD', 'HYB', 'WAN', 'POP', 'OPS', 'SEC', 'SUP', 'DEV'],
     syncScript: path.join(SKILL_ROOT, 'scripts', 'sync-queue.sh'),
@@ -491,12 +558,34 @@ export function loadConfig(customConfigFile = '') {
             : hasValidSavedUser,
       };
       delete merged.model;
+      merged.agentModel = String(
+        process.env.REVIEW_HUB_MODEL || saved.agentModel || defaults.agentModel || ''
+      ).trim();
+      const rawMode = String(
+        process.env.REVIEW_HUB_RUNNER_MODE || saved.agentRunnerMode || defaults.agentRunnerMode || 'auto'
+      )
+        .trim()
+        .toLowerCase();
+      merged.agentRunnerMode = ['auto', 'cli', 'gemini-api', 'vertex'].includes(rawMode)
+        ? rawMode
+        : 'auto';
+      merged.gcpProjectId = String(
+        process.env.GCP_PROJECT_ID || saved.gcpProjectId || defaults.gcpProjectId || ''
+      ).trim();
+      merged.gcpLocation =
+        String(
+          process.env.GCP_LOCATION || saved.gcpLocation || defaults.gcpLocation || 'global'
+        ).trim() || 'global';
       merged.projectsDir = expandHome(merged.projectsDir || defaults.projectsDir);
       merged.reviewsDir = expandHome(merged.reviewsDir || defaults.reviewsDir);
       merged.wanreviewRepoPath = expandHome(
         merged.wanreviewRepoPath || defaults.wanreviewRepoPath || ''
       );
       merged.domainAgents = normalizeDomainAgentsField(saved.domainAgents, defaults.domainAgents);
+      merged.autoReviewExclude = normalizeAutoReviewExcludeField(
+        saved.autoReviewExclude,
+        defaults.autoReviewExclude
+      );
       return merged;
     }
   } catch {
@@ -518,6 +607,10 @@ export function saveConfig(partialConfig, customConfigFile = '') {
     domainAgents: normalizeDomainAgentsField(
       partialConfig?.domainAgents ?? current.domainAgents,
       current.domainAgents
+    ),
+    autoReviewExclude: normalizeAutoReviewExcludeField(
+      partialConfig?.autoReviewExclude ?? current.autoReviewExclude,
+      current.autoReviewExclude
     ),
   };
   delete updated.model;

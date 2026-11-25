@@ -31,6 +31,7 @@ import {
 } from './scoring.mjs';
 import { resolveProductContextForPr } from './jira.mjs';
 import { ensureWanreviewRepoSynced } from './wanreview.mjs';
+import { resolveApiTransportConfig, runGeminiApiPrompt } from './api-transport.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -545,7 +546,11 @@ function attachDualTimeoutTimers({ child, cliLabel, timeoutMs, inactivityTimeout
 async function _runCliPromptInternal({
   prompt,
   cwd,
+  cfg = null,
   agentCli = 'agy',
+  agentModel = '',
+  prContext = null,
+  maxToolCalls = 3,
   approvalMode = 'yolo',
   timeoutMs = 420000,
   inactivityTimeoutMs = 210000,
@@ -558,7 +563,32 @@ async function _runCliPromptInternal({
     if (onStreamUpdate) {
       onStreamUpdate({ phase: 'Running agent…', partialText: '' });
     }
-    return customAgentRunner({ prompt, cwd, approvalMode, agentCli });
+    return customAgentRunner({ prompt, cwd, approvalMode, agentCli, agentModel });
+  }
+
+  const effectiveModel = String(
+    agentModel || cfg?.agentModel || process.env.REVIEW_HUB_MODEL || ''
+  ).trim();
+
+  if (!_customBinPath) {
+    const apiCfg = resolveApiTransportConfig({
+      ...(cfg || {}),
+      ...(effectiveModel ? { agentModel: effectiveModel } : {}),
+    });
+    if (apiCfg.transport === 'vertex' || apiCfg.transport === 'gemini-api') {
+      return runGeminiApiPrompt({
+        prompt,
+        transport: apiCfg.transport,
+        modelId: apiCfg.modelId,
+        projectId: apiCfg.projectId,
+        location: apiCfg.location,
+        apiKey: apiCfg.apiKey,
+        prContext,
+        maxToolCalls,
+        timeoutMs,
+        onStreamUpdate,
+      });
+    }
   }
 
   const { cli, bin } = _customBinPath
@@ -579,6 +609,9 @@ async function _runCliPromptInternal({
         '--output-format',
         'stream-json',
       ];
+      if (effectiveModel) {
+        args.push('--model', effectiveModel);
+      }
       for (const dir of dirsToAdd) {
         args.push('--add-dir', dir);
       }
@@ -725,6 +758,9 @@ async function _runCliPromptInternal({
           ? 'Follow the instructions provided on stdin and output the requested response.'
           : prompt,
       ];
+      if (effectiveModel) {
+        args.push('--model', effectiveModel);
+      }
       if (approvalMode === 'yolo' || approvalMode === 'auto_edit') {
         args.push('--dangerously-skip-permissions');
       }
@@ -799,6 +835,9 @@ async function _runCliPromptInternal({
       '-e',
       'none',
     ];
+    if (effectiveModel) {
+      args.push('--model', effectiveModel);
+    }
     for (const dir of validIncludeDirs) {
       args.push('--include-directories', dir);
     }
@@ -1447,7 +1486,15 @@ export async function runPrReviewJob({
     const out = await runCliPrompt({
       prompt,
       cwd: repoPath,
+      cfg,
       agentCli: cfg.agentCli || 'agy',
+      agentModel: cfg.agentModel || '',
+      prContext: {
+        org: cfg.githubOrg,
+        repo: pr.repo,
+        headSha,
+      },
+      maxToolCalls: singleDomainId ? 0 : 3,
       approvalMode: 'yolo',
       timeoutMs: 420000,
       inactivityTimeoutMs: 60000,
@@ -1791,7 +1838,15 @@ export async function sendPrChatMessage({
     const replyText = await runCliPrompt({
       prompt: promptParts.join('\n\n'),
       cwd: repoPath,
+      cfg,
       agentCli: cfg.agentCli || 'agy',
+      agentModel: cfg.agentModel || '',
+      prContext: {
+        org: cfg.githubOrg,
+        repo: pr.repo,
+        headSha: pr.headRefOid || pr.lastReviewedSha || 'HEAD',
+      },
+      maxToolCalls: 2,
       approvalMode: action === 'debrief' ? 'auto_edit' : 'plan',
       timeoutMs: 120000,
       fastChatMode: true,

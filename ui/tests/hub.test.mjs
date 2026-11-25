@@ -39,7 +39,14 @@ import {
   dismissFindingAsFalsePositive,
   isAgentAuthError,
 } from '../lib/agent.mjs';
-import { AutoReviewScheduler } from '../lib/scheduler.mjs';
+import { AutoReviewScheduler, shouldSkipAutoReview } from '../lib/scheduler.mjs';
+import {
+  resolveApiTransportConfig,
+  buildVertexGenerateUrl,
+  buildGeminiApiUrl,
+  runGeminiApiPrompt,
+  fetchRepoFileFromGithub,
+} from '../lib/api-transport.mjs';
 import {
   loadDomainAgentCatalog,
   computeBoundedScorecard,
@@ -3802,6 +3809,215 @@ Let me know if you prefer keeping a dry-run note!
       setCustomGithubPublishHandlerForTests(null);
       if (prevCfgEnv === undefined) delete process.env.REVIEW_HUB_CONFIG;
       else process.env.REVIEW_HUB_CONFIG = prevCfgEnv;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('API Transport, Single Model Selection & PR Auto-Review Exclusion', () => {
+  test('resolveApiTransportConfig selects vertex, gemini-api, or cli with single model override', () => {
+    const vertexCfg = resolveApiTransportConfig(
+      { agentRunnerMode: 'auto', agentModel: 'gemini-2.5-pro' },
+      { GCP_PROJECT_ID: 'ubi-prod-123', GCP_LOCATION: 'europe-west1' }
+    );
+    assert.equal(vertexCfg.transport, 'vertex');
+    assert.equal(vertexCfg.modelId, 'gemini-2.5-pro');
+    assert.equal(
+      buildVertexGenerateUrl(vertexCfg),
+      'https://europe-west1-aiplatform.googleapis.com/v1/projects/ubi-prod-123/locations/europe-west1/publishers/google/models/gemini-2.5-pro:generateContent'
+    );
+
+    const apiKeyCfg = resolveApiTransportConfig(
+      { agentRunnerMode: 'auto' },
+      { GEMINI_API_KEY: 'test-key-123', REVIEW_HUB_MODEL: 'gemini-2.5-flash' }
+    );
+    assert.equal(apiKeyCfg.transport, 'gemini-api');
+    assert.equal(apiKeyCfg.modelId, 'gemini-2.5-flash');
+    assert.equal(
+      buildGeminiApiUrl({ modelId: apiKeyCfg.modelId }),
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent'
+    );
+
+    const cliCfg = resolveApiTransportConfig(
+      { agentRunnerMode: 'cli', agentModel: 'gemini-4-carbon-medium' },
+      { GCP_PROJECT_ID: 'ubi-prod-123', GEMINI_API_KEY: 'test-key-123' }
+    );
+    assert.equal(cliCfg.transport, 'cli');
+    assert.equal(cliCfg.modelId, 'gemini-4-carbon-medium');
+  });
+
+  test('runGeminiApiPrompt executes Vertex AI Function Calling (read_repo_file) and enforces max 3 calls', async () => {
+    const seenPayloads = [];
+    let callIdx = 0;
+    const mockFetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      seenPayloads.push({ url, headers: init.headers, body });
+      callIdx++;
+      if (body.tools) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    {
+                      functionCall: {
+                        name: 'read_repo_file',
+                        args: { path: `src/File${callIdx}.php` },
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ text: '# Code Review: repo#1\n\n## 1. Task Summary & Functional Problem Solved\nDone.' }],
+              },
+            },
+          ],
+        }),
+      };
+    };
+
+    const fetchedPaths = [];
+    const mockGithubFetcher = async ({ filePath }) => {
+      fetchedPaths.push(filePath);
+      return { ok: true, path: filePath, type: 'file', content: '<?php interface Foo {}' };
+    };
+
+    const result = await runGeminiApiPrompt({
+      prompt: 'Audit this PR',
+      transport: 'vertex',
+      modelId: 'gemini-2.5-flash',
+      projectId: 'ubi-test',
+      location: 'global',
+      prContext: { org: 'ubitransports', repo: '2cloud-services', headSha: 'abc123' },
+      maxToolCalls: 3,
+      fetchFn: mockFetch,
+      tokenProvider: async () => 'adc-bearer-token',
+      githubFileFetcher: mockGithubFetcher,
+    });
+
+    assert.match(result, /# Code Review: repo#1/);
+    assert.deepEqual(fetchedPaths, ['src/File1.php', 'src/File2.php', 'src/File3.php']);
+    assert.equal(seenPayloads.length, 4, '3 tool turns + 1 final turn without tools');
+    assert.equal(seenPayloads[0].headers.Authorization, 'Bearer adc-bearer-token');
+    assert.ok(seenPayloads[0].body.tools, 'tools must be offered on initial turn');
+    assert.equal(
+      seenPayloads[3].body.tools,
+      undefined,
+      'tools must be omitted after maxToolCalls is reached to force final synthesis'
+    );
+  });
+
+  test('fetchRepoFileFromGithub blocks path traversal attempts', async () => {
+    const res = await fetchRepoFileFromGithub({
+      org: 'ubitransports',
+      repo: '2cloud-services',
+      filePath: '../../etc/passwd',
+      headSha: 'abc123',
+      execFn: async () => {
+        throw new Error('Should not execute gh api');
+      },
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.error, /Invalid or unsafe file path/i);
+  });
+
+  test('shouldSkipAutoReview filters bots, releases/version bumps, excluded labels, lockfiles-only, and oversized PRs while allowing manual force', () => {
+    const baseCfg = loadConfig();
+
+    assert.equal(shouldSkipAutoReview({ author: 'dependabot[bot]', title: 'Update axios' }, baseCfg).skip, true);
+    assert.equal(shouldSkipAutoReview({ author: 'ci-cd-matawan', title: 'Sync' }, baseCfg).skip, true);
+    assert.equal(shouldSkipAutoReview({ author: 'dev1', title: 'chore(release): 2.196.0' }, baseCfg).skip, true);
+    assert.equal(shouldSkipAutoReview({ author: 'dev1', title: 'Bump version to 1.4.0' }, baseCfg).skip, true);
+    assert.equal(shouldSkipAutoReview({ author: 'dev1', title: "Merge branch 'main' into develop" }, baseCfg).skip, true);
+    assert.equal(shouldSkipAutoReview({ author: 'dev1', title: 'Release', headRefName: 'release/2.196' }, baseCfg).skip, true);
+    assert.equal(
+      shouldSkipAutoReview({ author: 'dev1', title: 'Refactor', labels: [{ name: 'skip-ai-review' }] }, baseCfg).skip,
+      true
+    );
+    assert.equal(
+      shouldSkipAutoReview(
+        {
+          author: 'dev1',
+          title: 'Refresh lockfile',
+          changedFiles: 2,
+          changedFilePaths: ['package-lock.json', 'composer.lock'],
+        },
+        baseCfg
+      ).skip,
+      true
+    );
+    assert.equal(
+      shouldSkipAutoReview({ author: 'dev1', title: 'Huge migration', changedFiles: 200 }, baseCfg).skip,
+      true
+    );
+
+    // Normal feature PR must NOT be skipped
+    assert.equal(
+      shouldSkipAutoReview(
+        {
+          author: 'dev1',
+          title: 'feat(MA): PRD-18000 - Add ticket validation',
+          headRefName: 'feat/PRD-18000-ticket-validation',
+          labels: [{ name: 'backend' }],
+          changedFiles: 4,
+          changedFilePaths: ['src/Service/Validator.php'],
+        },
+        baseCfg
+      ).skip,
+      false
+    );
+
+    // Scheduler respects exclusion automatically, but allows manual force=true
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-skip-test-'));
+    let scheduler = null;
+    try {
+      scheduler = new AutoReviewScheduler({
+        loadConfigFn: () => ({ ...baseCfg, reviewsDir: tmpDir }),
+        runReviewFn: async () => {},
+      });
+      const skippedRes = scheduler.enqueuePrReview(
+        {
+          repo: '2cloud-services',
+          number: 9991,
+          title: 'chore(release): 2.200.0',
+          author: 'dev1',
+          headRefOid: 'sha1',
+        },
+        { force: false }
+      );
+      assert.equal(skippedRes.skipped, true);
+      assert.match(skippedRes.reason, /^title:/);
+
+      const forcedRes = scheduler.enqueuePrReview(
+        {
+          repo: '2cloud-services',
+          number: 9991,
+          title: 'chore(release): 2.200.0',
+          author: 'dev1',
+          headRefOid: 'sha1',
+        },
+        { force: true, priority: true }
+      );
+      assert.equal(forcedRes.skipped, false);
+      assert.ok(forcedRes.job);
+    } finally {
+      scheduler?.stop?.();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

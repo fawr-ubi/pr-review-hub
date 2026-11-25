@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadConfig } from './config.mjs';
+import { loadConfig, normalizeAutoReviewExcludeField } from './config.mjs';
 import { scanPrQueue } from './sync.mjs';
 import { createQueuedReviewJob, runPrReviewJob, isAgentAuthError } from './agent.mjs';
 import {
@@ -9,6 +9,81 @@ import {
   hydrateLocalStateFromSharedStore,
 } from './store.mjs';
 import { ensureWanreviewRepoSynced } from './wanreview.mjs';
+
+const LOCKFILE_ONLY_RE =
+  /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|composer\.lock|uv\.lock|poetry\.lock|Cargo\.lock|Gemfile\.lock)$/i;
+
+/**
+ * Evaluates whether a PR should be skipped by automatic background reviews
+ * (bots, release/version-bump/back-merge PRs, excluded labels, lockfile-only, oversized).
+ * Manual triggers (`force: true`) bypass this check.
+ */
+export function shouldSkipAutoReview(pr, cfg = {}) {
+  if (!pr || typeof pr !== 'object') {
+    return { skip: true, reason: 'invalid_pr' };
+  }
+  if (pr.isDraft || pr.syncStatus === 'DRAFT') {
+    return { skip: true, reason: 'draft' };
+  }
+  const rules = normalizeAutoReviewExcludeField(cfg.autoReviewExclude);
+  if (!rules.enabled) {
+    return { skip: false, reason: null };
+  }
+
+  const author = String(pr.author || '').trim().toLowerCase();
+  if (
+    author &&
+    (author.endsWith('[bot]') ||
+      rules.botAuthors.some((b) => b.toLowerCase() === author || author.startsWith(b.toLowerCase())))
+  ) {
+    return { skip: true, reason: `bot_author:${author}` };
+  }
+
+  const labels = Array.isArray(pr.labels)
+    ? pr.labels.map((l) => String(typeof l === 'string' ? l : l?.name || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  const excludedLabelSet = new Set(rules.excludeLabels.map((l) => l.toLowerCase()));
+  const matchedLabel = labels.find((l) => excludedLabelSet.has(l));
+  if (matchedLabel) {
+    return { skip: true, reason: `label:${matchedLabel}` };
+  }
+
+  const headRef = String(pr.headRefName || '').trim().toLowerCase();
+  const matchedPrefix = rules.excludeBranchPrefixes.find((p) =>
+    headRef.startsWith(p.toLowerCase())
+  );
+  if (matchedPrefix) {
+    return { skip: true, reason: `branch:${matchedPrefix}` };
+  }
+
+  const title = String(pr.title || '').trim();
+  for (const rawPattern of rules.excludeTitlePatterns) {
+    try {
+      if (new RegExp(rawPattern, 'i').test(title)) {
+        return { skip: true, reason: `title:${rawPattern}` };
+      }
+    } catch {
+      // ignore invalid user regex
+    }
+  }
+
+  const changedFilesCount = Number(pr.changedFiles || 0);
+  if (rules.maxChangedFiles > 0 && changedFilesCount > rules.maxChangedFiles) {
+    return { skip: true, reason: `oversized:${changedFilesCount}_files` };
+  }
+
+  const paths = Array.isArray(pr.changedFilePaths) ? pr.changedFilePaths.filter(Boolean) : [];
+  if (
+    rules.skipLockfilesOnly &&
+    paths.length > 0 &&
+    paths.length === (changedFilesCount || paths.length) &&
+    paths.every((p) => LOCKFILE_ONLY_RE.test(String(p)))
+  ) {
+    return { skip: true, reason: 'lockfiles_only' };
+  }
+
+  return { skip: false, reason: null };
+}
 
 function readLocalOpenPrs(reviewsDir) {
   try {
@@ -136,6 +211,10 @@ export class AutoReviewScheduler {
     const cooldownKey = `${prKey}:${headSha || 'HEAD'}:${normalizedScope}:${targetDomain || 'all'}`;
 
     if (!priority && !force && !targetDomain) {
+      const skipEval = shouldSkipAutoReview(pr, cfg);
+      if (skipEval.skip) {
+        return { skipped: true, reason: skipEval.reason, job: null };
+      }
       const lastFailedAt = this.failedCooldowns.get(cooldownKey);
       if (lastFailedAt && Date.now() - lastFailedAt < this.failureCooldownMs) {
         return { skipped: true, reason: 'failure_cooldown', job: null };
@@ -218,16 +297,17 @@ export class AutoReviewScheduler {
     }
     const cfg = this.loadConfigFn();
     const openPrs = readLocalOpenPrs(cfg.reviewsDir);
-    // Exclude Draft PRs (isDraft or syncStatus === 'DRAFT') and prioritize unreviewed recent PRs first
+    // Exclude Draft PRs and auto-review skipped PRs (bots, release/version bumps, excluded labels, etc.)
     const actionable = openPrs
-      .filter(
-        (pr) =>
-          !pr.isDraft &&
-          pr.syncStatus !== 'DRAFT' &&
-          (pr.syncStatus === 'NEEDS_REVIEW' ||
-            pr.syncStatus === 'NEEDS_UPDATE' ||
-            !pr.lastReviewedSha)
-      )
+      .filter((pr) => {
+        if (pr.isDraft || pr.syncStatus === 'DRAFT') return false;
+        if (!force && shouldSkipAutoReview(pr, cfg).skip) return false;
+        return (
+          pr.syncStatus === 'NEEDS_REVIEW' ||
+          pr.syncStatus === 'NEEDS_UPDATE' ||
+          !pr.lastReviewedSha
+        );
+      })
       .sort((a, b) => {
         const aNeverReviewed = !a.lastReviewedSha || a.syncStatus === 'NEEDS_REVIEW' ? 1 : 0;
         const bNeverReviewed = !b.lastReviewedSha || b.syncStatus === 'NEEDS_REVIEW' ? 1 : 0;

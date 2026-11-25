@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { SKILL_ROOT, findCliBinaryPath, ensureSkillSymlinks } from './config.mjs';
 import { listAllRules } from './rules.mjs';
+import { resolveApiTransportConfig } from './api-transport.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -131,6 +132,33 @@ export async function runDoctor(cfg = {}) {
     authRequired: agentAuthRequired,
     detail: agentDetail,
     fixHint: agentAuthRequired ? 'agy' : 'npm install -g @google/gemini-cli && gemini',
+  });
+
+  // 4b. AI Transport & Single Model Configuration
+  const apiTransport = resolveApiTransportConfig(cfg);
+  const modelLabel = apiTransport.modelId || 'CLI default';
+  const transportReady =
+    apiTransport.transport === 'cli'
+      ? agentOk
+      : apiTransport.transport === 'vertex'
+      ? Boolean(apiTransport.projectId)
+      : Boolean(apiTransport.apiKey);
+  checks.push({
+    id: 'aiTransport',
+    label: `AI Transport & Model (${apiTransport.transport})`,
+    ok: transportReady,
+    detail:
+      apiTransport.transport === 'vertex'
+        ? `Vertex AI (project: ${apiTransport.projectId || 'missing'}, location: ${apiTransport.location}, model: ${modelLabel})`
+        : apiTransport.transport === 'gemini-api'
+        ? `Gemini API HTTP (model: ${modelLabel}, GEMINI_API_KEY ${apiTransport.apiKey ? 'set' : 'missing'})`
+        : `Local CLI (${resolvedCli}, model: ${modelLabel})`,
+    fixHint:
+      apiTransport.transport === 'vertex'
+        ? 'Set GCP_PROJECT_ID and run gcloud auth application-default login'
+        : apiTransport.transport === 'gemini-api'
+        ? 'Set GEMINI_API_KEY=<your-key>'
+        : 'Set REVIEW_HUB_MODEL or agentModel in config.json to pin a single model',
   });
 
   // 5. Local Projects Workspace & Git Repositories (Optional — Remote GitHub mode always works)
